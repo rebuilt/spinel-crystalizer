@@ -412,6 +412,7 @@ int main(int argc, char **argv) {
   const char *int_overflow = "raise";
   const char *rbs_dir = NULL;
   int c_only = 0, stdout_mode = 0, run_mode = 0, dump_ast = 0;
+  int crystal_target = 0;   /* --target crystal: emit Crystal instead of C */
   int print_build = 0;   /* --print-build: emit the build ingredients, run nothing */
   int cc_jobs = 0;       /* --jobs=N: compile the C as N units in parallel (#4847); 0 = auto */
   int emit_rbs = 0, emit_types = 0, emit_symbol_map = 0;
@@ -490,6 +491,8 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "-I"))            { if (++i < argc) sp_add_feature_root(argv[i]); i++; }
     else if (!strncmp(a, "-I", 2) && a[2]) { sp_add_feature_root(a + 2); i++; }
     else if (sp_streq(a, "-S"))            { stdout_mode = 1; i++; }
+    else if (!strncmp(a, "--target=", 9))  { const char *tv = a + 9; if (sp_streq(tv, "crystal")) crystal_target = 1; else { fprintf(stderr, "spinel: --target expects crystal, got '%s'\n", tv); return 2; } i++; }
+    else if (sp_streq(a, "--target") && i + 1 < argc) { const char *tv = argv[i + 1]; if (sp_streq(tv, "crystal")) crystal_target = 1; else { fprintf(stderr, "spinel: --target expects crystal, got '%s'\n", tv); return 2; } i += 2; }
     else if (sp_streq(a, "--print-build")) { print_build = 1; i++; }
     else if (sp_streq(a, "-E"))            { run_mode = 1; i++; }
     else if (sp_streq(a, "--emit-rbs"))    { emit_rbs = 1; i++; }
@@ -795,7 +798,7 @@ int main(int argc, char **argv) {
     ext_feat[fl] = 0;
     if (fl) g_ext_feature = ext_feat;
   }
-  char *csrc = codegen_program(nt);
+  char *csrc = crystal_target ? codegen_program_crystal(nt) : codegen_program(nt);
   nt_free(nt);
   if (seed_path[0]) remove(seed_path);
   if (!csrc) { fprintf(stderr, "spinel: codegen failed\n"); return 1; }
@@ -806,6 +809,46 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Wrote %s\n", emit_out);
     if (emit_types && stdout_mode) fputs(csrc, stdout);
     free(csrc);
+    return 0;
+  }
+
+  /* Crystal target: print the source (-S), write it (-c), or build+run. */
+  if (crystal_target) {
+    if (stdout_mode) { fputs(csrc, stdout); free(csrc); return 0; }
+    char cr_path[4096];
+    if (c_only) {
+      snprintf(cr_path, sizeof cr_path, "%s", output ? output : basename);
+      if (!output) strncat(cr_path, ".cr", sizeof cr_path - strlen(cr_path) - 1);
+      if (refuse_overwrite(cr_path)) { free(csrc); return 1; }
+      if (!write_text_file(cr_path, csrc)) { free(csrc); return 1; }
+      fprintf(stderr, "Wrote %s\n", cr_path);
+      free(csrc);
+      return 0;
+    }
+    make_temp_path(cr_path, sizeof cr_path, "out", 0, ".cr");
+    if (!write_text_file(cr_path, csrc)) { free(csrc); return 1; }
+    free(csrc);
+    char out_bin[4096];
+    snprintf(out_bin, sizeof out_bin, "%s%s", output ? output : basename, output ? "" : EXE_SUFFIX);
+    Str cmd = {0};
+    s_add(&cmd, "crystal build --release -o ");
+    s_add_arg(&cmd, out_bin);
+    s_add(&cmd, " ");
+    s_add_arg(&cmd, cr_path);
+    int rc = system(cmd.p);
+    free(cmd.p);
+    remove(cr_path);
+    if (rc != 0) { fprintf(stderr, "spinel: crystal build failed\n"); return 1; }
+    if (run_mode) {
+      Str rcmd = {0};
+      s_add_arg(&rcmd, out_bin);
+      for (int ri = 0; ri < n_run_args; ri++) { s_add(&rcmd, " "); s_add_arg(&rcmd, run_args[ri]); }
+      rc = system(rcmd.p);
+      free(rcmd.p);
+      remove(out_bin);
+      return rc == 0 ? 0 : 1;
+    }
+    fprintf(stderr, "Wrote %s\n", out_bin);
     return 0;
   }
 

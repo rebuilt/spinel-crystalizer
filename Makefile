@@ -33,7 +33,11 @@ PRISM_VERSION ?= 1.9.0
 ifneq ($(wildcard vendor/prism/include/prism.h),)
   PRISM_DIR ?= vendor/prism
 else
-  PRISM_DIR ?= $(shell ruby -rprism -e 'puts $$LOADED_FEATURES.grep(/prism/).first.sub(%r{/lib/.*}, "")' 2>/dev/null)
+  # Resolve the installed prism gem's directory via RubyGems. (The old
+  # $LOADED_FEATURES one-liner stripped from the FIRST /lib/, which is Ruby's
+  # own lib dir, so it collapsed to the Ruby install root -- a tree with no
+  # include/prism.h -- and failed deep in the compile instead of here.)
+  PRISM_DIR ?= $(shell ruby -e 'require "rubygems"; s=Gem::Specification.find_all_by_name("prism").first; puts s.gem_dir if s' 2>/dev/null)
 endif
 
 PRISM_INC    = $(PRISM_DIR)/include
@@ -244,7 +248,7 @@ SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
                build/csrc/analyze.o build/csrc/analyze_util.o build/csrc/analyze_infer.o build/csrc/analyze_infer_recv.o \
                build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/codegen.o build/csrc/codegen_util.o \
                build/csrc/codegen_fold.o build/csrc/codegen_call.o build/csrc/codegen_call_recv.o build/csrc/codegen_iter.o \
-               build/csrc/codegen_expr.o build/csrc/codegen_stmt.o build/csrc/csplit.o build/csrc/main.o
+                build/csrc/codegen_expr.o build/csrc/codegen_stmt.o build/csrc/csplit.o build/csrc/codegen_crystal.o build/csrc/main.o
 
 build/csrc:
 	@mkdir -p build/csrc
