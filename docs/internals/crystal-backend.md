@@ -231,21 +231,26 @@ output against CRuby gives:
 
 | outcome | baseline `bd1f9b4a` | current | meaning |
 | --- | --- | --- | --- |
-| emit-clean | 757 | 671 | emits Crystal at all (the rest refuse) |
-| PASS | 196 | **214** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 84 | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 373 | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3745 | refused at the Ruby line, with a reason |
+| emit-clean | 757 | 690 | emits Crystal at all (the rest refuse) |
+| PASS | 196 | **226** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 89 | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 375 | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3726 | refused at the Ruby line, with a reason |
 
-This is **+18 PASS with zero PASS regressions** (every program that passed on the
-baseline still passes). The emit-clean count *fell* by 86 on purpose: the
-honesty-gate work below turns 86 programs that previously emitted Crystal that
-did not compile into line-anchored refusals. The 14 new DIFFs are the remainder
-of that set — programs that now compile but disagree with CRuby on an edge case
-(empty `min`/`max`, `Array#fill` with a Range, blockless `each_index`, `String#tr`
-ranges, numeric-string `upto`). A DIFF is a strictly better state than a
+This is **+30 PASS with zero PASS regressions** (every program that passed on the
+baseline still passes). The emit-clean count *fell* by 67 on purpose: the
+honesty-gate work below turns programs that previously emitted Crystal that did
+not compile into line-anchored refusals, and the method sweep (below) adds back a
+net 19 of them. The new DIFFs are the remainder — programs that now compile but
+disagree with CRuby on an edge case (empty `min`/`max`, `Array#fill` with a Range,
+blockless `each_index`, `String#tr` ranges, numeric-string `upto`, and from the
+method sweep: `squeeze` with a charset argument, `transform_values` block form,
+and `chunk_while` on a Range). A DIFF is a strictly better state than a
 BUILDFAIL: the translation compiles, and the remaining gap is a named, measurable
-behavior difference rather than a broken file.
+behavior difference rather than a broken file. The only new BUILDFAILs are two
+programs that call `chunk_while` on a Range, whose resulting iterator's blockless
+forms differ from CRuby; that is a known Range-iterator gap, paid for by three
+Array programs that now pass.
 
 Reproduce with `scripts/crystal_corpus.sh`; it gives every build its own
 `CRYSTAL_CACHE_DIR` (a shared cache across parallel builds corrupts itself and
@@ -287,15 +292,29 @@ methods and classes have had priority:
   no Crystal form and is refused.
 
 The method allowlist was extended only with names verified by a build-and-run
-comparison against Ruby, not merely by compiling: `match`, `=~`,
+comparison against Ruby, not merely by compiling. The first batch: `match`, `=~`,
 `Exception#message`, `Class#name`, `Kernel#at_exit`, and the data methods
 `fill`/`each_index`/`max`/`min`/`map!`/`slice_when`/`upto`/`itself`/`dig`/`tr`.
+A second sweep added `compact`/`flatten`/`chunk_while`, the Hash methods
+`each_key`/`each_value`/`transform_values`/`transform_keys`/`invert`/`clear`, and
+`squeeze`/`succ`. Each was exercised on a realistic receiver and its output diffed
+byte-for-byte against CRuby.
+
 Names whose Crystal version is *not* Ruby's are deliberately left refused —
 `Object#class` (`5.class` is `Integer` in Ruby, `Int32` in Crystal), `String#scan`
 (Ruby yields Strings, Crystal yields `MatchData`), `String#chr`/`each_char`/`lines`
-(Char vs String, line terminators), and the methods Crystal simply lacks
-(`match?`, `freeze`, `frozen?`, `inject`, `slice`, `slice!`, `lazy`, `send`,
-`equal?`). `scripts/crystal_reject_test.sh` pins the refusal messages.
+(Char vs String, line terminators), the methods Crystal simply lacks (`match?`,
+`freeze`, `frozen?`, `inject`, `slice`, `slice!`, `lazy`, `send`, `equal?`,
+`union`, `difference`, `take`, `except`, `default`, `delete_if`, `pow`, `ord`,
+`casecmp`, `swapcase`, `chop`, `to_sym`, `intern`, `delete_suffix`,
+`reverse_each`, `then`, `yield_self`), and the methods that return a Tuple where
+Ruby returns an Array (`product`, `divmod`, `rpartition`, `partition`, `minmax`).
+Three more were verified on their natural receiver but left out because the
+allowlist is name-based, not receiver-aware: `chomp` (fails once allowed on a
+nilable receiver such as `gets.chomp`), `modulo` (Crystal's `%` needs matching
+Int/Float types), and `to_h` (fails on a Struct receiver). For each of those a
+clear refusal is better than the build error it would cause.
+`scripts/crystal_reject_test.sh` pins the refusal messages.
 
 Two independent codegen bugs surfaced while building the refusal tables and were
 fixed:

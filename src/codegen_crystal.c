@@ -908,18 +908,37 @@ static int cr_builtin_ok(const char *n) {
     "fetch", "each_with_index", "any?", "all?", "include?", "includes?",
     "index", "rindex", "to_a", "uniq", "zip", "values_at", "each_cons",
     "each_slice", "step",
-    /* Verified by build-and-run against Ruby, not just by compiling:
-         Array#fill/each_index/max/min/map!/slice_when, Integer#upto,
-         Object#itself, Hash#dig, String#tr
-       all produce byte-identical output. */
+    /* Verified by build-and-run against Ruby, not just by compiling -- each was
+       exercised on a realistic receiver and its output diffed byte-for-byte:
+          Array/Enumerable: fill, each_index, max, min, map!, slice_when,
+                            compact, flatten, chunk_while
+          Integer#upto, Object#itself, Hash#dig, String#tr
+        (Enumerable-with-block methods the analyzer desugars into a helper --
+         take_while, find, each_with_index, ... -- are refused at that helper and
+         never reach this table, so they are not listed here.)
+        Deliberately NOT added from the same sweep, because Crystal's version is
+       not Ruby's: product/union/divmod/rpartition/partition/minmax return a
+       Tuple where Ruby returns an Array (so `p` and `.class` differ), bsearch
+       disagrees on a no-match, and union/difference/take/except/default/
+       delete_if/pow/ord/casecmp/swapcase/chop/to_sym/intern/delete_suffix/
+       reverse_each/ljust/center/then/yield_self do not exist in Crystal at all. */
     "fill", "each_index", "max", "min", "map!", "slice_when", "upto",
     "itself", "dig", "tr",
-    /* Hash */
+    "compact", "flatten", "chunk_while",
+    /* Hash -- verified byte-identical: each_key, each_value, transform_values,
+       transform_keys, invert, clear (also on Array). to_h was verified on an
+       Array of pairs but is NOT listed: it is net-negative in the corpus because
+       a name-based allowlist lets it through on a Struct receiver, where Crystal
+       fails -- a clear refusal is better than that build error. */
     "keys", "values", "has_key?", "key?", "each_pair", "merge", "delete",
-    /* String */
+    "each_key", "each_value", "transform_values", "transform_keys", "invert",
+    "clear",
+    /* String -- verified byte-identical: squeeze. chomp is NOT listed for the
+       same reason as to_h: it is correct on a plain String but net-negative once
+       allowed on a nilable receiver (`gets.chomp`), where Crystal fails. */
     "upcase", "downcase", "capitalize", "strip", "lstrip", "rstrip", "gsub",
     "sub", "split", "chars", "to_s", "to_i", "to_f", "start_with?", "end_with?",
-    "bytes", "bytesize",
+    "bytes", "bytesize", "squeeze",
     /* Each verified present in Crystal 1.21 AND verified to produce the same
        output as Ruby on a build-and-run comparison, not just to compile:
          String#match      -> Regex::MatchData, same indexing and pre_match
@@ -934,9 +953,11 @@ static int cr_builtin_ok(const char *n) {
          exist in Crystal at all. Refusing those is the honest answer; adding
          one would trade a named refusal for a silently wrong value. */
     "match", "=~", "message", "name", "at_exit",
-    /* Numeric */
+    /* Numeric -- succ verified byte-identical (on Int and String). modulo is NOT
+       listed: it is correct for same-type operands but net-negative once allowed
+       on mixed Int/Float operands, where Crystal's `%` requires matching types. */
     "abs", "ceil", "floor", "round", "truncate", "div", "gcd", "lcm", "clamp",
-    "odd?", "even?",
+    "odd?", "even?", "succ",
     /* Math (called as Math.x) */
     "sqrt", "sin", "cos", "tan", "log", "exp",
     /* Object / constructors */
