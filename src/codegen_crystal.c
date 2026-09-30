@@ -77,6 +77,8 @@ typedef struct {
                              needs the binding the enclosing clause introduced.
                              Set around the emission of a clause body, which may
                              itself contain nested begin/rescue. */
+  int tmp_seq;          /* counter for synthetic emitter-local names, so two
+                           desugarings in one method never collide */
 } CrGen;
 
 /* Record that `id` is outside the supported subset. Emission continues (a
@@ -116,7 +118,8 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_call(CrGen *g, int id, Buf *b);
-static void cr_emit_block(Buf *b, CrGen *g, int block, int indent);
+static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
+                          const char *meth);
 static void cr_emit_if(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_case(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module);
@@ -157,6 +160,49 @@ static int cr_map_type(CrGen *g, TyKind t, Buf *b) {
   }
   buf_puts(b, "untyped");
   return 0;
+}
+
+/* True when a Ruby local's name is reserved in Crystal and so cannot be emitted
+   verbatim. Ruby and Crystal share most keywords, so a local named `class` or
+   `if` is already broken in Ruby; the ones that matter are the Crystal-only
+   keywords `out`, `in`, `as` and `with`, which are ordinary Ruby identifiers. A
+   local named `out` used to emit `out = ""` and fail to compile with "expecting
+   variable or instance variable after out", because Crystal's parser reads `out`
+   as the start of an out-parameter. The Ruby-keyword list is included too:
+   renaming those is harmless (they cannot be legal Ruby locals) and keeps one
+   rule instead of an incomplete keyword list. */
+static int cr_is_reserved(const char *n) {
+  if (!n) return 0;
+  static const char *const kw[] = {
+    "alias", "abstract", "annotation", "as", "begin", "break", "case", "class",
+    "def", "do", "else", "elsif", "end", "ensure", "false", "if", "in",
+    "module", "next", "nil", "out", "rescue", "retry", "return", "self", "super",
+    "then", "true", "unless", "until", "when", "while", "with", "yield",
+  };
+  for (size_t i = 0; i < sizeof kw / sizeof kw[0]; i++)
+    if (sp_streq(n, kw[i])) return 1;
+  return 0;
+}
+
+/* The emitted name for a Ruby local: `_cr_<name>` when reserved, else the name
+   itself. The rename is a pure function of the Ruby name, so every occurrence of
+   that local -- its write, its reads, a block parameter, a multi-assign target,
+   a method parameter -- maps to the same identifier and the binding still lines
+   up. The analyzer's symbol table keeps the Ruby name (scope_local/nameset are
+   keyed on it), so only the emitted text changes.
+
+   The returned buffer is per-call, so the result must be used before the next
+   cr_local call; callers either buf_puts it immediately or call it once per
+   printf argument, which is safe because printf arguments are evaluated before
+   the format is consumed. Four slots cover the widest single printf. */
+static const char *cr_local(const char *n) {
+  if (!n) return "";
+  if (!cr_is_reserved(n)) return n;
+  static char bufs[4][96];
+  static int turn;
+  char *out = bufs[turn++ & 3];
+  snprintf(out, 96, "_cr_%s", n);
+  return out;
 }
 
 /* The ELEMENT Crystal type of an array kind (for empty array literals).
@@ -436,6 +482,64 @@ static const char *cr_core_class_name(CrGen *g, const char *n) {
   return NULL;
 }
 
+/* A Ruby constant that has an exact Crystal spelling with the same value, so it
+   is translated rather than refused. Returns 1 and writes the Crystal
+   expression when `path::leaf` has one. Only exact-equivalent spellings belong
+   here; a value that merely resembles the Ruby one is a refusal, not a guess. */
+static int cr_const_remap(const char *path, const char *leaf, Buf *b) {
+  if (!leaf) return 0;
+  /* Ruby's Float::INFINITY is a constant VALUE, and a positive-zero divisor is
+     the Crystal expression with exactly that value (verified: it compiles and
+     prints Infinity). Writing the constant name itself would not compile. A bare
+     `Float` read has no owner, so `path` is NULL there and must not be compared. */
+  if (path && sp_streq(path, "Float") && sp_streq(leaf, "INFINITY")) {
+    buf_puts(b, "(1.0 / 0.0)");
+    return 1;
+  }
+  return 0;
+}
+
+/* A Ruby name Crystal's stdlib does not define, so emitting one is a guaranteed
+   "undefined constant" build error. Returns the refusal reason, or NULL when the
+   name is fine. Keyed by full path where the bare name IS defined but the member
+   is not: `Float` is a real Crystal class, `Float::INFINITY` is not one of its
+   members, so a bare `Float` must keep working.
+
+   Consulted only after cr_core_class_name has already given a user class of the
+   same name priority, so a program's own `class Data` still works -- a class it
+   defines is a different thing from the stdlib name it shadows. */
+static const char *cr_missing_const(const char *path, const char *leaf) {
+  if (!leaf) return NULL;
+  static const struct { const char *path; const char *leaf; const char *why; } m[] = {
+    /* No Crystal stdlib name of that kind at all. */
+    { "TCPServer", NULL, "Crystal's sockets are a separate library with no TCPServer" },
+    { "Socket", NULL, "Crystal's sockets are a separate library with no Socket" },
+    { "Addrinfo", NULL, "Crystal has no Addrinfo; an address is an Addr" },
+    { "Data", NULL, "Crystal 1.21 has no Data.define" },
+    { "Enumerator", NULL, "Crystal has no Enumerator" },
+    { "Queue", NULL, "Crystal's channel type is Channel, not Queue" },
+    { "ConditionVariable", NULL, "Crystal has no ConditionVariable" },
+    { "Regexp", NULL, "Crystal spells the class Regex; there is no Regexp" },
+    { "RUBY_ENGINE", NULL, "Crystal has no RUBY_ENGINE constant" },
+    { "FileTest", NULL, "Crystal has no FileTest module" },
+    { "Interrupt", NULL, "Crystal has no Interrupt exception class" },
+    { "NoMethodError", NULL, "Crystal has no NoMethodError exception class" },
+    { "FrozenError", NULL, "Crystal has no FrozenError exception class" },
+    { "Complex", NULL, "Crystal has no Complex number type" },
+    /* The class exists; the member does not. */
+    { "Float", "INFINITY", "Crystal has no Float::INFINITY" },
+    { "Float", "NAN", "Crystal has no Float::NAN" },
+  };
+  for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) {
+    if (m[i].leaf) {
+      if (path && sp_streq(m[i].path, path) && sp_streq(m[i].leaf, leaf)) return m[i].why;
+    } else if (sp_streq(m[i].path, leaf)) {
+      return m[i].why;
+    }
+  }
+  return NULL;
+}
+
 /* ---- exception classes ----
    Crystal 1.21 defines only a handful of exception classes (Exception,
    ArgumentError, IndexError, KeyError, RuntimeError, DivisionByZeroError,
@@ -644,7 +748,143 @@ static const char *cr_translate_name(CrGen *g, int recv, const char *n) {
   /* Class-level predicates: Crystal spells these in the plural. */
   if (sp_streq(n, "exist?"))        return "exists?";
   if (sp_streq(n, "chdir"))         return "cd";
+  /* Time#to_i is epoch seconds, which Crystal names to_unix. Only on a Time:
+     Integer#to_i is an identity conversion that Crystal has no need to name. */
+  if (sp_streq(n, "to_i") && recv >= 0 && comp_ntype(g->c, recv) == TY_TIME)
+    return "to_unix";
   return n;
+}
+
+/* A method that does not exist on this receiver, so the call is a guaranteed
+   "undefined method" build error. Returns the refusal reason, or NULL.
+
+   This is the other half of the honesty gate. cr_builtin_ok is a NAME
+   allowlist, so it can only refuse a name it does not know -- it cannot notice
+   that `<<` is fine on an Array and undefined on a String, or that a class
+   receiver like `Time` is not concrete in this type model and so never reaches
+   the concrete-receiver check in cr_emit_call at all. Those names are in
+   cr_builtin_ok (or slip past it entirely) and still cannot compile, so they are
+   matched here by (receiver, name).
+
+   Keyed by receiver rather than by name alone on purpose: `<<` must keep working
+   on Array, `<<` on String is refused, and a program may define either name on
+   its own class. User methods are checked first by the caller, so a class the
+   program defines is never matched here. */
+static const char *cr_missing_method(CrGen *g, int id, int recv, const char *name) {
+  if (!name) return NULL;
+  /* The module or class a call is on, for the table below. A bare constant
+     (`GC.start`) names it directly; `Thread.new{...}.value` names it through the
+     constructor, so resolve one `new` hop as well. NULL when the receiver is a
+     value of some other shape. The type model gives a bare class receiver
+     TY_UNKNOWN, so the generic concrete-receiver gate in cr_emit_call cannot see
+     these calls at all; that is why the check is by name here. */
+  const char *mod = NULL;
+  if (recv >= 0 && nt_kind(g->nt, recv) == NK_ConstantReadNode) {
+    mod = nt_str(g->nt, recv, "name");
+  } else if (recv >= 0 && nt_kind(g->nt, recv) == NK_CallNode) {
+    int inner = nt_ref(g->nt, recv, "receiver");
+    const char *ctor = nt_str(g->nt, recv, "name");
+    if (inner >= 0 && ctor && sp_streq(ctor, "new") &&
+        nt_kind(g->nt, inner) == NK_ConstantReadNode)
+      mod = nt_str(g->nt, inner, "name");
+  }
+  struct { const char *recv; const char *meth; const char *why; } const t[] = {
+    { "GC",      "start", "Crystal's GC has no start" },
+    { "GC",      "stat",  "Crystal's GC has no stat; timing is Process.monotonic_time" },
+    { "Thread",  "value", "Crystal's Thread has no value; join then read a field" },
+    { "File",    "stat",  "Crystal's File has no class-level stat; use File.info" },
+    { "File",    "lstat", "Crystal's File has no class-level lstat" },
+    { "Time",    "to_a",  "Crystal's Time has no to_a" },
+    { "Kernel",  "gets",  "Crystal reads stdin with gets, not Kernel.gets" },
+  };
+  if (mod) {
+    /* A class the program defines shadows the stdlib name, so a call on it is
+       the program's own method and not the missing one. */
+    for (int i = 0; i < g->c->nclasses; i++)
+      if (sp_streq(g->c->classes[i].name, mod)) return NULL;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+      if (sp_streq(t[i].recv, mod) && sp_streq(t[i].meth, name)) return t[i].why;
+    /* Time.at is translated, not refused -- but only for a single integer
+       argument, which is the one shape Crystal's Time.unix matches. Any other
+       argument has no equivalent, and saying so is better than emitting the
+       rewrite and letting it fail as "expected Int, not Float64". */
+    if (sp_streq(mod, "Time") && sp_streq(name, "at")) {
+      int ac = 0; const int *av = call_args(g->nt, id, &ac);
+      if (ac != 1 || comp_ntype(g->c, av[0]) != TY_INT)
+        return "Crystal's Time.unix takes one Int; Time.at with a fractional or "
+               "sub-second argument has no Crystal form";
+    }
+  }
+  /* A receiver with an inferred value type. Match on the Crystal type the
+     emitter would have written, so the rule is stated in the same terms as the
+     output. */
+  TyKind rt = (recv >= 0) ? comp_ntype(g->c, recv) : TY_UNKNOWN;
+  struct { TyKind type; const char *meth; const char *why; } const v[] = {
+    { TY_STRING, "<<",
+      "Crystal's String is immutable and has no <<; a Ruby append-in-place needs a mutable buffer" },
+    { TY_RANGE,  "lazy",
+      "Crystal's Range has no lazy; there is no lazy enumerator to build" },
+  };
+  for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
+    if (v[i].type == rt && sp_streq(v[i].meth, name)) return v[i].why;
+  if (ty_is_hash(rt)) {
+    if (sp_streq(name, "freeze"))   return "Crystal has no freeze; a Hash is not frozen at runtime";
+    if (sp_streq(name, "frozen?"))  return "Crystal has no frozen?";
+    if (sp_streq(name, "sort"))     return "Hash has no sort; collect the pairs and sort those";
+    if (sp_streq(name, "sort_by"))  return "Hash has no sort_by; collect the pairs and sort those";
+  }
+  if (rt == TY_MUTEX && sp_streq(name, "locked?"))
+    return "Crystal's Mutex has no locked?";
+  return NULL;
+}
+
+/* A Ruby method whose Crystal equivalent is a DIFFERENT call shape, not just a
+   different name, so cr_translate_name cannot express it. Returns 1 and writes
+   the whole call (receiver, arguments and all) when it applies.
+
+   Only exact-semantics rewrites belong here. `Time.at` and `Time.unix` agree on
+   the instant, but Ruby's Time.at is in LOCAL time while Crystal's Time.unix is
+   UTC, so the rewrite carries `.to_local`; without it the value's zone would
+   silently differ. `Dir.rmdir` and `Dir.delete` are the same operation. */
+static int cr_call_remap(CrGen *g, int id, int recv, const char *name, Buf *b) {
+  if (!name || recv < 0) return 0;
+  if (nt_kind(g->nt, recv) != NK_ConstantReadNode) return 0;
+  const char *mod = nt_str(g->nt, recv, "name");
+  if (!mod) return 0;
+  for (int i = 0; i < g->c->nclasses; i++)
+    if (sp_streq(g->c->classes[i].name, mod)) return 0;  /* a user class wins */
+  int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+  if (sp_streq(mod, "Time") && sp_streq(name, "at")) {
+    /* Crystal's Time.unix takes an Int, and Ruby has no sub-argument form. So the
+       rewrite only holds for a single integer-valued argument. `Time.at(1.5)`
+       and `Time.at(secs, usec)` are refused rather than rewritten, because
+       emitting the rewrite anyway would only move the failure to a Crystal
+       "expected Int, not Float64" -- the same build error with less of a clue. */
+    if (argc != 1 || comp_ntype(g->c, argv[0]) != TY_INT) return 0;
+    buf_puts(b, "Time.unix(");
+    for (int i = 0; i < argc; i++) {
+      if (i) buf_puts(b, ", ");
+      cr_emit_expr(g, argv[i], b);
+    }
+    buf_puts(b, ").to_local");
+    return 1;
+  }
+  /* Time.now is "the current time in local zone", which is Crystal's
+     Time.local with no arguments. Crystal has no Time.now. */
+  if (sp_streq(mod, "Time") && sp_streq(name, "now") && argc == 0) {
+    buf_puts(b, "Time.local");
+    return 1;
+  }
+  if (sp_streq(mod, "Dir") && sp_streq(name, "rmdir")) {
+    buf_printf(b, "Dir.delete(");
+    for (int i = 0; i < argc; i++) {
+      if (i) buf_puts(b, ", ");
+      cr_emit_expr(g, argv[i], b);
+    }
+    buf_puts(b, ")");
+    return 1;
+  }
+  return 0;
 }
 
 /* A method name is emittable only if it is a Crystal stdlib method whose
@@ -668,12 +908,32 @@ static int cr_builtin_ok(const char *n) {
     "fetch", "each_with_index", "any?", "all?", "include?", "includes?",
     "index", "rindex", "to_a", "uniq", "zip", "values_at", "each_cons",
     "each_slice", "step",
+    /* Verified by build-and-run against Ruby, not just by compiling:
+         Array#fill/each_index/max/min/map!/slice_when, Integer#upto,
+         Object#itself, Hash#dig, String#tr
+       all produce byte-identical output. */
+    "fill", "each_index", "max", "min", "map!", "slice_when", "upto",
+    "itself", "dig", "tr",
     /* Hash */
     "keys", "values", "has_key?", "key?", "each_pair", "merge", "delete",
     /* String */
     "upcase", "downcase", "capitalize", "strip", "lstrip", "rstrip", "gsub",
     "sub", "split", "chars", "to_s", "to_i", "to_f", "start_with?", "end_with?",
     "bytes", "bytesize",
+    /* Each verified present in Crystal 1.21 AND verified to produce the same
+       output as Ruby on a build-and-run comparison, not just to compile:
+         String#match      -> Regex::MatchData, same indexing and pre_match
+         String#=~         -> same integer offset
+         Exception#message -> same string
+         Class#name        -> same module/class name string
+         Kernel#at_exit    -> runs at exit, in order
+       Deliberately NOT added, because Crystal's version is not Ruby's:
+         Object#class  -> Ruby's `5.class` is Integer, Crystal's is Int32
+         String#scan   -> Ruby's yields Strings, Crystal's yields MatchData
+         match?/freeze/frozen?/inject/slice/slice!/lazy/send/equal? do not
+         exist in Crystal at all. Refusing those is the honest answer; adding
+         one would trade a named refusal for a silently wrong value. */
+    "match", "=~", "message", "name", "at_exit",
     /* Numeric */
     "abs", "ceil", "floor", "round", "truncate", "div", "gcd", "lcm", "clamp",
     "odd?", "even?",
@@ -703,6 +963,29 @@ static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare) {
 /* Emit a constant path (C::CONST, A::B::C) by walking the parent chain. */
 static void cr_emit_const_path(CrGen *g, int id, Buf *b) {
   int parent = nt_ref(g->nt, id, "parent");
+  /* `Float::INFINITY` is a constant PATH whose leaf has no Crystal member, so
+     the whole path is what decides: remap when the path has an exact Crystal
+     spelling, refuse when it names something Crystal does not define. A nested
+     path (`A::B::C`) is left to the recursive walk below, since these tables
+     only know single-level names. */
+  if (parent >= 0 && nt_kind(g->nt, parent) == NK_ConstantReadNode) {
+    const char *owner = nt_str(g->nt, parent, "name");
+    const char *leaf  = nt_str(g->nt, id, "name");
+    if (owner && leaf) {
+      int user_class = 0;
+      for (int ci = 0; ci < g->c->nclasses; ci++)
+        if (sp_streq(g->c->classes[ci].name, owner)) { user_class = 1; break; }
+      if (cr_const_remap(owner, leaf, b)) return;
+      const char *why = user_class ? NULL : cr_missing_const(owner, leaf);
+      if (why) {
+        char msg[176];
+        snprintf(msg, sizeof msg, "the constant '%s::%s' (%s)", owner, leaf, why);
+        cr_mark_unsupported(g, id, msg);
+        buf_puts(b, "nil");
+        return;
+      }
+    }
+  }
   if (parent >= 0) {
     if (nt_kind(g->nt, parent) == NK_ConstantPathNode) cr_emit_const_path(g, parent, b);
     else { const char *n = nt_str(g->nt, parent, "name"); buf_puts(b, n ? n : ""); }
@@ -762,7 +1045,7 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
     case NK_NilNode:   buf_puts(b, "nil");   return;
     case NK_LocalVariableReadNode: {
       const char *n = nt_str(g->nt, id, "name");
-      buf_puts(b, n ? n : "");
+      buf_puts(b, cr_local(n));
       return;
     }
     case NK_InstanceVariableReadNode: {
@@ -773,6 +1056,27 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
     case NK_ConstantReadNode: {
       const char *n = nt_str(g->nt, id, "name");
       if (n) {
+        /* A name Crystal has with the same value, under a different spelling:
+           translate it rather than refuse it. Checked first, because a remap is
+           the better answer when one exists. */
+        if (cr_const_remap(NULL, n, b)) return;
+        /* A Ruby stdlib name with no Crystal counterpart. Refusing it here names
+           the gap at the Ruby line, instead of shipping `Data` or `RUBY_ENGINE`
+           into the output where it becomes an "undefined constant" build error
+           with no hint that the name is the problem. Skipped when the program
+           defines a class of the same name: that is a different binding, and it
+           resolves. */
+        int user_class = 0;
+        for (int ci = 0; ci < g->c->nclasses; ci++)
+          if (sp_streq(g->c->classes[ci].name, n)) { user_class = 1; break; }
+        const char *why = user_class ? NULL : cr_missing_const(NULL, n);
+        if (why) {
+          char msg[176];
+          snprintf(msg, sizeof msg, "the constant '%s' (%s)", n, why);
+          cr_mark_unsupported(g, id, msg);
+          buf_puts(b, "nil");
+          return;
+        }
         /* Ruby's core class names are spelled differently in Crystal, and the
            Ruby spellings are not defined there (`is_a?(Integer)` is a
            compile-time "undefined constant"). A user class of the same name
@@ -1028,7 +1332,26 @@ static void cr_emit_case(CrGen *g, int id, Buf *b, int indent) {
 }
 
 /* ---- blocks: recv.<name> do |p| ... end ---- */
-static void cr_emit_block(Buf *b, CrGen *g, int block, int indent) {
+/* A Ruby block over a one-value-yielding iterator with 2+ params auto-splats the
+   single yielded value: `[[1,2],[3,4]].each { |a, b| }` binds a and b to the
+   inner array's elements. Crystal does not: it yields exactly one parameter, so
+   `do |a, b|` is "too many block parameters (given 2, expected maximum 1)".
+
+   Crystal's own `|(a, b)|` syntax would be the literal translation, but it is
+   wrong for the iterators that really do yield two values -- `Hash#each` and
+   `each_with_index` -- which are already correct. So the split is made on the
+   yield arity instead: `ty_block_yield` (types.c) is the single source of truth
+   for builtin block protocols, and it returns 1 for `each`/`map`/`sort_by`/...
+   and 2 for the pair-yielding ones. Only the 1-yield case is desugared.
+
+   The destructure is emitted as an assignment INSIDE the body
+   (`do |__cr_elem| ; a, b = __cr_elem ; ...`) rather than as `|(a, b)|`. That
+   form is element-shape agnostic -- it binds a Tuple from `zip` and an Array
+   from `each_slice(2)` equally well -- so it cannot regress an iterator that was
+   already building, and it mirrors what the shared analyzer already does for a
+   parenthesized `|(a, b)|` source param (analyze_pass.c, block_destr_params). */
+static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
+                          const char *meth) {
   int params = nt_ref(g->nt, block, "parameters");
   int body   = nt_ref(g->nt, block, "body");
 
@@ -1041,15 +1364,39 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent) {
   } else if (pty && sp_streq(pty, "ParametersNode")) {
     preqs = nt_arr(g->nt, params, "requireds", &pn);
   }
-  buf_puts(b, pn > 0 ? " do |" : " do");
-  for (int i = 0; i < pn; i++) {
+  /* Ruby auto-splats only when the block asks for more values than the iterator
+     yields. A parenthesized `|(a, b)|` was already desugared upstream into a
+     single param, so seeing 2+ REQUIRED params here is the flat `|a, b|` form
+     and the auto-splat is what Ruby would do. */
+  TyKind yields[4];
+  int splat = 0;
+  if (pn >= 2 && recv >= 0 && meth && ty_block_yield(comp_ntype(g->c, recv),
+                                                      meth, yields, 4) == 1)
+    splat = 1;
+  char elem[48] = "";
+  if (splat) snprintf(elem, sizeof elem, "__cr_elem%d", g->tmp_seq++);
+  buf_puts(b, (splat || pn > 0) ? " do |" : " do");
+  if (splat) buf_puts(b, elem);
+  for (int i = 0; i < pn && !splat; i++) {
     const char *rn = nt_str(g->nt, preqs[i], "name");
     if (i) buf_puts(b, ", ");
-    buf_puts(b, rn ? rn : "");
-    nameset_add(&g->locals, rn);
+    buf_puts(b, cr_local(rn));
   }
+  /* The real param names are declared by the destructuring assignment below, but
+     they must be visible to the nil-safety name set either way: the assignment is
+     an ordinary write, and the body reads them exactly as before. */
+  for (int i = 0; i < pn; i++)
+    nameset_add(&g->locals, nt_str(g->nt, preqs[i], "name"));
   if (pn > 0) buf_puts(b, "|");
   buf_puts(b, "\n");
+  if (splat) {
+    cr_indent(b, indent + 1);
+    for (int i = 0; i < pn; i++) {
+      if (i) buf_puts(b, ", ");
+      buf_puts(b, cr_local(nt_str(g->nt, preqs[i], "name")));
+    }
+    buf_printf(b, " = %s\n", elem);
+  }
   /* The last statement of a block body is the block's return value, not a
      discarded read, so record it: the "value thrown away" rule must not turn its
      trailing index read into a nilable one. */
@@ -1222,7 +1569,21 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
        argument (a variable holding a class) has no Crystal form -- refused. */
     int isa_const = sp_streq(name, "is_a?") && argc == 1 &&
                     nt_kind(g->nt, argv[0]) == NK_ConstantReadNode;
-    if (!cr_builtin_ok(name) && !isa_const && !cr_user_method_ok(g, name, rt, bare)) {
+    int user_meth = cr_user_method_ok(g, name, rt, bare);
+    /* A method Crystal does not have on THIS receiver, whatever its name is in
+       the allowlist. Checked after the user-method test, so a method the program
+       defines always wins, and before the allowlist gate, which cannot see a
+       receiver-dependent difference like String#<< versus Array#<<. */
+    const char *missing = user_meth ? NULL : cr_missing_method(g, id, recv, name);
+    if (missing) {
+      char why[176];
+      snprintf(why, sizeof why, "method '%s' is not available on this receiver (%s)",
+               name, missing);
+      cr_mark_unsupported(g, id, why);
+      buf_puts(b, "nil");
+      return;
+    }
+    if (!cr_builtin_ok(name) && !isa_const && !user_meth) {
       /* A receiverless call, or a call on a CONCRETE type, is verifiable: an
          unknown method there would be a Crystal build error, so refuse it. A call
          on an untyped (poly/unknown) receiver defers to Crystal's dynamic dispatch
@@ -1238,6 +1599,10 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       }
     }
   }
+  /* A call whose Crystal equivalent has a different shape, not just a different
+     name (`Time.at` -> `Time.unix(..).to_local`). Emitted whole, so it runs
+     before the generic receiver/method/argument form below. */
+  if (block < 0 && cr_call_remap(g, id, recv, name, b)) return;
   const char *mname = cr_translate_name(g, recv, name);
   if (recv >= 0) {
     /* `x.nil?` asks whether x is nil, and `x.inspect` / `x.to_s` are defined on
@@ -1262,7 +1627,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   g->nil_ok = sav2;
   buf_puts(b, ")");
 
-  if (block >= 0) cr_emit_block(b, g, block, 0);
+  if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
 }
 
 /* ---- statements ---- */
@@ -1300,7 +1665,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       for (int i = 0; i < tn; i++) {
         const char *nm = nt_str(g->nt, targets[i], "name");
         if (i) buf_puts(b, ", ");
-        buf_puts(b, nm ? nm : "");
+        buf_puts(b, cr_local(nm));
         nameset_add(&g->locals, nm);
       }
       buf_puts(b, " = ");
@@ -1329,7 +1694,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
                 cr_map_type(g, kt, &kb) && cr_map_type(g, vt, &vb)) {
               cr_indent(b, indent);
               buf_printf(b, "%s : Hash(%s, %s) = Hash(%s, %s).new",
-                         name, kb.p, vb.p, kb.p, vb.p);
+                         cr_local(name), kb.p, vb.p, kb.p, vb.p);
               free(kb.p); free(vb.p);
               nameset_add(&g->locals, name);
               buf_puts(b, "\n");
@@ -1354,7 +1719,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
               Buf el; memset(&el, 0, sizeof el);
               if (cr_array_elem_type(g, et, &el)) {
                 cr_indent(b, indent);
-                buf_printf(b, "%s : Array(%s) = [] of %s", name, el.p, el.p);
+                buf_printf(b, "%s : Array(%s) = [] of %s", cr_local(name), el.p, el.p);
                 free(el.p);
                 nameset_add(&g->locals, name);
                 buf_puts(b, "\n");
@@ -1390,9 +1755,9 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
            honest type; that is what keeps `x = c.last; p x + 1.0` monomorphic. */
         int missing = cr_maybe_missing(g, val) && cr_all_reads_nil_safe(&g->nil_uses, name);
         if (missing && cr_map_type(g, vt, &ann)) {
-          buf_printf(b, "%s : %s? = ", name ? name : "", ann.p);
+          buf_printf(b, "%s : %s? = ", cr_local(name), ann.p);
         } else {
-          buf_printf(b, "%s = ", name ? name : "");
+          buf_printf(b, "%s = ", cr_local(name));
         }
         free(ann.p);
         nameset_add(&g->locals, name);
@@ -1403,7 +1768,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
         buf_puts(b, "\n");
         return;
       } else {
-        buf_printf(b, "%s = ", name ? name : "");
+        buf_printf(b, "%s = ", cr_local(name));
       }
       cr_emit_expr(g, val, b);
       buf_puts(b, "\n");
@@ -1425,11 +1790,11 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       cr_indent(b, indent);
       if (op && (sp_streq(op, "+") || sp_streq(op, "-") || sp_streq(op, "*") ||
                  sp_streq(op, "/") || sp_streq(op, "%"))) {
-        buf_printf(b, "%s %s= ", name ? name : "", op);
+        buf_printf(b, "%s %s= ", cr_local(name), op);
         cr_emit_expr(g, val, b);
       } else {
         /* no compound form in Crystal (e.g. **=): expand to a plain assignment */
-        buf_printf(b, "%s = %s", name ? name : "", name ? name : "");
+        buf_printf(b, "%s = %s", cr_local(name), cr_local(name));
         if (op) buf_printf(b, " %s ", op);
         cr_emit_expr(g, val, b);
       }
@@ -1579,7 +1944,7 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
     LocalVar *lv = scope_local(s, pn);
     TyKind pt = lv ? lv->type : TY_UNKNOWN;
     if (!first) buf_puts(b, ", "); first = 0;
-    buf_printf(b, "%s", pn);
+    buf_printf(b, "%s", cr_local(pn));
     cr_emit_type_ann(g, pt, b);
   }
   for (int i = 0; i < opn; i++) {
@@ -1588,7 +1953,7 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
     LocalVar *lv = scope_local(s, pn);
     TyKind pt = lv ? lv->type : TY_UNKNOWN;
     if (!first) buf_puts(b, ", "); first = 0;
-    buf_printf(b, "%s", pn);
+    buf_printf(b, "%s", cr_local(pn));
     cr_emit_type_ann(g, pt, b);
     buf_puts(b, " = ");
     cr_emit_expr(g, dflt, b);

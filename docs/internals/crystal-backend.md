@@ -38,7 +38,8 @@ make bin/spinel                       # build the compiler (needs `crystal` on P
 spinel --target crystal app.rb -S     # print the generated .cr
 spinel --target crystal app.rb -c     # write app.cr only
 spinel --target crystal app.rb        # crystal build --release -> ./app, then report
-scripts/poc_crystal.sh                # run the corpus vs CRuby and print metrics
+scripts/poc_crystal.sh                # run the 18-program corpus vs CRuby and print metrics
+scripts/crystal_reject_test.sh        # assert the honesty gate refuses with a reason
 ```
 
 `--target` accepts `crystal`, `wasm32-wasi`, or `native` (both `--target=X` and
@@ -197,11 +198,10 @@ constructs outside the subset. Both are near zero across the corpus, which is th
 core feasibility signal: **the analysis output was sufficient for a second
 backend without modification.**
 
-**Full-corpus baseline.** Run against the whole 4413-program `test/` suite (the
- C backend's own corpus, so every program is one Spinel can analyze), the Crystal
-target emits cleanly on **809 (18.4%)** and refuses the rest with a line-anchored
-diagnostic. The C backend compiles all 4413, so the gap is entirely the Crystal
-subset.
+**Full-corpus baseline.** Run against the C backend's own corpus (top-level
+`test/*.rb`), the Crystal target emits cleanly on a subset and refuses the rest
+with a line-anchored diagnostic. The C backend compiles all of them, so the gap
+is entirely the Crystal subset.
 
 Working through Crystal 1.21's removal of `untyped` revealed that the earlier
 "defer to dynamic dispatch on untyped receivers" strategy was not viable (there
@@ -223,23 +223,96 @@ refuse. The top remaining refusal reasons are poly containers, unknown method
 calls, keyword/rest parameters, block parameters, and `yield`. Driving the
 emit-clean count up while keeping refusals honest is the work that follows.
 
-**Measured results.** Of the 809 programs that emit, building each and comparing
-its output against CRuby gives:
+**Measured results.** The table below is a same-corpus, same-harness before/after
+so the deltas are meaningful: the baseline is commit `bd1f9b4a` built in a
+worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
+`scripts/crystal_corpus.sh`. Building each emitting program and comparing its
+output against CRuby gives:
 
-| outcome | count | meaning |
-| --- | --- | --- |
-| PASS | 222 | builds and output is byte-identical to CRuby |
-| DIFF | 75 | builds, but disagrees with CRuby |
-| BUILDFAIL | 508 | the emitted Crystal does not compile |
+| outcome | baseline `bd1f9b4a` | current | meaning |
+| --- | --- | --- | --- |
+| emit-clean | 757 | 671 | emits Crystal at all (the rest refuse) |
+| PASS | 196 | **214** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 84 | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 373 | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3745 | refused at the Ruby line, with a reason |
 
-Against the pre-`rescue` baseline of 682 emitting / 189 PASS / 61 DIFF / 432
-BUILDFAIL, this is **+127 emit-clean programs and +33 PASS with no regressions**:
-every program that passed before still passes.
+This is **+18 PASS with zero PASS regressions** (every program that passed on the
+baseline still passes). The emit-clean count *fell* by 86 on purpose: the
+honesty-gate work below turns 86 programs that previously emitted Crystal that
+did not compile into line-anchored refusals. The 14 new DIFFs are the remainder
+of that set — programs that now compile but disagree with CRuby on an edge case
+(empty `min`/`max`, `Array#fill` with a Range, blockless `each_index`, `String#tr`
+ranges, numeric-string `upto`). A DIFF is a strictly better state than a
+BUILDFAIL: the translation compiles, and the remaining gap is a named, measurable
+behavior difference rather than a broken file.
 
 Reproduce with `scripts/crystal_corpus.sh`; it gives every build its own
 `CRYSTAL_CACHE_DIR` (a shared cache across parallel builds corrupts itself and
 manufactures ~90 bogus "compiler bug" reports) and compares outputs serially
-after the builds finish.
+after the builds finish. The harness keys work files by repo-relative path, not
+basename: the corpus has duplicate basenames in subdirectories
+(`test/main.rb`, `test/require/main.rb`, `test/collect/seed/main.rb` all basename
+to `main`), and a basename key silently overwrote one with another, so four
+programs were never built or compared and every reported total was short by four.
+It also reads the file list on a dedicated file descriptor and gives each program
+`/dev/null` on stdin, so a program that reads stdin cannot consume the list and
+truncate the run.
+
+### The honesty gate: refuse, do not ship broken Crystal
+
+Crystal's type system and stdlib differ from Ruby's enough that a direct
+translation of a name can produce Crystal that either fails to compile with a
+message about the wrong thing, or compiles and silently disagrees. The emitter
+therefore refuses a construct it cannot translate, at the Ruby source line, and
+says why. Two receiver-aware tables drive this, consulted after the program's own
+methods and classes have had priority:
+
+- `cr_missing_const` refuses a constant Crystal's stdlib does not define
+  (`Data`, `Enumerator`, `Queue`, `Socket`, `TCPServer`, `RUBY_ENGINE`,
+  `Float::NAN`, ...). `Float::INFINITY` is the one constant with an exact Crystal
+  spelling (`(1.0 / 0.0)`), so it is remapped rather than refused. A program's own
+  `class Data` still wins, because the check runs after the user-class lookup.
+- `cr_missing_method` refuses a method that does not exist on *this* receiver,
+  which a name-only allowlist cannot see: `String#<<` is undefined in Crystal
+  while `Array#<<` is fine, `GC.start`/`GC.stat`/`Thread#value`/`File.stat`/
+  `File.lstat`/`Range#lazy`/`Mutex#locked?`/`Hash#freeze` have no counterpart, and
+  the receiver may be a class (`Time.at`), a constructor call
+  (`Thread.new{}.value`), or a typed value.
+- `cr_call_remap` rewrites the few calls whose Crystal form has a different shape
+  rather than a different name: `Time.at(n)` → `Time.unix(n).to_local` (Ruby's is
+  local time, Crystal's is UTC, so the zone is carried explicitly),
+  `Time.now` → `Time.local`, `Dir.rmdir` → `Dir.delete`. `Time.at` is only
+  rewritten for a single integer argument; a fractional or sub-second argument has
+  no Crystal form and is refused.
+
+The method allowlist was extended only with names verified by a build-and-run
+comparison against Ruby, not merely by compiling: `match`, `=~`,
+`Exception#message`, `Class#name`, `Kernel#at_exit`, and the data methods
+`fill`/`each_index`/`max`/`min`/`map!`/`slice_when`/`upto`/`itself`/`dig`/`tr`.
+Names whose Crystal version is *not* Ruby's are deliberately left refused —
+`Object#class` (`5.class` is `Integer` in Ruby, `Int32` in Crystal), `String#scan`
+(Ruby yields Strings, Crystal yields `MatchData`), `String#chr`/`each_char`/`lines`
+(Char vs String, line terminators), and the methods Crystal simply lacks
+(`match?`, `freeze`, `frozen?`, `inject`, `slice`, `slice!`, `lazy`, `send`,
+`equal?`). `scripts/crystal_reject_test.sh` pins the refusal messages.
+
+Two independent codegen bugs surfaced while building the refusal tables and were
+fixed:
+
+- **Crystal-keyword locals.** `out`, `in`, `as` and `with` are ordinary Ruby
+  identifiers but reserved in Crystal, so `out = ""` emitted Crystal that failed
+  with "expecting variable or instance variable after out". `cr_local` renames
+  such a local consistently at every binding site (write, read, block parameter,
+  multi-assign target, method parameter).
+- **Flat multi-param blocks over a one-value iterator.** Ruby auto-splats
+  `[[1,2],[3,4]].each { |a, b| }`; Crystal yields one value and rejects
+  `do |a, b|` with "too many block parameters". The emitter now binds one
+  synthetic param and destructures it in the body, gated on
+  `ty_block_yield(...) == 1` so the genuinely pair-yielding iterators
+  (`Hash#each`, `each_with_index`) are untouched. The in-body assignment is
+  element-shape agnostic, so it also handles a Tuple from `zip`.
+
 
 ### Nilability: consumption-site inference
 
