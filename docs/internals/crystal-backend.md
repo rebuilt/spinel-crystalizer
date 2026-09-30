@@ -38,8 +38,9 @@ make bin/spinel                       # build the compiler (needs `crystal` on P
 spinel --target crystal app.rb -S     # print the generated .cr
 spinel --target crystal app.rb -c     # write app.cr only
 spinel --target crystal app.rb        # crystal build --release -> ./app, then report
-scripts/poc_crystal.sh                # run the 18-program corpus vs CRuby and print metrics
-scripts/crystal_reject_test.sh        # assert the honesty gate refuses with a reason
+ scripts/poc_crystal.sh                # run the 18-program corpus vs CRuby and print metrics
+ scripts/crystal_reject_test.sh        # assert the honesty gate refuses with a reason
+ scripts/crystal_difference_test.sh    # pin each Ruby-vs-Crystal difference: agree / refuse / diverge
 ```
 
 `--target` accepts `crystal`, `wasm32-wasi`, or `native` (both `--target=X` and
@@ -323,6 +324,13 @@ nilable receiver such as `gets.chomp`), `modulo` (Crystal's `%` needs matching
 Int/Float types), and `to_h` (fails on a Struct receiver). For each of those a
 clear refusal is better than the build error it would cause.
 `scripts/crystal_reject_test.sh` pins the refusal messages.
+`scripts/crystal_difference_test.sh` goes further: for each named Ruby-vs-Crystal
+difference it pins the honest disposition — AGREE (translated, output matches
+CRuby), REFUSE (cleanly refused, naming the construct), or DIVERGE (emitted but
+known to differ on an edge). It is a regression net for the subtle translations
+(nil-on-miss `[]`, string quoting, block autosplat, `exist?`→`exists?`, trailing
+`while`) and an honesty ledger for the gaps that cannot be closed (no runtime
+metaprogramming, no `untyped`).
 
 Two independent codegen bugs surfaced while building the refusal tables and were
 fixed:
