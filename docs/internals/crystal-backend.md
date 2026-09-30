@@ -231,26 +231,34 @@ output against CRuby gives:
 
 | outcome | baseline `bd1f9b4a` | current | meaning |
 | --- | --- | --- | --- |
-| emit-clean | 757 | 690 | emits Crystal at all (the rest refuse) |
-| PASS | 196 | **226** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 89 | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 375 | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3726 | refused at the Ruby line, with a reason |
+| emit-clean | 757 | 747 | emits Crystal at all (the rest refuse) |
+| PASS | 196 | **240** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 99 | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 408 | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3669 | refused at the Ruby line, with a reason |
 
-This is **+30 PASS with zero PASS regressions** (every program that passed on the
-baseline still passes). The emit-clean count *fell* by 67 on purpose: the
+This is **+44 PASS with zero PASS regressions** (every program that passed on the
+baseline still passes). The emit-clean count *fell* by 10 on purpose: the
 honesty-gate work below turns programs that previously emitted Crystal that did
-not compile into line-anchored refusals, and the method sweep (below) adds back a
-net 19 of them. The new DIFFs are the remainder — programs that now compile but
-disagree with CRuby on an edge case (empty `min`/`max`, `Array#fill` with a Range,
-blockless `each_index`, `String#tr` ranges, numeric-string `upto`, and from the
-method sweep: `squeeze` with a charset argument, `transform_values` block form,
-and `chunk_while` on a Range). A DIFF is a strictly better state than a
-BUILDFAIL: the translation compiles, and the remaining gap is a named, measurable
-behavior difference rather than a broken file. The only new BUILDFAILs are two
-programs that call `chunk_while` on a Range, whose resulting iterator's blockless
-forms differ from CRuby; that is a known Range-iterator gap, paid for by three
-Array programs that now pass.
+not compile into line-anchored refusals, and the method sweep plus regex-literal
+support (below) add most of them back. The new DIFFs are the remainder — programs
+that now compile but disagree with CRuby on an edge case (empty `min`/`max`,
+`Array#fill` with a Range, blockless `each_index`, `String#tr` ranges,
+numeric-string `upto`, `squeeze` with a charset argument, `transform_values` block
+form, `chunk_while` on a Range, and a few regex edge cases). A DIFF is a strictly
+better state than a BUILDFAIL: the translation compiles, and the remaining gap is
+a named, measurable behavior difference rather than a broken file.
+
+Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
+translate to Crystal's native regex literal, which is the same syntax; the pattern
+text drops in verbatim with only the `/` delimiter re-escaped (the unescaped source
+resolves `\/` and `%r{}` slashes to a bare `/`). This unblocked 57 programs. Most of
+the new BUILDFAILs it exposed are not regex bugs: the dominant one is a nilable
+`MatchData` — `m = str.match(/re/); m[1]` fails because Crystal types the result as
+`(Regex::MatchData | Nil)` and will not dispatch a method on it without a guard. That
+is the separate nilability gap, now visible instead of hidden behind a regex refusal;
+the rest are patterns Crystal's engine genuinely cannot compile (named backreferences
+`\k<n>`) or a `MatchData` constant that needs a `Regex::MatchData` remap.
 
 Reproduce with `scripts/crystal_corpus.sh`; it gives every build its own
 `CRYSTAL_CACHE_DIR` (a shared cache across parallel builds corrupts itself and

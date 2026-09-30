@@ -437,6 +437,17 @@ static void cr_emit_escaped(Buf *b, const char *s) {
   }
 }
 
+/* Copy a regex pattern into a /.../ literal, escaping only the delimiter. The
+   unescaped source resolves \/ and %r{} slashes to a bare /, which would close
+   the Crystal literal early; re-escape it. Backslashes are left as-is -- they
+   are regex syntax in both Ruby and Crystal, not string escapes. */
+static void cr_emit_regex_pat(Buf *b, const char *s) {
+  for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+    if (*p == '/') buf_puts(b, "\\/");
+    else buf_putn(b, (const char *)p, 1);
+  }
+}
+
 /* A StatementsNode holding exactly one child -> that child's id, else -1. */
 static int cr_single_expr(const NodeTable *nt, int stmts_id) {
   if (stmts_id < 0) return -1;
@@ -1272,10 +1283,49 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       g->nil_ok = 0;
       return;
     }
+    /* A Ruby /pattern/ literal. Crystal's regex literal is the same syntax --
+       trailing option flags (/i /m /x) and inline interpolation included -- so
+       the pattern text drops in verbatim (it is regex source, not a Crystal
+       string, so it must NOT be string-escaped). The Prism flag bits map to the
+       same letters: IGNORE_CASE=4 -> i, MULTI_LINE=16 -> m, EXTENDED=8 -> x. */
+    case NK_RegularExpressionNode: {
+      const char *pat = nt_str(g->nt, id, "unescaped");
+      int flags = nt_int(g->nt, id, "flags", 0);
+      buf_puts(b, "/");
+      cr_emit_regex_pat(b, pat);
+      buf_puts(b, "/");
+      if (flags & 4)  buf_puts(b, "i");
+      if (flags & 16) buf_puts(b, "m");
+      if (flags & 8)  buf_puts(b, "x");
+      return;
+    }
+    case NK_InterpolatedRegularExpressionNode: {
+      int n = 0; const int *parts = nt_arr(g->nt, id, "parts", &n);
+      int flags = nt_int(g->nt, id, "flags", 0);
+      buf_puts(b, "/");
+      for (int i = 0; i < n; i++) {
+        NodeKind pk = nt_kind(g->nt, parts[i]);
+        if (pk == NK_StringNode) {
+          const char *s = nt_str(g->nt, parts[i], "content");
+          cr_emit_regex_pat(b, s);   /* regex text: escape only the delimiter */
+        } else if (pk == NK_EmbeddedStatementsNode) {
+          int stmts = nt_ref(g->nt, parts[i], "statements");
+          buf_puts(b, "#{");
+          int e = cr_single_expr(g->nt, stmts);
+          if (e >= 0) cr_emit_expr(g, e, b); else cr_emit_stmts(g, stmts, b, 0);
+          buf_puts(b, "}");
+        }
+      }
+      buf_puts(b, "/");
+      if (flags & 4)  buf_puts(b, "i");
+      if (flags & 16) buf_puts(b, "m");
+      if (flags & 8)  buf_puts(b, "x");
+      return;
+    }
     default: {
       /* An expression node outside the subset (SelfNode, GlobalVariableReadNode,
-         LambdaNode, RegularExpressionNode, ...). Emit a placeholder and record it;
-         the run is refused at the end so this never ships as a silent `nil`. */
+         LambdaNode, ...). Emit a placeholder and record it; the run is refused at
+         the end so this never ships as a silent `nil`. */
       const char *ty = nt_type(g->nt, id);
       cr_mark_unsupported(g, id, ty ? ty : "expression");
       buf_puts(b, "nil");
