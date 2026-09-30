@@ -365,6 +365,9 @@ static void usage(void) {
     "  --target=wasm32-wasi  Build a WebAssembly module for a WASI host with the\n"
     "              wasi-sdk at $WASI_SDK (default /opt/wasi-sdk); Integer is 32-bit,\n"
     "              and Fiber, Thread, processes and sockets are not available there\n"
+    "  --target=crystal    Emit Crystal source instead of C (experimental; needs\n"
+    "              `crystal` on PATH to build). Covers a small subset; see\n"
+    "              docs/internals/crystal-backend.md\n"
     "  -e STR      Inline Ruby source (repeatable; joined with newlines)\n"
     "  --rbs DIR   Seed analyzer with RBS signatures from DIR (advisory)\n"
     "  --int-overflow=MODE  Int +/-/* overflow handling (default: raise)\n"
@@ -432,7 +435,8 @@ int main(int argc, char **argv) {
     else if (!strncmp(a, "--target=", 9)) {
       if (sp_streq(a + 9, "wasm32-wasi")) target_wasi = 1;
       else if (sp_streq(a + 9, "native")) target_wasi = 0;
-      else { fprintf(stderr, "spinel: unknown --target %s (wasm32-wasi or native)\n", a + 9); return 1; }
+      else if (sp_streq(a + 9, "crystal")) crystal_target = 1;
+      else { fprintf(stderr, "spinel: unknown --target %s (wasm32-wasi, native or crystal)\n", a + 9); return 1; }
       i++;
     }
     else if (!strncmp(a, "--rbs=", 6))    { rbs_dir = a + 6; i++; }
@@ -491,8 +495,16 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "-I"))            { if (++i < argc) sp_add_feature_root(argv[i]); i++; }
     else if (!strncmp(a, "-I", 2) && a[2]) { sp_add_feature_root(a + 2); i++; }
     else if (sp_streq(a, "-S"))            { stdout_mode = 1; i++; }
-    else if (!strncmp(a, "--target=", 9))  { const char *tv = a + 9; if (sp_streq(tv, "crystal")) crystal_target = 1; else { fprintf(stderr, "spinel: --target expects crystal, got '%s'\n", tv); return 2; } i++; }
-    else if (sp_streq(a, "--target") && i + 1 < argc) { const char *tv = argv[i + 1]; if (sp_streq(tv, "crystal")) crystal_target = 1; else { fprintf(stderr, "spinel: --target expects crystal, got '%s'\n", tv); return 2; } i += 2; }
+    /* Space-separated form of --target=, matching the other two-value flags
+       (--rbs, --int-overflow). Handles all three targets so both spellings agree. */
+    else if (sp_streq(a, "--target") && i + 1 < argc) {
+      const char *tv = argv[i + 1];
+      if (sp_streq(tv, "wasm32-wasi")) target_wasi = 1;
+      else if (sp_streq(tv, "native")) target_wasi = 0;
+      else if (sp_streq(tv, "crystal")) crystal_target = 1;
+      else { fprintf(stderr, "spinel: unknown --target %s (wasm32-wasi, native or crystal)\n", tv); return 1; }
+      i += 2;
+    }
     else if (sp_streq(a, "--print-build")) { print_build = 1; i++; }
     else if (sp_streq(a, "-E"))            { run_mode = 1; i++; }
     else if (sp_streq(a, "--emit-rbs"))    { emit_rbs = 1; i++; }

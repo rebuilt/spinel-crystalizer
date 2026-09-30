@@ -54,6 +54,10 @@ How the compiler is built and where it is going. Not needed to *use* Spinel.
   the rest of the compiler consumes.
 - **[internals/analyze-ir.md](internals/analyze-ir.md)** -- the analyze ↔ codegen
   contract (the shared in-memory `Compiler` model).
+- **[internals/crystal-backend.md](internals/crystal-backend.md)** -- an
+  experimental second codegen target (`--target=crystal`) that emits Crystal
+  instead of C, reusing the same analysis. A proof-of-concept, not a replacement
+  for the C backend.
 - **[internals/gc.md](internals/gc.md)** -- the collector: two heaps, the marker
   byte that identifies a heap string, explicit roots, a full mark with a
   generational sweep, and the limits that follow from having no write barrier.
