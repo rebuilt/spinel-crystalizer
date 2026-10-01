@@ -122,6 +122,23 @@ a = Point.new(1, 2)
 a.x = 10
 p a.x'
 
+# []= writes a member by symbol, string name or integer position (negative counts
+# from the end) and answers the stored value. One overload set per distinct member
+# type, so a heterogeneous struct writes without a union or a cast.
+expect_agree "struct_aref_write" 'S = Struct.new(:a, :b)
+s = S.new(1, 2)
+s[:a] = 10
+s["b"] = 20
+s[-1] = 30
+p (s[0] = 40)
+p s.to_a
+p (begin; s[9] = 1; "no"; rescue => e; e.class; end)
+R = Struct.new(:name, :count)
+r = R.new("a", 1)
+r[0] = "b"
+r[-1] = 2
+p [r.name, r.count]'
+
 # No array autosplat and a max block arity of 1 in Crystal; we destructure the
 # yielded pair in the block body instead.
 expect_agree "block_autosplat" '[[1,2],[3,4]].each { |a,b| p a+b }'
@@ -159,6 +176,12 @@ expect_diverge "param_type_name" "Crystal .class shows parameterized types" 'p({
 # Struct#to_h is translated (=> form, a real Hash), but Crystal prints symbol-keyed
 # hashes as {:a => 1} where Ruby prints {a: 1}; the value is right, the spelling differs.
 expect_diverge "struct_to_h_print" "Crystal prints symbol-keyed hashes with : and =>" 'P = Struct.new(:a); p P.new(1).to_h'
+
+# An unknown member NAME: Ruby raises NameError, but Crystal 1.21 defines no such
+# class (its whole hierarchy is Exception/ArgumentError/IndexError/KeyError/...),
+# so [] and []= answer IndexError. Both are errors; only the class differs.
+expect_diverge "struct_member_name_error" "no NameError in Crystal, so IndexError" 'P = Struct.new(:a)
+p(begin; P.new(1)[:zz]; rescue => e; e.class; end)'
 
 if [ "$ok" = 1 ]; then
   echo "crystal-difference-test: PASS (agree=$n_agree refuse=$n_refuse diverge=$n_diverge)"

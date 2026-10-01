@@ -2180,6 +2180,60 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
       for (int i = 0; i < ci->nivars; i++)
         buf_printf(b, "    when %d then %s\n", i, ci->ivars[i]);
       buf_puts(b, "    else raise IndexError.new(\"bad index\")\n    end\n  end\n");
+
+      /* []= writes a member. One overload set per DISTINCT member type, whose case
+         arms list only that type's members, so a heterogeneous struct still gets a
+         cast-free signature (no union, no .as): `s[:n] = "x"` fails to resolve when
+         :n is an Int member and the program build-fails rather than storing a value
+         of the wrong type. Members are grouped by their MAPPED Crystal spelling so
+         Int32 and Int64 members share one overload. Each arm ends in the assignment,
+         so the setter answers the stored value (Ruby's `s[k] = v` value). */
+      for (int gi = 0; gi < ci->nivars; gi++) {
+        Buf t; memset(&t, 0, sizeof t);
+        cr_map_type(g, ci->ivar_types[gi], &t);         /* known to succeed */
+        int seen = 0;
+        for (int k = 0; k < gi; k++) {
+          Buf p; memset(&p, 0, sizeof p);
+          cr_map_type(g, ci->ivar_types[k], &p);
+          if (sp_streq(p.p, t.p)) seen = 1;
+          free(p.p);
+        }
+        if (seen) { free(t.p); continue; }               /* already emitted */
+
+        buf_printf(b, "  def []=(key : Symbol, value : %s)\n    case key\n", t.p);
+        for (int i = 0; i < ci->nivars; i++) {
+          Buf m; memset(&m, 0, sizeof m);
+          cr_map_type(g, ci->ivar_types[i], &m);
+          if (sp_streq(m.p, t.p))
+            buf_printf(b, "    when :%s then %s = value\n", ci->ivars[i] + 1, ci->ivars[i]);
+          free(m.p);
+        }
+        buf_puts(b, "    else raise IndexError.new(\"no member\")\n    end\n  end\n");
+
+        buf_printf(b, "  def []=(key : String, value : %s)\n    case key\n", t.p);
+        for (int i = 0; i < ci->nivars; i++) {
+          Buf m; memset(&m, 0, sizeof m);
+          cr_map_type(g, ci->ivar_types[i], &m);
+          if (sp_streq(m.p, t.p))
+            buf_printf(b, "    when \"%s\" then %s = value\n", ci->ivars[i] + 1, ci->ivars[i]);
+          free(m.p);
+        }
+        buf_puts(b, "    else raise IndexError.new(\"no member\")\n    end\n  end\n");
+
+        buf_printf(b, "  def []=(key : Int64, value : %s)\n", t.p);
+        buf_printf(b, "    i = key < 0 ? key + %d : key\n", ci->nivars);
+        buf_printf(b, "    if i < 0 || i >= %d; raise IndexError.new(\"bad index\"); end\n", ci->nivars);
+        buf_puts(b, "    case i\n");
+        for (int i = 0; i < ci->nivars; i++) {
+          Buf m; memset(&m, 0, sizeof m);
+          cr_map_type(g, ci->ivar_types[i], &m);
+          if (sp_streq(m.p, t.p))
+            buf_printf(b, "    when %d then %s = value\n", i, ci->ivars[i]);
+          free(m.p);
+        }
+        buf_puts(b, "    else raise IndexError.new(\"bad index\")\n    end\n  end\n");
+        free(t.p);
+      }
     }
   }
 

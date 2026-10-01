@@ -237,19 +237,24 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | current | meaning |
-| --- | --- | --- | --- |
- | emit-clean | 757 | 786 | emits Crystal at all (the rest refuse) |
- | PASS | 196 | **256** | builds and output is byte-identical to CRuby |
- | DIFF | 70 | 102 | builds, but disagrees with CRuby |
- | BUILDFAIL | 491 | 428 | the emitted Crystal does not compile |
- | REFUSED | 3659 | 3631 | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | **current (Phase 3)** | meaning |
+| --- | --- | --- | --- | --- |
+| emit-clean | 757 | 786 | **786** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | **256** | **257** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | **102** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | **428** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | **3631** | refused at the Ruby line, with a reason |
 
-This is **+60 PASS with zero PASS regressions** (every program that passed on the
-baseline still passes). The emit-clean count rose by 29: the honesty-gate work
+Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
+(every program that passed on the baseline still passes), and Phase 3 adds a further
++1 (`test/struct_member_write.rb`) on a corpus one program larger — 4417 → 4418 — also
+with zero PASS regressions and **no status change on any of the 4417 shared programs**.
+The emit-clean count rose by 29 through Phase 2: the honesty-gate work
 below turns programs that previously emitted broken Crystal into line-anchored
 refusals, and the method sweep, regex-literal support, the `attr_accessor` fix
-(below), and the `Struct.new` translation (below) add most of them back. The new
+(below), and the `Struct.new` translation (below) add most of them back. Phase 3
+left emit-clean unchanged — `[]=` needs no new typing — and the newly agreeing cases
+are the focused `[]=` tests. The new
 DIFFs are the remainder — programs
 that now compile but disagree with CRuby on an edge case (empty `min`/`max`,
 `Array#fill` with a Range, blockless `each_index`, `String#tr` ranges,
@@ -279,17 +284,32 @@ objects, so aliasing and in-place mutation (`arr[i].x = …`) must survive. On t
 the constructor and readers/writers the emitter generates the feature surface:
 `to_a`/`values` (member values in order), `.members` (symbol list), `to_h`
 (symbol-keyed, `=>` form), member-wise `==` (typed to the class so a foreign
-operand still falls through to identity), and `[]` by symbol / string / integer
-position (negative counts from the end). Methods written in a block-form
+operand still falls through to identity), and `[]` / `[]=` by symbol / string /
+integer position (negative counts from the end). Methods written in a block-form
 `Struct.new(…) do … end` are emitted too. This moves the pure-Struct programs from a
-broken verbatim emit to PASS. Two Crystal/Ruby printing differences surface as
+broken verbatim emit to PASS. `[]=` is emitted as **one overload set per distinct
+member type** — grouped by the *mapped* Crystal spelling, so `Int32` and `Int64`
+members share one — and each overload's `case` arms list only that type's members.
+That keeps it cast-free: a heterogeneous struct needs no `union` and no `.as`, and a
+store of the wrong type fails overload resolution rather than writing a value under a
+mislabelled member. Each arm ends in the assignment, so the setter answers the stored
+value, matching Ruby's `s[k] = v`. Two Crystal/Ruby printing differences surface as
 documented DIFFs rather than bugs: `to_h` prints symbol keys as `{:a => 1}` where
 Ruby prints `{a: 1}`, and `puts <struct>` uses Crystal's default object formatting
-rather than a custom `to_s`. Still not translated (they build-fail on the missing
-method): `[]=` (the stored value must match each member's type, which Crystal's
-static typing resists for heterogeneous structs), `dig`, `values_at`, and a
+rather than a custom `to_s`. A third difference is the *class* of the error for an
+unknown member **name**: Ruby raises `NameError`, but Crystal 1.21 defines no such
+class (its whole hierarchy is `Exception`/`ArgumentError`/`IndexError`/`KeyError`/…),
+so `[]` and `[]=` answer `IndexError`. Both are errors; only the class differs, and it
+is pinned in `scripts/crystal_difference_test.sh` as
+`expect_diverge "struct_member_name_error"`. An out-of-range **index** is `IndexError`
+on both sides, so that case agrees.
+
+Still not translated (they build-fail on the missing method): `dig` (recursing into
+a member needs every member type to answer `dig`, which a heterogeneous struct cannot
+offer), `values_at`, and a
 `Struct#new` called with fewer arguments than members (Ruby fills the rest with
-nil). `Data.define` is deliberately *not* translated: it is a value type whose `==`
+nil — nilable ivars would break every member that is read in arithmetic, so that
+trade was measured and rejected). `Data.define` is deliberately *not* translated: it is a value type whose `==`
 compares members, and a plain class answers `==` by identity, so emitting it would
 silently change results; it stays an honest refusal until member-wise equality lands.
 
@@ -512,12 +532,15 @@ program compiles but can differ on edge inputs.
    sharpest *inference* gap surfaced by the PoC.
   - **`Struct` feature surface.** The core definition (positional constructor,
     readers, writers) plus `to_a`/`values`, `.members`, `to_h`, member-wise `==`,
-    and `[]` by symbol/string/index all translate. Still not translated: `[]=`
-    (the stored value must match each member's type, which Crystal's static typing
-    resists for heterogeneous structs), `dig`, `values_at`, and a `Struct#new`
-    called with fewer arguments than members (Ruby nil-fills the rest). Programs
-    using those build-fail on the missing method. `Data.define` is refused outright
-    (value-type `==`), not partially translated.
+    and `[]`/`[]=` by symbol/string/index all translate; `[]=` emits one cast-free
+    overload set per distinct member type, so a heterogeneous struct writes without
+    a union. Still not translated: `dig`, `values_at`, and a `Struct#new`
+    called with fewer arguments than members (Ruby nil-fills the rest — nilable
+    ivars would break members read in arithmetic, a measured net loss). An unknown
+    member *name* answers `IndexError` where Ruby answers `NameError`, since Crystal
+    1.21 has no `NameError`; that difference is pinned in the difference-test ledger.
+    Programs using the missing methods build-fail on them. `Data.define` is refused
+    outright (value-type `==`), not partially translated.
  - **Non-local block control flow.** `break`/`return` out of a *yielding* method's
   block (and `catch`/`throw`, `retry`) are not handled. Crystal `Proc`s cannot
   break out of the enclosing method, so these would need emulation (exceptions /
