@@ -439,6 +439,34 @@ static void cr_emit_escaped(Buf *b, const char *s) {
   }
 }
 
+/* Emit a Crystal string literal for a Ruby charset argument (the argument of
+   tr/delete/count/squeeze). With `expand` set, an `X-Y` run becomes the explicit
+   character set: Crystal's delete/count/squeeze parse ranges, but its tr does
+   not, so tr needs them spelled out. A backslash escape and every other
+   character are copied verbatim, so `\-` stays an escaped hyphen. Only printable
+   ASCII endpoints are expanded; anything else is left as written. */
+static void cr_emit_charset_literal(Buf *b, const char *s, int expand) {
+  buf_puts(b, "\"");
+  for (const char *p = s ? s : ""; *p; ) {
+    if (*p == '\\' && p[1]) {
+      char esc[3] = { '\\', p[1], 0 };
+      cr_emit_escaped(b, esc);
+      p += 2; continue;
+    }
+    if (expand && p[1] == '-' && p[2] != 0) {
+      unsigned char a = (unsigned char)p[0], z = (unsigned char)p[2];
+      if (a >= 32 && a <= 126 && z >= 32 && z <= 126 && a <= z) {
+        for (int c = a; c <= z; c++) { char ch[2] = { (char)c, 0 }; cr_emit_escaped(b, ch); }
+        p += 3; continue;
+      }
+    }
+    char ch[2] = { *p, 0 };
+    cr_emit_escaped(b, ch);
+    p++;
+  }
+  buf_puts(b, "\"");
+}
+
 /* Copy a regex pattern into a /.../ literal, escaping only the delimiter. The
    unescaped source resolves \/ and %r{} slashes to a bare /, which would close
    the Crystal literal early; re-escape it. Backslashes are left as-is -- they
@@ -1731,6 +1759,46 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
+  /* Ruby's Array#join flattens nested Arrays recursively before joining, with
+     the separator between every element; Crystal's join renders a nested Array
+     with its inspect form. `flatten` recurses through Arrays only -- the same
+     set Ruby's join flattens -- and leaves scalar elements alone. */
+  if (recv >= 0 && sp_streq(name, "join") && block < 0 &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".flatten.join(");
+    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    buf_puts(b, ")");
+    return;
+  }
+
+  /* Ruby's charset arguments use range notation, and a lone "^" is a literal
+     caret. Crystal's delete/count/squeeze parse both the same way EXCEPT the
+     lone "^" (there it negates the empty set and matches every character), and
+     Crystal's tr expands no ranges at all. Rewrite the literal charset(s). */
+  if (recv >= 0 && comp_ntype(g->c, recv) == TY_STRING) {
+    if (sp_streq(name, "tr") && argc == 2 &&
+        nt_kind(g->nt, argv[0]) == NK_StringNode && nt_kind(g->nt, argv[1]) == NK_StringNode) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".tr(");
+      cr_emit_charset_literal(b, nt_str(g->nt, argv[0], "content"), 1);
+      buf_puts(b, ", ");
+      cr_emit_charset_literal(b, nt_str(g->nt, argv[1], "content"), 1);
+      buf_puts(b, ")");
+      return;
+    }
+    const char *cs = argc == 1 && nt_kind(g->nt, argv[0]) == NK_StringNode
+                     ? nt_str(g->nt, argv[0], "content") : NULL;
+    if (cs && sp_streq(cs, "^") &&
+        (sp_streq(name, "delete") || sp_streq(name, "count") || sp_streq(name, "squeeze"))) {
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".%s(", name);
+      cr_emit_charset_literal(b, "\\^", 0);
+      buf_puts(b, ")");
+      return;
+    }
+  }
+
   /* Ruby's sub/gsub replacement strings expand `\&` (the whole match) and
      `\k<name>` (empty when the group did not participate); Crystal's replacement
      parser leaves `\&` literal and raises IndexError for a non-participating
@@ -2269,6 +2337,14 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
   cr_pop_scope(g, saved);
 
   buf_puts(b, "end\n");
+  /* Crystal renders an object through `to_s(io : IO)` / `inspect(io : IO)`; a
+     no-arg override (every Ruby `to_s`/`inspect` is no-arg) is what Ruby's
+     interpolation and `puts` call, but Crystal's own formatters never reach it,
+     so `puts obj` / `"#{obj}"` / `p obj` would use the default. Emit a delegating
+     IO form so the program's method is the one they actually use. */
+  if (!s->is_cmethod && reqn == 0 && opn == 0 && blkparam < 0 &&
+      (sp_streq(s->name, "to_s") || sp_streq(s->name, "inspect")))
+    buf_printf(b, "def %s(io : IO) : Nil\n  io << %s\nend\n", s->name, s->name);
 }
 
 /* ---- classes ---- */

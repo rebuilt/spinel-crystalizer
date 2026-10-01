@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | **Phase 5 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | **778** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | **268** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | **88** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | **3620** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | **Phase 6 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | **778** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | **278** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | **78** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | **3620** | refused at the Ruby line, with a reason |
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -255,7 +255,9 @@ BUILDFAIL 426 / REFUSED 3616. Against that, Phase 4 is **+7 PASS, −10 DIFF,
 −1 BUILDFAIL, +4 REFUSED, with zero PASS regressions** — every changed program
 moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
 BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
-+0 REFUSED**, also with zero PASS regressions.
++0 REFUSED**, and Phase 6 **+10 PASS, −10 DIFF, +0 BUILDFAIL, +0 REFUSED** — both
+with zero PASS regressions and no change to any program other than the ones named
+below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
@@ -271,9 +273,11 @@ DIFFs are the remainder — programs
 that now compile but disagree with CRuby on an edge case (empty `min`/`max`,
 `Array#fill` with a Range, blockless `each_index`, `String#tr` ranges,
 numeric-string `upto`, `squeeze` with a charset argument, `transform_values` block
-form, `chunk_while` on a Range, and a few regex edge cases). A DIFF is a strictly
-better state than a BUILDFAIL: the translation compiles, and the remaining gap is
-a named, measurable behavior difference rather than a broken file.
+form, `chunk_while` on a Range, and a few regex edge cases; the `min`/`max`,
+`tr`-range and `squeeze`-charset ones were cleared by the later phases below). A
+DIFF is a strictly better state than a BUILDFAIL: the translation compiles, and
+the remaining gap is a named, measurable behavior difference rather than a broken
+file.
 
 Phase 4 then went after the worst DIFFs — the ones where the emitted Crystal
 *raises at run time* while CRuby completes — and found that all of them were bugs
@@ -344,6 +348,27 @@ Phase 5 closed two follow-ups that Phase 4 surfaced:
   `0`. It now emits `s.to_i(strict: false, underscore: true) { 0 }`, matching
   Ruby on trailing garbage, `_` separators, empty strings, and whitespace, while
   leaving the default base in place.
+
+Phase 6 then cleared the largest remaining coherent DIFF clusters:
+
+- **User-defined `to_s`/`inspect` were ignored.** Crystal renders an object
+  through `to_s(io : IO)` / `inspect(io : IO)`, and every Ruby `to_s`/`inspect`
+  is no-arg, so an emitted no-arg override was what `obj.to_s` returned but never
+  what `puts obj`, `"#{obj}"` or `p obj` reached — those used Crystal's default
+  `#<Obj:0x…>`. For a no-arg `to_s`/`inspect` the emitter now also emits a
+  delegating `def to_s(io : IO) : Nil; io << to_s; end` (same for `inspect`), so
+  the program's method is the one the formatters use. Fixed `value_type_interp_to_s`,
+  `puts_object_to_s_poly`, `value_obj_boxed_to_s`, `puts_object_nested_new_arg`
+  and `i994`.
+- **Nested `Array#join`.** Ruby's `join` recursively flattens nested Arrays;
+  Crystal's renders a nested Array with its inspect form. Array receivers now
+  emit `.flatten.join(…)`, and `flatten` recurses through exactly the same set
+  (Arrays, not other enumerables). Fixed `array_join_nested`.
+- **Charset arguments.** Ruby's `tr` expands `a-z` ranges; Crystal's does not, so
+  a literal charset is expanded at emit time. And a lone `"^"` is a literal caret
+  in Ruby while Crystal's `delete`/`count`/`squeeze` negate the empty set and
+  match everything, so it is emitted escaped. Fixed `string_charset_escape`,
+  `string_charset_range_notation`, `str_delete_count_negation` and `str_squeeze_arg`.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
