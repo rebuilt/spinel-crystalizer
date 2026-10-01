@@ -475,16 +475,20 @@ static int cr_is_binop(const char *n) {
          sp_streq(n, "|") || sp_streq(n, "^");
 }
 
-/* True for a call node that will be emitted as an infix operator (`a + b`,
-   `a ** b`). Crystal binds `.` tighter than these, so such a node must be
-   parenthesized wherever it is used as a receiver (`(a + b).to_s`). */
-static int cr_is_binop_node(CrGen *g, int id) {
+/* True for a call node that emits as an infix or prefix operator rather than a
+   `recv.method` form. Crystal binds `.` (and `[`) tighter than these, so such a
+   node must be parenthesized wherever it is used as a receiver or as an operand
+   (`(a + b).to_s`, `a * (b + c)`, `(-x).abs`). */
+static int cr_needs_parens(CrGen *g, int id) {
   if (id < 0 || nt_kind(g->nt, id) != NK_CallNode) return 0;
   const char *n = nt_str(g->nt, id, "name");
-  return n && cr_is_binop(n);
+  if (!n) return 0;
+  return cr_is_binop(n) || sp_streq(n, "-@") || sp_streq(n, "+@") || sp_streq(n, "!");
 }
+/* Emit a subexpression that sits in receiver or operand position, adding the
+   parentheses the operator form needs there. */
 static void cr_emit_recv(CrGen *g, int recv, Buf *b) {
-  int paren = cr_is_binop_node(g, recv);
+  int paren = cr_needs_parens(g, recv);
   if (paren) buf_puts(b, "(");
   cr_emit_expr(g, recv, b);
   if (paren) buf_puts(b, ")");
@@ -1636,7 +1640,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
      raises IndexError, so it maps onto the `[]?` form. */
   if (recv >= 0 && sp_streq(name, "at") && argc == 1 && ty_is_array(comp_ntype(g->c, recv))) {
-    cr_emit_expr(g, recv, b);
+    cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
     cr_emit_expr(g, argv[0], b);
     buf_puts(b, "]?");
@@ -1665,28 +1669,27 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
-  /* Ruby's String#to_i(base) auto-detects the base's prefix for base 0, treats a
+  /* Ruby's String#to_i auto-detects the base's prefix for base 0, treats a
      leading zero as octal only there, accepts `_` digit separators, and never
-     raises on trailing garbage; Crystal's to_i defaults to strict:true (raising
-     ArgumentError) with no prefix/underscore handling (string.cr `to_i`). Set the
-     flags that make Crystal answer as Ruby does. Only an explicit base is
-     rewritten: the same strict default affects bare `s.to_i` too, but that shape
-     is far more common and is left for a separate, corpus-wide pass. */
-  if (recv >= 0 && sp_streq(name, "to_i") && argc == 1 &&
+     raises (it answers 0 when no digits parse); Crystal's to_i defaults to
+     strict:true (raising ArgumentError) with no prefix/underscore handling
+     (string.cr `to_i`). Set the flags that make Crystal answer as Ruby does. */
+  if (recv >= 0 && sp_streq(name, "to_i") && argc <= 1 &&
       comp_ntype(g->c, recv) == TY_STRING &&
       !cr_user_method_ok(g, name, TY_STRING, 0)) {
     /* Crystal rejects base 0 outright, so Ruby's autodetect is spelled by
        leaving the (valid) default base in place and letting prefix/octal
-       detection override it per string. The `{ 0 }` block is Ruby's "no digits
-       parsed means 0": Crystal's to_i otherwise raises on "0", "08" or "",
-       where Ruby answers 0. */
-    int base0 = nt_kind(g->nt, argv[0]) == NK_IntegerNode &&
+       detection override it per string. A bare `s.to_i` keeps Crystal's default
+       base 10 and only needs strict/underscore. The `{ 0 }` block is Ruby's "no
+       digits parsed means 0": Crystal's to_i otherwise raises on "0", "08" or
+       "", where Ruby answers 0. */
+    int base0 = argc == 1 && nt_kind(g->nt, argv[0]) == NK_IntegerNode &&
                 nt_int(g->nt, argv[0], "value", -1) == 0;
     cr_emit_recv(g, recv, b);
     buf_puts(b, ".to_i(");
-    if (base0) buf_puts(b, "10");
-    else       cr_emit_expr(g, argv[0], b);
-    buf_puts(b, ", strict: false, underscore: true");
+    if (base0)          buf_puts(b, "10, ");
+    else if (argc == 1) { cr_emit_expr(g, argv[0], b); buf_puts(b, ", "); }
+    buf_puts(b, "strict: false, underscore: true");
     if (base0) buf_puts(b, ", prefix: true, leading_zero_is_octal: true");
     buf_puts(b, ") { 0 }");
     return;
@@ -1763,7 +1766,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     if (sp_streq(name, "%") && nt_kind(g->nt, recv) == NK_StringNode &&
         ty_is_hash(comp_ntype(g->c, argv[0])) &&
         cr_str_has_named_format(nt_str(g->nt, recv, "content"))) {
-      cr_emit_expr(g, recv, b);
+      cr_emit_recv(g, recv, b);
       buf_puts(b, " % (");
       cr_emit_expr(g, argv[0], b);
       buf_puts(b, ".transform_keys(&.to_s))");
@@ -1775,10 +1778,10 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     if ((sp_streq(name, "==") || sp_streq(name, "!=")) &&
         nt_kind(g->nt, argv[0]) == NK_NilNode)
       g->nil_ok = 1;
-    cr_emit_expr(g, recv, b);
+    cr_emit_recv(g, recv, b);
     g->nil_ok = savb;
     buf_printf(b, " %s ", op);
-    cr_emit_expr(g, argv[0], b);
+    cr_emit_recv(g, argv[0], b);
     return;
   }
 
@@ -1803,7 +1806,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
        so a nested read is not silently made nilable: in `t[k][j]`, making the
        inner `t[k]` nilable would change the type of the outer receiver. */
     int savr = g->nil_ok; g->nil_ok = 0;
-    cr_emit_expr(g, recv, b);
+    cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
     for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
     g->nil_ok = savr;
@@ -1815,7 +1818,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
      bracket assignment is an expression that evaluates to the stored value,
      the same as Ruby's, so this holds in statement and value position alike. */
   if (recv >= 0 && sp_streq(name, "[]=") && argc == 2) {
-    cr_emit_expr(g, recv, b);
+    cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
     cr_emit_expr(g, argv[0], b);
     buf_puts(b, "] = ");
@@ -1886,7 +1889,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     int sav = g->nil_ok;
     if (sp_streq(name, "nil?") || sp_streq(name, "inspect") || sp_streq(name, "to_s"))
       g->nil_ok = 1;
-    cr_emit_expr(g, recv, b);
+    cr_emit_recv(g, recv, b);
     g->nil_ok = sav;
     buf_printf(b, ".%s", mname);
   }

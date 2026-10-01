@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | **Phase 4 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | **4398** † | programs run |
-| emit-clean | 757 | 786 | 787 | **778** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | **264** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | **89** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | **425** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | **3620** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | **Phase 5 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | **778** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | **268** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | **88** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | **3620** | refused at the Ruby line, with a reason |
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -254,7 +254,8 @@ Phase 3 restricted to the 4398 shared programs is PASS 257 / DIFF 99 /
 BUILDFAIL 426 / REFUSED 3616. Against that, Phase 4 is **+7 PASS, −10 DIFF,
 −1 BUILDFAIL, +4 REFUSED, with zero PASS regressions** — every changed program
 moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
-BUILDFAIL to a named refusal.
+BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
++0 REFUSED**, also with zero PASS regressions.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
@@ -323,6 +324,26 @@ from the C backend's raise-mode runs.
 Also fixed along the way: the exception-class refusal now **names the class** it
 is refusing (`the exception class 'FrozenError' has no Crystal equivalent: …`),
 where before the message only listed what Crystal *does* define.
+
+Phase 5 closed two follow-ups that Phase 4 surfaced:
+
+- **Operator precedence in receiver position.** The emitter never parenthesized
+  a subexpression that is itself an infix/prefix operator, so `(2 * 3).to_s`
+  emitted `2_i64 * 3_i64.to_s()` (which Crystal parses as `2 * (3.to_s)`) and
+  `(h[1] + h[2]).to_s` compiled to something else entirely. Ruby and Crystal
+  share operator precedence, but Crystal binds `.` (and `[`) tighter than every
+  operator, so an operator node in receiver *or operand* position (`a * (b + c)`)
+  needs explicit parentheses. `cr_emit_recv` now wraps such a node at every
+  receiver site (`[]`, `[]=`, `at`, the generic call, `min`/`max`, `chars`,
+  `to_i`) and on both operands of a binary operator. This turned three
+  BUILDFAILs and one DIFF into PASS (`empty_hash_int_int_promote`, `gsub_sub_block`,
+  `at_exit_hook_survives_collection`, `issue_2913`) with no output change
+  anywhere else.
+- **Bare `String#to_i`.** Phase 4 fixed only the explicit-base form; a bare
+  `s.to_i` still raised `ArgumentError` on non-numeric input where Ruby answers
+  `0`. It now emits `s.to_i(strict: false, underscore: true) { 0 }`, matching
+  Ruby on trailing garbage, `_` separators, empty strings, and whitespace, while
+  leaving the default base in place.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
@@ -594,14 +615,12 @@ the *semantic divergences* below, where a method exists in both languages and th
 program compiles but can differ on edge inputs.
 
 - **Semantic divergence of shared methods.** Methods present in both stdlibs but
-  with different edge-case behaviour: `String#to_i` (Ruby accepts `_` separators
-  and never raises; Crystal's default is `strict: true`), `ENV[]` (Ruby returns
-  nil for a missing key, Crystal raises), and the like. These compile and run, so
-  they are not caught by the rejection discipline; closing them needs
-  receiver-type-aware translation plus per-method semantic checks. The
-  explicit-base `String#to_i(base)` case is now handled with Crystal's
-  `strict`/`underscore`/`prefix` flags, but bare `s.to_i` still raises where Ruby
-  answers `0`.
+  with different edge-case behaviour: `ENV[]` (Ruby returns nil for a missing
+  key, Crystal raises), `String#sum`/`Float` summation (Kahan compensation), and
+  the like. These compile and run, so they are not caught by the rejection
+  discipline; closing them needs receiver-type-aware translation plus per-method
+  semantic checks. `String#to_i` — both the explicit-base and bare forms — is now
+  handled with Crystal's `strict`/`underscore`/`prefix` flags.
 - **`puts <collection>`.** Ruby's `puts` splats an array/hash (one element per
   line); Crystal's prints the container via `to_s`. Not translated — the corpus
   uses `.join` instead. A general fix needs receiver-type-aware emission.
