@@ -21,6 +21,12 @@
 #
 # Usage: crystal_corpus.sh <list-of-ruby-files> <outdir> [jobs]
 #
+# Run this in raise mode (the default). `test/promote_*.rb` must be filtered
+# from the full-corpus list, exactly as the Makefile filters them out of the C
+# backend's raise/wrap runs: those tests only have defined output under
+# `--int-overflow=promote`, which this target does not implement, so running
+# them here would report a runtime overflow as if it were a translation gap.
+#
 # To build the list of programs the target emits cleanly:
 #   find test -name '*.rb' | sort | xargs -P 16 -I{} sh -c \
 #     'bin/spinel --target crystal {} -S >/dev/null 2>&1 && echo {}' | sort -u > ok.txt

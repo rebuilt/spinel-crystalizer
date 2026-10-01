@@ -55,6 +55,31 @@ expect_agree() {
   n_agree=$((n_agree+1))
 }
 
+# expect_agree_file <label> <ruby-file> : transpile a whole corpus test file,
+# build and run it, and compare the Crystal output against the file's committed
+# .expected (which is also the CRuby output, so CRuby itself is diffed in too).
+# Used for the broad Struct surface, which is too large for an inline source.
+expect_agree_file() {
+  local label="$1" rb="$2"
+  if ! "$SPINEL" --target crystal "$rb" -S > "$tmp/$label.cr" 2> "$tmp/$label.emit"; then
+    echo "FAIL [agree $label]: refused, but should translate: $(head -1 "$tmp/$label.emit")"
+    ok=0; return
+  fi
+  if [ "$have_crystal" = 0 ]; then n_agree=$((n_agree+1)); return; fi
+  ruby "$rb" > "$tmp/$label.rbout" 2>&1
+  if ! diff -q "$rb.expected" "$tmp/$label.rbout" >/dev/null; then
+    echo "FAIL [agree $label]: CRuby output no longer matches $rb.expected"; ok=0; return
+  fi
+  if ! CRYSTAL_CACHE_DIR="$tmp/cache-$label" timeout 300 "$CRYSTAL" build --release -o "$tmp/$label.bin" "$tmp/$label.cr" 2> "$tmp/$label.build"; then
+    echo "FAIL [agree $label]: emitted Crystal does not compile:"; head -3 "$tmp/$label.build"; ok=0; return
+  fi
+  "$tmp/$label.bin" > "$tmp/$label.crout" 2>&1
+  if ! diff -q "$tmp/$label.rbout" "$tmp/$label.crout" >/dev/null; then
+    echo "FAIL [agree $label]: output differs from CRuby:"; diff "$tmp/$label.rbout" "$tmp/$label.crout" | head -6; ok=0; return
+  fi
+  n_agree=$((n_agree+1))
+}
+
 # expect_refuse <substring-of-diagnostic> <ruby source> : must exit non-zero and name the reason.
 expect_refuse() {
   local want="$1" src="$2" out
@@ -138,6 +163,11 @@ r = R.new("a", 1)
 r[0] = "b"
 r[-1] = 2
 p [r.name, r.count]'
+
+# The broad Struct surface (top-level and nested classes, homogeneous and
+# heterogeneous members, readers/writers, to_a/to_h/==/[]/[]=, block and
+# implicit-self reads) as one file, pinned against the committed .expected.
+expect_agree_file "struct_full" "test/crystal_struct.rb"
 
 # No array autosplat and a max block arity of 1 in Crystal; we destructure the
 # yielded pair in the block body instead.

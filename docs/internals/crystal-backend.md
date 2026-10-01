@@ -237,13 +237,24 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | **current (Phase 3)** | meaning |
-| --- | --- | --- | --- | --- |
-| emit-clean | 757 | 786 | **786** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | **256** | **257** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | **102** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | **428** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | **3631** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | **Phase 4 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | **4398** † | programs run |
+| emit-clean | 757 | 786 | 787 | **778** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | **264** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | **89** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | **425** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | **3620** | refused at the Ruby line, with a reason |
+
+† Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
+the Makefile applies to the C backend's raise/wrap runs, because those tests only
+have defined output under `--int-overflow=promote` and the Crystal target has no
+promote mode. To keep the deltas honest they are measured on the same list:
+Phase 3 restricted to the 4398 shared programs is PASS 257 / DIFF 99 /
+BUILDFAIL 426 / REFUSED 3616. Against that, Phase 4 is **+7 PASS, −10 DIFF,
+−1 BUILDFAIL, +4 REFUSED, with zero PASS regressions** — every changed program
+moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
+BUILDFAIL to a named refusal.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
@@ -262,6 +273,56 @@ numeric-string `upto`, `squeeze` with a charset argument, `transform_values` blo
 form, `chunk_while` on a Range, and a few regex edge cases). A DIFF is a strictly
 better state than a BUILDFAIL: the translation compiles, and the remaining gap is
 a named, measurable behavior difference rather than a broken file.
+
+Phase 4 then went after the worst DIFFs — the ones where the emitted Crystal
+*raises at run time* while CRuby completes — and found that all of them were bugs
+in our own translations rather than inference gaps, so each has a small,
+line-anchored fix:
+
+- **`String#chars`.** Ruby yields an array of one-character **Strings**; Crystal
+  yields `Char`. The analyzer already models the result as a string array, so a
+  later use of the element as a String (a hash lookup, `==` against a literal)
+  raised. The blockless form now emits `.chars.map(&.to_s)`; the *block* form
+  cannot be rewritten without changing what the block parameter is, so it is
+  refused. This fixed `issue_2903` and `issue_2929`.
+- **Named format references.** `"%<n>d" % {n: 9}` is passed through to Crystal's
+  `String#%` (i.e. `sprintf`), whose named references index the hash with a
+  **String** key (`string/formatter.cr`). Ruby reads the symbol-keyed hash we emit,
+  so it raised `KeyError`. A literal format with `%<name>` / `%{name}` now emits
+  `arg.transform_keys(&.to_s)`. This fixed `format_named`.
+- **`String#to_i(base)`.** Crystal's `to_i` is `strict: true` by default (raising
+  `ArgumentError` where Ruby answers `0`) and rejects base `0` and `_` separators.
+  An explicit-base call now emits `strict: false, underscore: true` and, for base
+  `0`, `prefix: true, leading_zero_is_octal: true` (Crystal rejects base 0, so the
+  default valid base is kept and prefix detection does the autodetect per string),
+  with a `{ 0 }` block for Ruby's "no valid digits means 0". This fixed
+  `string_to_i_base` and `string_to_i_base_zero`. The same `strict` default affects
+  bare `s.to_i`; that shape is far more common (114 programs) and is left for a
+  separate pass.
+- **`Float#to_i`.** Crystal's `Float#to_i` returns an `Int32` and raises past
+  2³¹; Ruby's returns a full Integer. Float receivers now emit `.to_i64`, which
+  matches Ruby across the Int64 range; a float literal outside that range is
+  refused (Ruby returns a Bignum, Crystal raises `OverflowError`).
+- **Named capture reads.** `s[/re/, "name"]` answers `nil` in Ruby when the group
+  did not participate; Crystal's `String#[]` declares a non-nilable `String` and
+  asserts. It now emits the `[]?` form. This fixed `issue_3082`.
+- **`min`/`max` on empty.** Crystal raises `Enumerable::EmptyError`; Ruby answers
+  `nil`. In a nil-tolerant position (`min?` / `max?`) it now answers nil. This
+  fixed `empty_int_array_min_max`.
+
+Two constructs that could only differ at run time are now refused rather than
+shipped as a crash. A `sub`/`gsub` replacement using Ruby's `\&` (whole match) or
+`\k<name>` (empty when the group did not participate) is refused: Crystal's
+replacement parser leaves `\&` literal and *raises* for a non-participating
+`\k<name>`, so the two languages are not interchangeable. And an integer that
+would overflow `Int64` at run time cannot be caught — see the integer-width
+limitation below — so the `promote_*` tests, which exist only to exercise
+`--int-overflow=promote`, are excluded from the Crystal corpus as they already are
+from the C backend's raise-mode runs.
+
+Also fixed along the way: the exception-class refusal now **names the class** it
+is refusing (`the exception class 'FrozenError' has no Crystal equivalent: …`),
+where before the message only listed what Crystal *does* define.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
@@ -352,6 +413,18 @@ methods and classes have had priority:
   rewritten for a single integer argument; a fractional or sub-second argument has
   no Crystal form and is refused.
 
+A few names are emittable for some shapes and refused for others, because the
+Crystal form would be wrong rather than merely missing:
+
+- `String#chars` with a **block** is refused (Crystal yields `Char` where Ruby
+  yields a one-character String); the blockless form is rewritten to
+  `.chars.map(&.to_s)`.
+- A `sub`/`gsub` replacement literal using `\&` or `\k<name>` is refused; Crystal's
+  replacement language leaves `\&` literal and raises for a non-participating
+  `\k<name>`.
+- `Float#to_i` on a literal outside the Int64 range is refused (Ruby answers a
+  Bignum; Crystal raises `OverflowError`).
+
 The method allowlist was extended only with names verified by a build-and-run
 comparison against Ruby, not merely by compiling. The first batch: `match`, `=~`,
 `Exception#message`, `Class#name`, `Kernel#at_exit`, and the data methods
@@ -432,6 +505,14 @@ tracks this structurally:
   read, so it is never given a `?`.
 - **`Array#at` maps to `[]?`**, because Ruby's `at` answers `nil` out of range
   where Crystal's `at` raises.
+- **`min` / `max` map to `min?` / `max?`** in a nil-tolerant position, because
+  Ruby answers `nil` on an empty collection where Crystal raises
+  `Enumerable::EmptyError`. The same one-node hand-off the index read uses carries
+  the flag into the call (the flag is otherwise cleared before any call, so it can
+  never reach a receiver).
+- **A named capture read always uses `[]?`.** `s[/re/, "name"]` answers `nil`
+  whenever the group did not participate, so — unlike the index read — the nilable
+  form is unconditionally correct and does not depend on the surrounding context.
 - **A local bound from a maybe-missing read is declared `T?` only when every read
   of it tolerates nil.** A pre-pass tallies, per local, how many reads sit in a
   nil-tolerant position versus how many reads it has in all. `v = h[k]` followed
@@ -513,17 +594,28 @@ the *semantic divergences* below, where a method exists in both languages and th
 program compiles but can differ on edge inputs.
 
 - **Semantic divergence of shared methods.** Methods present in both stdlibs but
-  with different edge-case behaviour: `String#to_i` (Ruby accepts `_` separators,
-  Crystal raises), `ENV[]` (Ruby returns nil for a missing key, Crystal raises),
-  and the like. These compile and run, so they are not caught by the rejection
-  discipline; closing them needs receiver-type-aware translation plus per-method
-  semantic checks.
+  with different edge-case behaviour: `String#to_i` (Ruby accepts `_` separators
+  and never raises; Crystal's default is `strict: true`), `ENV[]` (Ruby returns
+  nil for a missing key, Crystal raises), and the like. These compile and run, so
+  they are not caught by the rejection discipline; closing them needs
+  receiver-type-aware translation plus per-method semantic checks. The
+  explicit-base `String#to_i(base)` case is now handled with Crystal's
+  `strict`/`underscore`/`prefix` flags, but bare `s.to_i` still raises where Ruby
+  answers `0`.
 - **`puts <collection>`.** Ruby's `puts` splats an array/hash (one element per
   line); Crystal's prints the container via `to_s`. Not translated — the corpus
   uses `.join` instead. A general fix needs receiver-type-aware emission.
 - **Integer width.** `TY_INT` maps to `Int64`; Ruby integers are arbitrary
   precision. Values beyond 2⁶³ overflow (Spinel's C backend auto-promotes to
-  Bigint; the Crystal path does not).
+  Bigint; the Crystal path does not). A **literal** past 64 bits is already
+  refused at its source line, and the same is done for a float literal whose
+  `to_i` is out of range, but an arithmetic result that overflows only at run time
+  cannot be caught without range analysis — the analyzer's own widen-to-bigint
+  detection only fires under `--int-overflow=promote`, which the Crystal target
+  does not implement. The `promote_*` tests therefore stay out of the Crystal
+  corpus by the same rule that keeps them out of the C backend's raise-mode runs.
+  `test/range_unbounded_bounds.rb` (infinite/nil Range bounds, which CRuby sizes as
+  Infinity) remains a documented DIFF for the same reason.
 - **Poly containers.** When the inference leaves a container poly — notably a
   nested array literal whose *outer* array is not narrowed (`[[1,2],[3,4]]` →
   `poly_array`, so the inner block param is `poly`) — the element type is

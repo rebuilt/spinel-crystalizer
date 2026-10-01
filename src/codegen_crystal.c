@@ -475,6 +475,52 @@ static int cr_is_binop(const char *n) {
          sp_streq(n, "|") || sp_streq(n, "^");
 }
 
+/* True for a call node that will be emitted as an infix operator (`a + b`,
+   `a ** b`). Crystal binds `.` tighter than these, so such a node must be
+   parenthesized wherever it is used as a receiver (`(a + b).to_s`). */
+static int cr_is_binop_node(CrGen *g, int id) {
+  if (id < 0 || nt_kind(g->nt, id) != NK_CallNode) return 0;
+  const char *n = nt_str(g->nt, id, "name");
+  return n && cr_is_binop(n);
+}
+static void cr_emit_recv(CrGen *g, int recv, Buf *b) {
+  int paren = cr_is_binop_node(g, recv);
+  if (paren) buf_puts(b, "(");
+  cr_emit_expr(g, recv, b);
+  if (paren) buf_puts(b, ")");
+}
+
+/* Does a Ruby format string use a named reference ("%<name>spec" or "%{name}")?
+   `%%` is an escaped percent and is skipped, so a literal "%%<x>" is not one.
+   Only the presence matters: the rewrite that follows renames the hash keys for
+   every named reference at once, and leaves a purely positional format alone. */
+static int cr_str_has_named_format(const char *s) {
+  if (!s) return 0;
+  for (const char *p = s; *p; p++) {
+    if (*p != '%') continue;
+    if (p[1] == '%') { p++; continue; }
+    if (p[1] == '<' || p[1] == '{') return 1;
+  }
+  return 0;
+}
+
+/* Does a sub/gsub replacement string use a Ruby backreference that Crystal's
+   replacement parser answers differently? `\&` is the whole match in Ruby but
+   stays literal in Crystal, and `\k<name>` expands to the empty string in Ruby
+   when the group did not participate while Crystal raises IndexError. `\\` is a
+   literal backslash in both and is skipped, so "\\\\&" is not a backreference. */
+static int cr_str_has_ruby_only_replacement(const char *s) {
+  if (!s) return 0;
+  for (const char *p = s; *p; p++) {
+    if (*p != '\\') continue;
+    char c = p[1];
+    if (c == '\\') { p++; continue; }
+    if (c == '&') return 1;
+    if (c == 'k' && p[2] == '<') return 1;
+  }
+  return 0;
+}
+
 /* Ruby -> Crystal stdlib name divergences for the unambiguous ones in the PoC
    subset. Keyed on the receiver's inferred type where the mapping depends on it:
    `include?` is `includes?` on Array/String but `has_key?` on Hash (Crystal's
@@ -659,10 +705,13 @@ static void cr_emit_rescue_head(CrGen *g, int clause, const char *vn, Buf *b, in
     }
     const char *cn = cr_exception_name(g, nm);
     if (!cn) {
-      /* Refuse the CLASS, not the clause: the message should name the exception
-         the programmer actually has to deal with. */
-      cr_mark_unsupported(g, exc[i],
-        "an exception class with no Crystal equivalent: " CR_NO_CRYSTAL_EXC);
+      /* Refuse the CLASS, not the clause, and name it: the message should point
+         at the exception the programmer actually has to deal with. */
+      char why[300];
+      snprintf(why, sizeof why,
+               "the exception class '%s' has no Crystal equivalent: "
+               CR_NO_CRYSTAL_EXC, nm);
+      cr_mark_unsupported(g, exc[i], why);
       buf_printf(b, "%sException", i ? " | " : " ");
       continue;
     }
@@ -1300,13 +1349,16 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       cr_emit_if(g, id, b, 0);
       return;
     case NK_CallNode: {
-      /* Hand the flag to the call emitter ONLY for an index read -- the one place
-         that consults it. Restoring it for any other call would let it reach the
-         receiver: in `p(h[k] + 1)`, p's argument is the `+`, and the `+`'s
-         receiver must not become a nilable read. */
+      /* Hand the flag to the call emitter ONLY for the reads that consult it --
+         an index read, and `min`/`max` (whose `?` form keeps Ruby's nil-on-empty).
+         Restoring it for any other call would let it reach the receiver: in
+         `p(h[k] + 1)`, p's argument is the `+`, and the `+`'s receiver must not
+         become a nilable read. The call emitter clears it again for its own
+         receiver, so the hand-off stops at the call it is meant for. */
       const char *cnm = nt_str(g->nt, id, "name");
-      if (cnm && sp_streq(cnm, "[]") && nt_ref(g->nt, id, "receiver") >= 0)
-        g->nil_ok = saved_nil_ok;
+      int nil_read = cnm && nt_ref(g->nt, id, "receiver") >= 0 &&
+                     (sp_streq(cnm, "[]") || sp_streq(cnm, "min") || sp_streq(cnm, "max"));
+      if (nil_read) g->nil_ok = saved_nil_ok;
       cr_emit_call(g, id, b);
       g->nil_ok = 0;
       return;
@@ -1569,11 +1621,15 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       }
     }
     /* A class with no Crystal equivalent cannot be constructed; refuse it here
-       rather than emitting an undefined constant. */
+       rather than emitting an undefined constant, and name the class. */
     if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
                      nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
-      cr_mark_unsupported(g, cls,
-        "an exception class with no Crystal equivalent: " CR_NO_CRYSTAL_EXC);
+      const char *nm = cr_exception_operand(g, cls);
+      char why[300];
+      snprintf(why, sizeof why,
+               "the exception class '%s' has no Crystal equivalent: "
+               CR_NO_CRYSTAL_EXC, nm ? nm : "?");
+      cr_mark_unsupported(g, cls, why);
     }
   }
 
@@ -1584,6 +1640,105 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     buf_puts(b, "[");
     cr_emit_expr(g, argv[0], b);
     buf_puts(b, "]?");
+    return;
+  }
+
+  /* Ruby's String#chars yields an array of one-character Strings; Crystal's
+     String#chars yields Chars. The analyzer models the result as a string array
+     (a String read out of a container during the poly pass, and TY_STR_ARRAY on
+     the concrete pass), so a later use of an element as a String -- a hash
+     lookup, `==` against a literal, string concatenation -- would take the Char
+     path and raise at runtime (issue 2903). Map each Char back to a String for
+     the blockless form. The block form cannot be rewritten without changing what
+     the block parameter is, so it is refused rather than silently Char-typed. */
+  if (recv >= 0 && sp_streq(name, "chars") && argc == 0 &&
+      comp_ntype(g->c, recv) == TY_STRING &&
+      !cr_user_method_ok(g, name, TY_STRING, 0)) {
+    if (block >= 0) {
+      cr_mark_unsupported(g, id, "String#chars with a block (Crystal's chars "
+                                "yields Char; Ruby's yields one-character Strings)");
+      buf_puts(b, "nil");
+      return;
+    }
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".chars.map(&.to_s)");
+    return;
+  }
+
+  /* Ruby's String#to_i(base) auto-detects the base's prefix for base 0, treats a
+     leading zero as octal only there, accepts `_` digit separators, and never
+     raises on trailing garbage; Crystal's to_i defaults to strict:true (raising
+     ArgumentError) with no prefix/underscore handling (string.cr `to_i`). Set the
+     flags that make Crystal answer as Ruby does. Only an explicit base is
+     rewritten: the same strict default affects bare `s.to_i` too, but that shape
+     is far more common and is left for a separate, corpus-wide pass. */
+  if (recv >= 0 && sp_streq(name, "to_i") && argc == 1 &&
+      comp_ntype(g->c, recv) == TY_STRING &&
+      !cr_user_method_ok(g, name, TY_STRING, 0)) {
+    /* Crystal rejects base 0 outright, so Ruby's autodetect is spelled by
+       leaving the (valid) default base in place and letting prefix/octal
+       detection override it per string. The `{ 0 }` block is Ruby's "no digits
+       parsed means 0": Crystal's to_i otherwise raises on "0", "08" or "",
+       where Ruby answers 0. */
+    int base0 = nt_kind(g->nt, argv[0]) == NK_IntegerNode &&
+                nt_int(g->nt, argv[0], "value", -1) == 0;
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".to_i(");
+    if (base0) buf_puts(b, "10");
+    else       cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ", strict: false, underscore: true");
+    if (base0) buf_puts(b, ", prefix: true, leading_zero_is_octal: true");
+    buf_puts(b, ") { 0 }");
+    return;
+  }
+
+  /* Crystal's Float#to_i returns an Int32 and raises once the value passes
+     2**31; Ruby's returns a full Integer. Crystal's Float#to_i64 keeps Ruby's
+     value across the whole Int64 range, so use it. Past Int64 the two still
+     differ -- Ruby yields a Bignum, Crystal raises OverflowError -- so a float
+     literal outside the range is refused rather than shipped as a crash. */
+  if (recv >= 0 && sp_streq(name, "to_i") && argc == 0 &&
+      comp_ntype(g->c, recv) == TY_FLOAT &&
+      !cr_user_method_ok(g, name, TY_FLOAT, 0)) {
+    if (nt_kind(g->nt, recv) == NK_FloatNode) {
+      const char *c = nt_content(g->nt, recv);
+      double d = c ? strtod(c, NULL) : 0.0;
+      if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) {
+        cr_mark_unsupported(g, id, "Float#to_i outside the Int64 range (Ruby "
+                                  "returns a Bignum; Crystal raises OverflowError)");
+        buf_puts(b, "nil");
+        return;
+      }
+    }
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".to_i64");
+    return;
+  }
+
+  /* Ruby's min/max answer nil on an empty collection; Crystal's min/max raise
+     Enumerable::EmptyError. The `?` form returns the nilable counterpart, so it
+     is used only where the surrounding context already tolerates nil -- the same
+     gate the `[]` read uses -- to avoid widening an element type that a later
+     non-nil use depends on. */
+  if (recv >= 0 && (sp_streq(name, "min") || sp_streq(name, "max")) &&
+      argc == 0 && block < 0 && g->nil_ok &&
+      (ty_is_array(comp_ntype(g->c, recv)) || comp_ntype(g->c, recv) == TY_RANGE)) {
+    cr_emit_recv(g, recv, b);
+    buf_printf(b, ".%s?()", name);
+    return;
+  }
+
+  /* Ruby's sub/gsub replacement strings expand `\&` (the whole match) and
+     `\k<name>` (empty when the group did not participate); Crystal's replacement
+     parser leaves `\&` literal and raises IndexError for a non-participating
+     `\k<name>`. The two languages are not interchangeable, and a computed
+     replacement hides its contents, so only a literal one is inspected. */
+  if (recv >= 0 && (sp_streq(name, "sub") || sp_streq(name, "gsub")) &&
+      argc == 2 && nt_kind(g->nt, argv[1]) == NK_StringNode &&
+      cr_str_has_ruby_only_replacement(nt_str(g->nt, argv[1], "content"))) {
+    cr_mark_unsupported(g, id, "a sub/gsub replacement using Ruby's `\\&` or "
+                              "`\\k<name>` (Crystal's replacement language differs)");
+    buf_puts(b, "nil");
     return;
   }
 
@@ -1598,6 +1753,21 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       int ri = (rt == TY_INT || rt == TY_BIGINT);
       int ai = (at == TY_INT || at == TY_BIGINT);
       if (ri && ai) op = "//";
+    }
+    /* Crystal's String#% is sprintf, and its named references ("%<name>spec" /
+       "%{name}") index the hash with a STRING key (formatter.cr: `arg[index]`).
+       Ruby's format reads the symbol-keyed hash we emit, so a plain `%` raises
+       KeyError on the first name. Rename the keys back to Strings. Restricted to
+       a literal format, as on the C side: a computed format hides its references,
+       and a positional format needs no rewrite at all. */
+    if (sp_streq(name, "%") && nt_kind(g->nt, recv) == NK_StringNode &&
+        ty_is_hash(comp_ntype(g->c, argv[0])) &&
+        cr_str_has_named_format(nt_str(g->nt, recv, "content"))) {
+      cr_emit_expr(g, recv, b);
+      buf_puts(b, " % (");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ".transform_keys(&.to_s))");
+      return;
     }
     /* `x == nil` / `x != nil` is the other spelling of "does this read have a
        value", so the left operand is a nil-tolerant position too. */
@@ -1623,6 +1793,12 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     int nilable = g->nil_ok && argc == 1 &&
                   nt_kind(g->nt, argv[0]) != NK_RangeNode &&
                   (ty_is_hash(rt) || ty_is_array(rt));
+    /* `s[regexp, name]` is the named-capture read. Ruby answers nil when the
+       group did not participate; Crystal's `[]` instead declares a non-nilable
+       String and asserts a match, so the nil answer is the `[]?` form. This is
+       always correct -- the group may or may not have matched -- so it does not
+       depend on the surrounding nil-tolerance. */
+    if (argc == 2 && comp_ntype(g->c, argv[0]) == TY_REGEX) nilable = 1;
     /* The flag is about THIS read only. Clear it for the receiver and the index
        so a nested read is not silently made nilable: in `t[k][j]`, making the
        inner `t[k]` nilable would change the type of the outer receiver. */
