@@ -36,6 +36,8 @@ const int *call_args(const NodeTable *nt, int id, int *argc);
    turns a construct outside the subset into a hard error instead of a silent
    `nil` placeholder that would ship as wrong output. */
 __attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg);
+/* True when `val` is a `Struct.new(...)` / `Data.define(...)` call (analyze_scope.c). */
+int is_struct_call(Compiler *c, int val);
 
 /* ---- emitter state ---- */
 typedef struct { char **names; int n, cap; } NameSet;
@@ -988,6 +990,24 @@ static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare) {
     if (!sc->name || !sp_streq(sc->name, name)) continue;
     if (bare && (sc->class_id == -1 || sc->class_id == g->cur_class)) return 1;
     if (!bare && ty_is_object(rt) && sc->class_id == ty_object_class(rt)) return 1;
+  }
+  /* attr_accessor/reader/writer generate methods the analyzer records in the
+     class's readers[]/writers[] rather than as def scopes, so a call to them
+     (c.x / c.x = v) must be accepted here or it is refused as "not in subset". */
+  if (!bare && ty_is_object(rt)) {
+    int ci = ty_object_class(rt);
+    if (ci >= 0 && ci < g->c->nclasses) {
+      ClassInfo *cl = &g->c->classes[ci];
+      for (int i = 0; i < cl->nreaders; i++)
+        if (sp_streq(cl->readers[i], name)) return 1;
+      size_t nl = strlen(name);
+      if (nl >= 2 && name[nl - 1] == '=') {   /* setter: "x=" -> base "x" */
+        for (int i = 0; i < cl->nwriters; i++) {
+          const char *w = cl->writers[i];
+          if (strlen(w) == nl - 1 && strncmp(w, name, nl - 1) == 0) return 1;
+        }
+      }
+    }
   }
   return 0;
 }
@@ -2073,11 +2093,13 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      annotation: a bare `@d` in a class body parses as a read, not a declaration,
      and is rejected as an instance variable at the top level. An ivar whose type
      the inference left poly has no annotation to write, so refuse it. */
+  int all_ivars_typed = 1;
   if (!is_module)
     for (int i = 0; i < ci->nivars; i++) {
       Buf tmp; memset(&tmp, 0, sizeof tmp);
       if (!cr_map_type(g, ci->ivar_types[i], &tmp)) {
         free(tmp.p);
+        all_ivars_typed = 0;
         cr_mark_unsupported(g, ci->def_node,
                             "an instance variable with a poly/unknown type: Crystal "
                             "requires a declared ivar type and has no untyped type");
@@ -2086,6 +2108,24 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
       buf_printf(b, "  %s : %s\n", ci->ivars[i], tmp.p);
       free(tmp.p);
     }
+
+  /* A Struct.new(:a, :b) has no user `initialize`: the constructor takes the
+     members positionally and assigns them. Emit it as a Crystal
+     `def initialize(@a : T, @b : T)` whose ivar-params assign on entry. Only when
+     every member type is concrete (a poly member already refused above). Data is
+     excluded (is_data): it is a value type needing member-wise ==, not this ctor. */
+  if (ci->is_struct && !ci->is_data && !is_module && all_ivars_typed) {
+    Buf sig; memset(&sig, 0, sizeof sig);
+    for (int i = 0; i < ci->nivars; i++) {
+      if (i) buf_puts(&sig, ", ");
+      Buf tmp; memset(&tmp, 0, sizeof tmp);
+      cr_map_type(g, ci->ivar_types[i], &tmp);   /* known to succeed */
+      buf_printf(&sig, "@%s : %s", ci->ivars[i] + 1, tmp.p);  /* skip leading '@' */
+      free(tmp.p);
+    }
+    buf_printf(b, "  def initialize(%s)\n  end\n", sig.p ? sig.p : "");
+    free(sig.p);
+  }
 
   /* methods: walk the body's DefNodes (and class-level constants) */
   int cbody = -1;
@@ -2138,6 +2178,28 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   buf_puts(b, "end\n");
 }
 
+/* A top-level `Name = Struct.new(...)` / `Data.define(...)` definition. The
+   analyzer models it as a user class (is_struct/is_data) whose members are the
+   positional ivars; we emit it as a Crystal reference-type `class` in Pass 1 and
+   suppress the verbatim write in Pass 2. Returns the class index, or -1 if the
+   node is not such a definition. */
+static int cr_struct_def_ci(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, node) != NK_ConstantWriteNode) return -1;
+  const char *nm = nt_str(nt, node, "name");
+  int val = nt_ref(nt, node, "value");
+  if (!nm || !is_struct_call(c, val)) return -1;
+  int ci = comp_class_index(c, nm);
+  if (ci < 0) return -1;
+  ClassInfo *cls = &c->classes[ci];
+  /* Struct is a reference type, so a Crystal `class` matches it. Data sets BOTH
+     is_struct and is_data (register_struct_members); it is a VALUE type with
+     member-wise ==, which a plain class answers by identity -- silently wrong.
+     So only a pure Struct (is_struct && !is_data) is emitted here; Data stays
+     refused until value semantics land. */
+  return (cls->is_struct && !cls->is_data) ? ci : -1;
+}
+
 /* ---- entry point ---- */
 char *codegen_program_crystal(const NodeTable *nt) {
   Compiler *c = comp_new(nt);
@@ -2172,6 +2234,9 @@ char *codegen_program_crystal(const NodeTable *nt) {
       } else if (kk == NK_DefNode) {
         Scope *s = cr_scope_for_def(c, tstmts[k]);
         if (s) cr_emit_method(&g, s, &b);
+      } else if (kk == NK_ConstantWriteNode) {
+        int sci = cr_struct_def_ci(c, tstmts[k]);
+        if (sci >= 0) cr_emit_class(&g, &c->classes[sci], &b, 0);
       }
     }
   }
@@ -2183,6 +2248,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
     for (int k = 0; k < tn; k++) {
       NodeKind kk = nt_kind(nt, tstmts[k]);
       if (kk == NK_ClassNode || kk == NK_ModuleNode || kk == NK_DefNode) continue;
+      if (cr_struct_def_ci(c, tstmts[k]) >= 0) continue;   /* emitted as a class in Pass 1 */
       cr_emit_stmt(&g, tstmts[k], &b, 0);
     }
   }

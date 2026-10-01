@@ -172,6 +172,13 @@ translates for the supported surface:
   block), the emitter looks ahead to the first push and pins `[] of T`.
 - **Ranges.** Emitted parenthesised (`(1..5)`) because `..` binds looser than a
   method call; the exclusive-end flag is bit 2 of the Prism range flags.
+- **`Struct.new`.** A top-level `X = Struct.new(:a, :b)` becomes a Crystal
+  reference-type `class`: a positional `def initialize(@a : T, @b : T)` assigns
+  the members in order, and a reader/writer pair is generated for each. Ruby's
+  `Struct` is a reference object, so a `class` (not the value-type `struct`
+  keyword) matches its aliasing/mutation semantics. `Data.define` is *refused*,
+  not translated: it is a value type with member-wise `==`, which a plain class
+  answers by identity — emitting it would silently change `a == b`.
 
 ## What the corpus covers (and passes)
 
@@ -232,17 +239,18 @@ output against CRuby gives:
 
 | outcome | baseline `bd1f9b4a` | current | meaning |
 | --- | --- | --- | --- |
-| emit-clean | 757 | 747 | emits Crystal at all (the rest refuse) |
-| PASS | 196 | **240** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 99 | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 408 | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3669 | refused at the Ruby line, with a reason |
+| emit-clean | 757 | 779 | emits Crystal at all (the rest refuse) |
+| PASS | 196 | **252** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 100 | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 427 | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3638 | refused at the Ruby line, with a reason |
 
-This is **+44 PASS with zero PASS regressions** (every program that passed on the
-baseline still passes). The emit-clean count *fell* by 10 on purpose: the
-honesty-gate work below turns programs that previously emitted Crystal that did
-not compile into line-anchored refusals, and the method sweep plus regex-literal
-support (below) add most of them back. The new DIFFs are the remainder — programs
+This is **+56 PASS with zero PASS regressions** (every program that passed on the
+baseline still passes). The emit-clean count rose by 22: the honesty-gate work
+below turns programs that previously emitted broken Crystal into line-anchored
+refusals, and the method sweep, regex-literal support, the `attr_accessor` fix
+(below), and the `Struct.new` translation (below) add most of them back. The new
+DIFFs are the remainder — programs
 that now compile but disagree with CRuby on an edge case (empty `min`/`max`,
 `Array#fill` with a Range, blockless `each_index`, `String#tr` ranges,
 numeric-string `upto`, `squeeze` with a charset argument, `transform_values` block
@@ -259,7 +267,21 @@ the new BUILDFAILs it exposed are not regex bugs: the dominant one is a nilable
 `(Regex::MatchData | Nil)` and will not dispatch a method on it without a guard. That
 is the separate nilability gap, now visible instead of hidden behind a regex refusal;
 the rest are patterns Crystal's engine genuinely cannot compile (named backreferences
-`\k<n>`) or a `MatchData` constant that needs a `Regex::MatchData` remap.
+ `\k<n>`) or a `MatchData` constant that needs a `Regex::MatchData` remap.
+
+A top-level `X = Struct.new(:a, :b)` is emitted as a Crystal reference-type
+`class`: the analyzer already models it as a user class (`is_struct`, members as
+ordered ivars with readers/writers), so the emitter adds one synthesized
+`def initialize(@a : T, @b : T)` whose ivar-params assign the members positionally,
+and suppresses the verbatim `X = Struct.new(…)` write. A `class` (not Crystal's
+value-type `struct` keyword) is deliberate: Ruby `Struct` instances are reference
+objects, so aliasing and in-place mutation (`arr[i].x = …`) must survive. This moves
+the pure-Struct programs from a broken verbatim emit to PASS; the remaining struct
+BUILDFAILs are the not-yet-translated feature surface (`.members`, `to_a`/`values`,
+`dig`, `[]`/`[]=`, member-wise `==`) — Phase 2 of this work. `Data.define` is
+deliberately *not* translated: it is a value type whose `==` compares members, and a
+plain class answers `==` by identity, so emitting it would silently change results;
+it stays an honest refusal until member-wise equality lands.
 
 Reproduce with `scripts/crystal_corpus.sh`; it gives every build its own
 `CRYSTAL_CACHE_DIR` (a shared cache across parallel builds corrupts itself and
@@ -345,8 +367,19 @@ fixed:
   `do |a, b|` with "too many block parameters". The emitter now binds one
   synthetic param and destructures it in the body, gated on
   `ty_block_yield(...) == 1` so the genuinely pair-yielding iterators
-  (`Hash#each`, `each_with_index`) are untouched. The in-body assignment is
-  element-shape agnostic, so it also handles a Tuple from `zip`.
+   (`Hash#each`, `each_with_index`) are untouched. The in-body assignment is
+   element-shape agnostic, so it also handles a Tuple from `zip`.
+- **`attr_accessor` calls refused.** The analyzer resolves `attr_reader`/
+  `attr_writer`/`attr_accessor` into the class's `readers[]`/`writers[]` (emitted
+  as `def x` / `def x=`), but those names never create a `def` scope, so a call to
+  the generated accessor (`c.x`, `c.x = v`) was refused as "not in the Crystal
+  subset". `cr_user_method_ok` now also accepts a name found in the receiver
+  class's `readers[]` (getter) or `writers[]` (setter, matched on the base name
+  with the trailing `=` stripped). This unblocked 29 programs; the ones that still
+  build-fail do so on unrelated pre-existing gaps (`Struct.new`, Crystal's strict
+  ivar initialization, unary-operator defs), which the old accessor refusal had
+  been masking.
+
 
 
 ### Nilability: consumption-site inference
@@ -465,9 +498,14 @@ program compiles but can differ on edge inputs.
   nested array literal whose *outer* array is not narrowed (`[[1,2],[3,4]]` →
   `poly_array`, so the inner block param is `poly`) — the element type is
   unresolvable and Crystal has no `[] of untyped`. The look-ahead handles
-  concrete pushes; genuinely-poly elements still fail to build. This is the
-  sharpest *inference* gap surfaced by the PoC.
-- **Non-local block control flow.** `break`/`return` out of a *yielding* method's
+   concrete pushes; genuinely-poly elements still fail to build. This is the
+   sharpest *inference* gap surfaced by the PoC.
+ - **`Struct` feature surface.** The core `Struct.new` definition (positional
+   constructor, readers, writers) translates; the rest of the Struct API does not
+   yet: `.members`, `to_a`/`values`/`to_h`, `dig`, `[]`/`[]=` accessors, and
+   member-wise `==`. Programs using those still build-fail on the missing method.
+   `Data.define` is refused outright (value-type `==`), not partially translated.
+ - **Non-local block control flow.** `break`/`return` out of a *yielding* method's
   block (and `catch`/`throw`, `retry`) are not handled. Crystal `Proc`s cannot
   break out of the enclosing method, so these would need emulation (exceptions /
   CPS). This is the sharpest *semantic* gap for a full port and was deliberately

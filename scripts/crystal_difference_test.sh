@@ -100,6 +100,28 @@ expect_agree "index_nil_on_miss" 'h = {a: 1}; p h[:b]'
 # are char literals in Crystal); backslashes are re-escaped so \n stays literal.
 expect_agree "string_quoting" "p 'abc'"
 
+# attr_accessor/reader/writer become property/getter/setter; we emit explicit
+# def/def x= methods, and a call to the generated accessor (c.x / c.x = v) must
+# resolve against the class's readers[]/writers[], not just its def scopes.
+expect_agree "attr_accessor" 'class C
+  attr_accessor :x
+  def initialize
+    @x = 5
+  end
+end
+c = C.new
+p c.x
+c.x = 9
+p c.x'
+
+# A top-level `X = Struct.new(:a, :b)` becomes a Crystal reference-type `class`
+# with a positional `initialize`, readers and writers; member get/set round-trip.
+expect_agree "struct_new" 'Point = Struct.new(:x, :y)
+p Point.new(1, 2).x + Point.new(3, 4).y
+a = Point.new(1, 2)
+a.x = 10
+p a.x'
+
 # No array autosplat and a max block arity of 1 in Crystal; we destructure the
 # yielded pair in the block body instead.
 expect_agree "block_autosplat" '[[1,2],[3,4]].each { |a,b| p a+b }'
@@ -120,6 +142,10 @@ expect_refuse "method 'eval' is not in the Crystal subset" 'p eval("1+1")'
 expect_refuse "method 'respond_to?' is not in the Crystal subset" 'p "a".respond_to?(:upcase)'
 # Regex backreference globals $`/$'/$& are not supported; use $~.pre_match etc.
 expect_refuse "BackReferenceReadNode"            '"a" =~ /a/; p $&'
+# Data.define is a VALUE type (member-wise ==); a Crystal class compares by
+# identity, so we refuse it rather than emit a reference class that would answer
+# `==` wrong. (A plain Struct.new is a reference type and IS translated.)
+expect_refuse "the constant 'Data'"              'D = Data.define(:a); p D.new(1) == D.new(1)'
 
 # ---- DIVERGE: emitted, but differs from CRuby on a known edge ---------------
 
