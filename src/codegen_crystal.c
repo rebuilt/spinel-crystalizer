@@ -991,23 +991,31 @@ static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare) {
     if (bare && (sc->class_id == -1 || sc->class_id == g->cur_class)) return 1;
     if (!bare && ty_is_object(rt) && sc->class_id == ty_object_class(rt)) return 1;
   }
-  /* attr_accessor/reader/writer generate methods the analyzer records in the
-     class's readers[]/writers[] rather than as def scopes, so a call to them
-     (c.x / c.x = v) must be accepted here or it is refused as "not in subset". */
-  if (!bare && ty_is_object(rt)) {
-    int ci = ty_object_class(rt);
-    if (ci >= 0 && ci < g->c->nclasses) {
-      ClassInfo *cl = &g->c->classes[ci];
-      for (int i = 0; i < cl->nreaders; i++)
-        if (sp_streq(cl->readers[i], name)) return 1;
-      size_t nl = strlen(name);
-      if (nl >= 2 && name[nl - 1] == '=') {   /* setter: "x=" -> base "x" */
-        for (int i = 0; i < cl->nwriters; i++) {
-          const char *w = cl->writers[i];
-          if (strlen(w) == nl - 1 && strncmp(w, name, nl - 1) == 0) return 1;
-        }
+  /* attr_accessor/reader/writer and the synthesized Struct methods are recorded in
+     the class's readers[]/writers[] (not def scopes), so a call to them must be
+     accepted here or it is refused as "not in subset". The target class is the
+     receiver's class for a qualified call, or the enclosing class (implicit self)
+     for a bare call inside a method body -- Crystal resolves a bare `x` with no
+     local of that name to self.x, matching Ruby. */
+  int tci = -1;
+  if (!bare && ty_is_object(rt)) tci = ty_object_class(rt);
+  else if (bare && g->cur_class >= 0) tci = g->cur_class;
+  if (tci >= 0 && tci < g->c->nclasses) {
+    ClassInfo *cl = &g->c->classes[tci];
+    for (int i = 0; i < cl->nreaders; i++)
+      if (sp_streq(cl->readers[i], name)) return 1;
+    size_t nl = strlen(name);
+    if (nl >= 2 && name[nl - 1] == '=') {   /* setter: "x=" -> base "x" */
+      for (int i = 0; i < cl->nwriters; i++) {
+        const char *w = cl->writers[i];
+        if (strlen(w) == nl - 1 && strncmp(w, name, nl - 1) == 0) return 1;
       }
     }
+    /* to_h is a synthesized Struct method not in the name allowlist (which would
+       wrongly let it through on non-struct receivers). Accept it only on a struct
+       instance so the call reaches the generated method. (to_a/values are already
+       allowed; ==/[]/[]= bypass as operators.) */
+    if (cl->is_struct && !cl->is_data && sp_streq(name, "to_h")) return 1;
   }
   return 0;
 }
@@ -2125,6 +2133,54 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
     }
     buf_printf(b, "  def initialize(%s)\n  end\n", sig.p ? sig.p : "");
     free(sig.p);
+
+    /* Struct feature surface: to_a/values gather the member values in declaration
+       order; .members lists them as symbols; to_h pairs each symbol with its value
+       (the => form, so it is a real Hash, not a NamedTuple). Emitted for every pure
+       Struct with at least one typed member so any of them can be called. Data is
+       excluded (a value type with a different API). */
+    if (ci->nivars > 0) {
+      for (int which = 0; which < 2; which++) {
+        buf_printf(b, "  def %s\n    [", which == 0 ? "to_a" : "values");
+        for (int i = 0; i < ci->nivars; i++)
+          buf_printf(b, "%s%s", i ? ", " : "", ci->ivars[i]);
+        buf_puts(b, "]\n  end\n");
+      }
+      buf_puts(b, "  def self.members\n    [");
+      for (int i = 0; i < ci->nivars; i++)
+        buf_printf(b, "%s:%s", i ? ", " : "", ci->ivars[i] + 1);
+      buf_puts(b, "]\n  end\n");
+      buf_puts(b, "  def to_h\n    { ");
+      for (int i = 0; i < ci->nivars; i++)
+        buf_printf(b, "%s:%s => %s", i ? ", " : "", ci->ivars[i] + 1, ci->ivars[i]);
+      buf_puts(b, " }\n  end\n");
+
+      /* == is member-wise (Ruby Struct equality), not Crystal's default identity.
+         Typed to the class so `a == b` dispatches here while `a == nil` / a foreign
+         type still falls through to Object#== (identity) -- matching Ruby's answer. */
+      buf_printf(b, "  def ==(other : %s)\n", ci->name);
+      for (int i = 0; i < ci->nivars; i++)
+        buf_printf(b, "    return false unless %s == other.%s\n", ci->ivars[i], ci->ivars[i] + 1);
+      buf_puts(b, "    true\n  end\n");
+
+      /* [] reads a member by symbol, string name, or integer position (negative
+         counts from the end). Emitted as bracket syntax at the call site, so no
+         allowlist entry is needed. The result is the union of the member types. */
+      buf_puts(b, "  def [](key : Symbol)\n    case key\n");
+      for (int i = 0; i < ci->nivars; i++)
+        buf_printf(b, "    when %s:%s then %s\n", "", ci->ivars[i] + 1, ci->ivars[i]);
+      buf_puts(b, "    else raise IndexError.new(\"no member\")\n    end\n  end\n");
+      buf_puts(b, "  def [](key : String)\n    case key\n");
+      for (int i = 0; i < ci->nivars; i++)
+        buf_printf(b, "    when \"%s\" then %s\n", ci->ivars[i] + 1, ci->ivars[i]);
+      buf_puts(b, "    else raise IndexError.new(\"no member\")\n    end\n  end\n");
+      buf_printf(b, "  def [](key : Int64)\n    i = key < 0 ? key + %d : key\n", ci->nivars);
+      buf_printf(b, "    if i < 0 || i >= %d; raise IndexError.new(\"bad index\"); end\n", ci->nivars);
+      buf_puts(b, "    case i\n");
+      for (int i = 0; i < ci->nivars; i++)
+        buf_printf(b, "    when %d then %s\n", i, ci->ivars[i]);
+      buf_puts(b, "    else raise IndexError.new(\"bad index\")\n    end\n  end\n");
+    }
   }
 
   /* methods: walk the body's DefNodes (and class-level constants) */
@@ -2133,6 +2189,16 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
     const char *cty = nt_type(g->nt, ci->def_node);
     if (cty && (sp_streq(cty, "ClassNode") || sp_streq(cty, "ModuleNode")))
       cbody = nt_ref(g->nt, ci->def_node, "body");
+    else if (ci->is_struct && !ci->is_data && cty && sp_streq(cty, "ConstantWriteNode")) {
+      /* block-form: Point = Struct.new(:x) do def m; end end -- the methods live
+         in the call's block body (the analyzer fixes their class_id to this one). */
+      int val = nt_ref(g->nt, ci->def_node, "value");
+      int blk = (val >= 0 && nt_kind(g->nt, val) == NK_CallNode) ? nt_ref(g->nt, val, "block") : -1;
+      if (blk >= 0) {
+        int bb = nt_ref(g->nt, blk, "body");
+        if (bb >= 0 && sp_streq(nt_type(g->nt, bb), "StatementsNode")) cbody = bb;
+      }
+    }
   }
   if (cbody >= 0) {
     int n = 0; const int *arr = nt_arr(g->nt, cbody, "body", &n);

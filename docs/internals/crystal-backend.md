@@ -239,14 +239,14 @@ output against CRuby gives:
 
 | outcome | baseline `bd1f9b4a` | current | meaning |
 | --- | --- | --- | --- |
-| emit-clean | 757 | 779 | emits Crystal at all (the rest refuse) |
-| PASS | 196 | **252** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 100 | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 427 | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3638 | refused at the Ruby line, with a reason |
+ | emit-clean | 757 | 786 | emits Crystal at all (the rest refuse) |
+ | PASS | 196 | **256** | builds and output is byte-identical to CRuby |
+ | DIFF | 70 | 102 | builds, but disagrees with CRuby |
+ | BUILDFAIL | 491 | 428 | the emitted Crystal does not compile |
+ | REFUSED | 3659 | 3631 | refused at the Ruby line, with a reason |
 
-This is **+56 PASS with zero PASS regressions** (every program that passed on the
-baseline still passes). The emit-clean count rose by 22: the honesty-gate work
+This is **+60 PASS with zero PASS regressions** (every program that passed on the
+baseline still passes). The emit-clean count rose by 29: the honesty-gate work
 below turns programs that previously emitted broken Crystal into line-anchored
 refusals, and the method sweep, regex-literal support, the `attr_accessor` fix
 (below), and the `Struct.new` translation (below) add most of them back. The new
@@ -275,13 +275,23 @@ ordered ivars with readers/writers), so the emitter adds one synthesized
 `def initialize(@a : T, @b : T)` whose ivar-params assign the members positionally,
 and suppresses the verbatim `X = Struct.new(…)` write. A `class` (not Crystal's
 value-type `struct` keyword) is deliberate: Ruby `Struct` instances are reference
-objects, so aliasing and in-place mutation (`arr[i].x = …`) must survive. This moves
-the pure-Struct programs from a broken verbatim emit to PASS; the remaining struct
-BUILDFAILs are the not-yet-translated feature surface (`.members`, `to_a`/`values`,
-`dig`, `[]`/`[]=`, member-wise `==`) — Phase 2 of this work. `Data.define` is
-deliberately *not* translated: it is a value type whose `==` compares members, and a
-plain class answers `==` by identity, so emitting it would silently change results;
-it stays an honest refusal until member-wise equality lands.
+objects, so aliasing and in-place mutation (`arr[i].x = …`) must survive. On top of
+the constructor and readers/writers the emitter generates the feature surface:
+`to_a`/`values` (member values in order), `.members` (symbol list), `to_h`
+(symbol-keyed, `=>` form), member-wise `==` (typed to the class so a foreign
+operand still falls through to identity), and `[]` by symbol / string / integer
+position (negative counts from the end). Methods written in a block-form
+`Struct.new(…) do … end` are emitted too. This moves the pure-Struct programs from a
+broken verbatim emit to PASS. Two Crystal/Ruby printing differences surface as
+documented DIFFs rather than bugs: `to_h` prints symbol keys as `{:a => 1}` where
+Ruby prints `{a: 1}`, and `puts <struct>` uses Crystal's default object formatting
+rather than a custom `to_s`. Still not translated (they build-fail on the missing
+method): `[]=` (the stored value must match each member's type, which Crystal's
+static typing resists for heterogeneous structs), `dig`, `values_at`, and a
+`Struct#new` called with fewer arguments than members (Ruby fills the rest with
+nil). `Data.define` is deliberately *not* translated: it is a value type whose `==`
+compares members, and a plain class answers `==` by identity, so emitting it would
+silently change results; it stays an honest refusal until member-wise equality lands.
 
 Reproduce with `scripts/crystal_corpus.sh`; it gives every build its own
 `CRYSTAL_CACHE_DIR` (a shared cache across parallel builds corrupts itself and
@@ -500,11 +510,14 @@ program compiles but can differ on edge inputs.
   unresolvable and Crystal has no `[] of untyped`. The look-ahead handles
    concrete pushes; genuinely-poly elements still fail to build. This is the
    sharpest *inference* gap surfaced by the PoC.
- - **`Struct` feature surface.** The core `Struct.new` definition (positional
-   constructor, readers, writers) translates; the rest of the Struct API does not
-   yet: `.members`, `to_a`/`values`/`to_h`, `dig`, `[]`/`[]=` accessors, and
-   member-wise `==`. Programs using those still build-fail on the missing method.
-   `Data.define` is refused outright (value-type `==`), not partially translated.
+  - **`Struct` feature surface.** The core definition (positional constructor,
+    readers, writers) plus `to_a`/`values`, `.members`, `to_h`, member-wise `==`,
+    and `[]` by symbol/string/index all translate. Still not translated: `[]=`
+    (the stored value must match each member's type, which Crystal's static typing
+    resists for heterogeneous structs), `dig`, `values_at`, and a `Struct#new`
+    called with fewer arguments than members (Ruby nil-fills the rest). Programs
+    using those build-fail on the missing method. `Data.define` is refused outright
+    (value-type `==`), not partially translated.
  - **Non-local block control flow.** `break`/`return` out of a *yielding* method's
   block (and `catch`/`throw`, `retry`) are not handled. Crystal `Proc`s cannot
   break out of the enclosing method, so these would need emulation (exceptions /
