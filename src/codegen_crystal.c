@@ -1853,6 +1853,20 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
+  /* Ruby's Math.lgamma answers [log|Gamma(x)|, sign]; Crystal's answers the log
+     alone. Pair it with the computed sign; the argument is bound to a temp so a
+     side-effecting expression is evaluated once. */
+  if (recv >= 0 && sp_streq(name, "lgamma") && argc == 1 &&
+      nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+      sp_streq(nt_str(g->nt, recv, "name"), "Math")) {
+    char tmp[32];
+    snprintf(tmp, sizeof tmp, "__sp_lg%d", g->tmp_seq++);
+    buf_printf(b, "(begin %s = ", tmp);
+    cr_emit_expr(g, argv[0], b);
+    buf_printf(b, "; [Math.lgamma(%s), sp_lgamma_sign(%s)] end)", tmp, tmp);
+    return;
+  }
+
   /* Ruby's sub/gsub replacement strings expand `\&` (the whole match) and
      `\k<name>` (empty when the group did not participate); Crystal's replacement
      parser leaves `\&` literal and raises IndexError for a non-participating
@@ -1925,6 +1939,11 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
        always correct -- the group may or may not have matched -- so it does not
        depend on the surrounding nil-tolerance. */
     if (argc == 2 && comp_ntype(g->c, argv[0]) == TY_REGEX) nilable = 1;
+    /* ENV is a String-keyed Hash in Ruby: a missing key answers nil rather than
+       raising. Crystal's `ENV[]?` is that form (and `ENV[]=` already accepts nil
+       to delete), so this is always the nil-returning read, not a guess. */
+    if (nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+        sp_streq(nt_str(g->nt, recv, "name"), "ENV")) nilable = 1;
     /* The flag is about THIS read only. Clear it for the receiver and the index
        so a nested read is not silently made nilable: in `t[k][j]`, making the
        inner `t[k]` nilable would change the type of the outer receiver. */
@@ -2734,6 +2753,18 @@ char *codegen_program_crystal(const NodeTable *nt) {
     "    o = options\n"
     "    (o.ignore_case? ? 1 : 0) | (o.extended? ? 2 : 0) | (o.multiline? ? 4 : 0)\n"
     "  end\n"
+    "end\n\n");
+  /* Ruby's Math.lgamma answers [log|Gamma(x)|, sign]; Crystal's answers the log
+     alone (and has no lgamma_r). The sign is +1 for x > 0, -1 for x < 0 in the
+     interval floor(x) odd (the sign of Gamma flips each unit interval), and +1
+     at the non-positive integer poles (CRuby's convention); -0.0 is -1. */
+  buf_puts(&b,
+    "def sp_lgamma_sign(x : Float64) : Int32\n"
+    "  return -1 if x == 0 && (1.0 / x) < 0\n"
+    "  return 1 if x >= 0\n"
+    "  f = x.floor\n"
+    "  return 1 if f == x\n"
+    "  (f.to_i % 2 == 0) ? 1 : -1\n"
     "end\n\n");
 
   int top_body = c->scopes[0].body;

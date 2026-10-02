@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | Phase 7 (`f8ba43ac`) | Phase 8 (`bc5dd918`) | **Phase 9 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | **777** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | **297** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | **58** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | **3621** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | Phase 7 (`f8ba43ac`) | Phase 8 (`bc5dd918`) | Phase 9 (`a3fc1ffd`) | **Phase 10 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | **777** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | **300** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | **55** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | **3621** | refused at the Ruby line, with a reason |
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -257,7 +257,8 @@ moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
 BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
 +0 REFUSED**, Phase 6 **+10 PASS, −10 DIFF, +0 BUILDFAIL, +0 REFUSED**, and
 Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
-**+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED**, and Phase 9
+**+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED**, Phase 9
+**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 10
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS regressions
 and no change to any program other than the ones named below.
 
@@ -434,7 +435,19 @@ The rest of the tuple/iterator tail (`each_with_index` and `chunk` yielding
 Tuples, `each`/`each_slice` returning nil instead of the receiver, un-materialized
 lazy iterators) and the remaining whitespace/limit/trailing-empty `split` cases
 need the emitter's iterator/materialization machinery reworked, and are left as
-the tracked 58 DIFFs.
+tracked DIFFs.
+
+Phase 10 was a contained batch of two stdlib-semantics fixes:
+
+- **`ENV[k]`.** Ruby's `ENV` is a String-keyed Hash: a missing key answers `nil`.
+  Crystal's `ENV[]` raises, but `ENV[]?` answers nil and `ENV[]=` already accepts
+  nil to delete — so the read is emitted with `?`. Fixed `env_nil_string_to_s` and
+  `env_string_inference`, and closes the `ENV[]` entry in the gap list below.
+- **`Math.lgamma`.** Ruby answers `[log|Gamma(x)|, sign]`; Crystal answers the log
+  alone. The emitted call is paired with a synthesized `sp_lgamma_sign` (the sign
+  is `-1` on the negative intervals where `floor(x)` is odd and at `-0.0`, `+1`
+  otherwise), which reproduces CRuby's `lgamma_r` convention at the poles. Fixed
+  `issue_3116`.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
@@ -706,13 +719,14 @@ construct at its Ruby line instead of shipping wrong output); the exceptions are
 the *semantic divergences* below, where a method exists in both languages and the
 program compiles but can differ on edge inputs.
 
-- **Semantic divergence of shared methods.** Methods present in both stdlibs but
-  with different edge-case behaviour: `ENV[]` (Ruby returns nil for a missing
-  key, Crystal raises), `String#sum`/`Float` summation (Kahan compensation), and
-  the like. These compile and run, so they are not caught by the rejection
-  discipline; closing them needs receiver-type-aware translation plus per-method
-  semantic checks. `String#to_i` — both the explicit-base and bare forms — is now
-  handled with Crystal's `strict`/`underscore`/`prefix` flags.
+- **Semantic divergence of shared methods.** A method that exists in both stdlibs
+  but answers differently on edge inputs. These compile and run, so the rejection
+  discipline never sees them; closing each needs receiver-type-aware translation
+  plus a per-method check. Several are now closed: `String#to_i` (both forms) via
+  Crystal's `strict`/`underscore`/`prefix` flags, `ENV[k]` via `ENV[]?`, and
+  `Math.lgamma` via the emitted `sp_lgamma_sign`. Still open: `Array#sum` on
+  floats (Ruby uses Kahan-Babuška-Neumaier compensation), `Float#to_s` fixed vs
+  scientific notation, and the like.
 - **`puts <collection>`.** Ruby's `puts` splats an array/hash (one element per
   line); Crystal's prints the container via `to_s`. Not translated — the corpus
   uses `.join` instead. A general fix needs receiver-type-aware emission.
