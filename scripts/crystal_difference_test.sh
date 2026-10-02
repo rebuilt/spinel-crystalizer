@@ -203,9 +203,9 @@ expect_diverge "each_returns_nil" ".each yields nil, not the receiver" 'p [1,2].
 # (we emit => form), but .class shows its element types.
 expect_diverge "param_type_name" "Crystal .class shows parameterized types" 'p({a: 1}.class)'
 
-# Struct#to_h is translated (=> form, a real Hash), but Crystal prints symbol-keyed
-# hashes as {:a => 1} where Ruby prints {a: 1}; the value is right, the spelling differs.
-expect_diverge "struct_to_h_print" "Crystal prints symbol-keyed hashes with : and =>" 'P = Struct.new(:a); p P.new(1).to_h'
+# Struct#to_h is translated to a real Hash, and the emitted Hash#inspect shim
+# renders symbol keys with CRuby's spelling ({a: 1}, not {:a => 1}).
+expect_agree "struct_to_h_print" 'P = Struct.new(:a); p P.new(1).to_h'
 
 # An unknown member NAME: Ruby raises NameError, but Crystal 1.21 defines no such
 # class (its whole hierarchy is Exception/ArgumentError/IndexError/KeyError/...),

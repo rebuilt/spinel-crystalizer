@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | **Phase 6 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | **778** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | **278** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | **78** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | **3620** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | **Phase 7 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | **778** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | **289** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | **67** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | **3620** | refused at the Ruby line, with a reason |
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -255,9 +255,9 @@ BUILDFAIL 426 / REFUSED 3616. Against that, Phase 4 is **+7 PASS, −10 DIFF,
 −1 BUILDFAIL, +4 REFUSED, with zero PASS regressions** — every changed program
 moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
 BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
-+0 REFUSED**, and Phase 6 **+10 PASS, −10 DIFF, +0 BUILDFAIL, +0 REFUSED** — both
-with zero PASS regressions and no change to any program other than the ones named
-below.
++0 REFUSED**, Phase 6 **+10 PASS, −10 DIFF, +0 BUILDFAIL, +0 REFUSED**, and
+Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS
+regressions and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
@@ -370,6 +370,22 @@ Phase 6 then cleared the largest remaining coherent DIFF clusters:
   match everything, so it is emitted escaped. Fixed `string_charset_escape`,
   `string_charset_range_notation`, `str_delete_count_negation` and `str_squeeze_arg`.
 
+Phase 7 closed the **Hash inspection** cluster — the single largest remaining
+group. Crystal prints a symbol-keyed hash as `{:a => 1}`; CRuby 4.0 prints
+`{a: 1}` for a plain-label key and `{"a-b": 1}` for one that is not, and `p`,
+`puts` and `#{}` all go through `inspect`/`to_s`. Since the C backend already
+reproduces CRuby's spelling byte-for-byte, every generated program now carries a
+small `Hash#inspect`/`#to_s` shim that matches it (a key is a label when it is a
+letter or `_` — or any non-ASCII codepoint — followed by letters/digits/`_`, with
+an optional trailing `?`/`!`; operators, `@x`, `$y` and `1abc` stay quoted). This
+is the one place the emitted program reopens a core class; it changes only
+formatting, and the full corpus shows no PASS regression. It resolved
+`array_to_h_pairs`, `begin_value_body_local`, `each_with_index_to_h`,
+`hash_block_methods_variants`, `hash_inspect_poly`, `hash_transform_keys_cross`,
+`issue_3138`, `p_as_expression`, `print_puts_expression_and_kinds`,
+`to_h_with_block` and `typed_hash_inspect_and_each_value`, and let the
+`struct_to_h_print` difference-ledger entry be promoted from DIVERGE to AGREE.
+
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
 text drops in verbatim with only the `/` delimiter re-escaped (the unescaped source
@@ -400,10 +416,11 @@ members share one — and each overload's `case` arms list only that type's memb
 That keeps it cast-free: a heterogeneous struct needs no `union` and no `.as`, and a
 store of the wrong type fails overload resolution rather than writing a value under a
 mislabelled member. Each arm ends in the assignment, so the setter answers the stored
-value, matching Ruby's `s[k] = v`. Two Crystal/Ruby printing differences surface as
-documented DIFFs rather than bugs: `to_h` prints symbol keys as `{:a => 1}` where
-Ruby prints `{a: 1}`, and `puts <struct>` uses Crystal's default object formatting
-rather than a custom `to_s`. A third difference is the *class* of the error for an
+value, matching Ruby's `s[k] = v`. `to_h` prints with CRuby's symbol-key spelling
+because the emitted `Hash#inspect` shim renders `{a: 1}` (Phase 7; it was a
+documented DIFF before). One Crystal/Ruby printing difference remains a documented
+DIFF: `puts <struct>` uses Crystal's default object formatting rather than a
+custom `to_s`. A third difference is the *class* of the error for an
 unknown member **name**: Ruby raises `NameError`, but Crystal 1.21 defines no such
 class (its whole hierarchy is `Exception`/`ArgumentError`/`IndexError`/`KeyError`/…),
 so `[]` and `[]=` answer `IndexError`. Both are errors; only the class differs, and it
