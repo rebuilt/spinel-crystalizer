@@ -237,18 +237,19 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | **P13 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | **734** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | **307** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | **49** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | **378** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | **3664** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | **P14 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | **673** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | **307** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | **49** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | **317** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | **3725** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
-P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`.)
+P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`, P12 `9f4e8772`,
+P13 `7725fc9d`.)
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -266,7 +267,8 @@ Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 11
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 12
 **+2 PASS, −2 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 13
-**+2 PASS, −1 DIFF, −44 BUILDFAIL, +43 REFUSED** — all with zero PASS regressions
+**+2 PASS, −1 DIFF, −44 BUILDFAIL, +43 REFUSED**, and Phase 14
+**+0 PASS, +0 DIFF, −61 BUILDFAIL, +61 REFUSED** — all with zero PASS regressions
 and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
@@ -523,6 +525,28 @@ The same phase made the metrics reproducible and regression-proof:
   `scripts/crystal_corpus_gate.sh <results.txt>` fails if any baselined PASS
   stops passing (other transitions are reported, not failed). This is the
   zero-regression rule every phase here has been held to, now executable.
+
+Phase 14 continued the same honesty sweep on the remaining `undefined method`
+tail. The receiver-typed table grew three kinds of rule:
+
+- **Class-object reflection** — `Dog.ancestors`, `Dog.superclass`,
+  `M.const_get`, `Dog.method_defined?`, … checked *before* the user-class shadow
+  test, because reflection over the program's own class has no Crystal form
+  either.
+- **Container methods Crystal lacks** — `Array#slice!`/`#append`/`#prepend`,
+  `Hash#default=`/`#replace`/`#fetch_values`/`#flatten`/`#value?`/`#key?`,
+  `String#sum`, keyed on the container *family* so every element type is covered.
+- **Methods Crystal's Object simply has not** — `respond_to?`, `eql?`,
+  `equal?`, `then`, `yield_self`, `freeze`, `frozen?`, `send`, `public_send` —
+  refused by name, since a concrete receiver is already caught by the allowlist
+  but a poly/untyped one reaches dynamic dispatch and fails to compile. `Integer#[]`
+  (a bit read) and `String#[]=` (immutable) are guarded directly, because `[]`
+  and `[]=` are special-cased ahead of the table.
+
+The safety property is simple: a method Crystal lacks can never appear in a PASS
+program, so these refusals cannot regress one. Net **61 `BUILDFAIL`s became
+refusals, with zero PASS or DIFF change** — emit-clean fell 734 → 673, again by
+design.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern

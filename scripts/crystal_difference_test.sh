@@ -186,7 +186,7 @@ expect_refuse "ForNode"                          'for x in [1,2]; p x; end'
 expect_refuse "LambdaNode"                       'f = -> { 42 }; p f.call'
 expect_refuse "method 'proc' is not in the Crystal subset" 'f = proc { 42 }; p f.call'
 expect_refuse "method 'eval' is not in the Crystal subset" 'p eval("1+1")'
-expect_refuse "method 'respond_to?' is not in the Crystal subset" 'p "a".respond_to?(:upcase)'
+expect_refuse "respond_to?' is not available on this receiver" 'p "a".respond_to?(:upcase)'
 # Regex backreference globals $`/$'/$& are not supported; use $~.pre_match etc.
 expect_refuse "BackReferenceReadNode"            '"a" =~ /a/; p $&'
 # Data.define is a VALUE type (member-wise ==); a Crystal class compares by

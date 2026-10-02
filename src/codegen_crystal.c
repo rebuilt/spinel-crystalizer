@@ -904,9 +904,32 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { "File",    "stat",  "Crystal's File has no class-level stat; use File.info" },
     { "File",    "lstat", "Crystal's File has no class-level lstat" },
     { "Time",    "to_a",  "Crystal's Time has no to_a" },
+    { "Time",    "mktime", "Crystal spells mktime Time.local" },
     { "Kernel",  "gets",  "Crystal reads stdin with gets, not Kernel.gets" },
+    { "Object",  "new",   "Crystal's Object is not instantiable with new" },
+    { "Struct",  "new",   "only a top-level S = Struct.new(..) is translated; a Struct factory call has no Crystal form" },
+    { "Signal",  "trap",  "Crystal has no Signal.trap; a handler is not part of this subset" },
+    { "Signal",  "signame", "Crystal has no Signal.signame" },
+    { "Random",  "urandom", "Crystal's secure randomness is Random::Secure" },
+    { "ENV",     "key?",  "Crystal's ENV has no key?; use has_key?" },
+    { "ENV",     "update", "Crystal's ENV has no update" },
   };
   if (mod) {
+    /* Class-object reflection -- `Dog.ancestors`, `Dog.method_defined?`,
+       `M.const_get`. Ruby's Class/Module query surface has no Crystal form even
+       when the class is the program's own, so this is checked BEFORE the
+       user-class shadow test (which only protects the *instance* methods a
+       program defines). */
+    static const char *const refl[] = {
+      "ancestors", "superclass", "subclasses", "method_defined?",
+      "const_defined?", "const_get", "const_set", "instance_method",
+      "singleton_class?", "instance_methods", "public_instance_methods",
+      "const_source_location", "define_method", "module_eval", "class_eval",
+      "constants", NULL,
+    };
+    for (int i = 0; refl[i]; i++)
+      if (sp_streq(name, refl[i]))
+        return "Ruby's class-object reflection has no Crystal equivalent";
     /* A class the program defines shadows the stdlib name, so a call on it is
        the program's own method and not the missing one. */
     for (int i = 0; i < g->c->nclasses; i++)
@@ -960,17 +983,49 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { TY_REGEX, "eql?",    "Crystal compares Regex with ==" },
     { TY_REGEX, "names",   "Crystal exposes named captures lazily, not as a name list" },
     { TY_REGEX, "freeze",  "Crystal has no freeze" },
+    { TY_STRING, "[]=",    "Crystal's String is immutable and has no []=; a Ruby index-assign needs a mutable buffer" },
+    { TY_STRING, "sum",    "Crystal's String has no sum (Ruby's byte checksum)" },
+    { TY_FLOAT,  "succ",   "Crystal's Float has no succ" },
+    { TY_SYMBOL, "size",   "Crystal's Symbol has no size" },
+    { TY_TIME,   "min",    "Crystal spells the minute of the hour `minute`" },
+    { TY_TIME,   "to_a",   "Crystal's Time has no to_a" },
+    { TY_TIME,   "asctime", "Crystal's Time has no asctime; format it" },
   };
   for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
     if (v[i].type == rt && sp_streq(v[i].meth, name)) return v[i].why;
+  /* Container methods Crystal lacks (keyed on the container family, so every
+     element type is covered without listing each TyKind). */
+  if (ty_is_array(rt)) {
+    if (sp_streq(name, "slice!")) return "Crystal's Array has no slice!; it is not mutated in place";
+    if (sp_streq(name, "append")) return "Crystal spells Array#append `push`";
+    if (sp_streq(name, "prepend")) return "Crystal spells Array#prepend `unshift`";
+  }
   if (ty_is_hash(rt)) {
     if (sp_streq(name, "freeze"))   return "Crystal has no freeze; a Hash is not frozen at runtime";
     if (sp_streq(name, "frozen?"))  return "Crystal has no frozen?";
     if (sp_streq(name, "sort"))     return "Hash has no sort; collect the pairs and sort those";
     if (sp_streq(name, "sort_by"))  return "Hash has no sort_by; collect the pairs and sort those";
+    if (sp_streq(name, "default=")) return "Crystal's Hash has no default= (use fetch with a block)";
+    if (sp_streq(name, "replace"))  return "Crystal's Hash has no replace";
+    if (sp_streq(name, "fetch_values")) return "Crystal's Hash has no fetch_values";
+    if (sp_streq(name, "flatten"))  return "Crystal's Hash has no flatten";
+    if (sp_streq(name, "value?"))   return "Crystal's Hash has no value?";
+    if (sp_streq(name, "key?"))     return "Crystal's Hash has no key?; use has_key?";
   }
   if (rt == TY_MUTEX && sp_streq(name, "locked?"))
     return "Crystal's Mutex has no locked?";
+  /* Methods Crystal's Object simply has not, whatever the receiver. A concrete
+     receiver is already refused by the name allowlist, but a poly/untyped one
+     (a Time, a Thread, a container element) reaches dynamic dispatch and then
+     fails to compile, so catch them by name here too. */
+  {
+    static const char *const gone[] = {
+      "respond_to?", "eql?", "equal?", "then", "yield_self",
+      "freeze", "frozen?", "send", "public_send", NULL,
+    };
+    for (int i = 0; gone[i]; i++)
+      if (sp_streq(name, gone[i])) return "Crystal's Object has no such method";
+  }
   return NULL;
 }
 
@@ -2001,6 +2056,14 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
      non-container receiver keeps the raising form rather than a guess. */
   if (recv >= 0 && sp_streq(name, "[]")) {
     TyKind rt = comp_ntype(g->c, recv);
+    /* Ruby's Integer#[] is a bit read; Crystal's Int has no []. (`[]` is
+       special-cased before the missing-method table, so it needs its own guard.)
+       A Symbol#[] slice is likewise rejected below by the plain emission. */
+    if (rt == TY_INT || rt == TY_BIGINT) {
+      cr_mark_unsupported(g, id, "Ruby's Integer#[] bit read has no Crystal form");
+      buf_puts(b, "nil");
+      return;
+    }
     int nilable = g->nil_ok && argc == 1 &&
                   nt_kind(g->nt, argv[0]) != NK_RangeNode &&
                   (ty_is_hash(rt) || ty_is_array(rt));
@@ -2031,6 +2094,13 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
      bracket assignment is an expression that evaluates to the stored value,
      the same as Ruby's, so this holds in statement and value position alike. */
   if (recv >= 0 && sp_streq(name, "[]=") && argc == 2) {
+    /* Crystal's String is immutable; Ruby's String#[]= mutates in place. (`[]=`
+       is special-cased before the missing-method table, so guard it here.) */
+    if (comp_ntype(g->c, recv) == TY_STRING) {
+      cr_mark_unsupported(g, id, "Crystal's String is immutable and has no []=; a Ruby index-assign needs a mutable buffer");
+      buf_puts(b, "nil");
+      return;
+    }
     cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
     cr_emit_expr(g, argv[0], b);
