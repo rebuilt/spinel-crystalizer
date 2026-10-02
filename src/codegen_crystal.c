@@ -426,6 +426,11 @@ static void cr_scan_nil_uses(CrGen *g, int id, NilUseTally *out, int safe) {
 /* ---- string escaping (Crystal double-quoted literal body) ---- */
 static void cr_emit_escaped(Buf *b, const char *s) {
   for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    /* Crystal interpolates `#{...}` inside a double-quoted string; a Ruby
+       string that holds a literal `#{` (from `'\#{x}'` or an escaped
+       interpolation) must have the `#` escaped or the Crystal literal is
+       unterminated. */
+    if (*p == '#' && p[1] == '{') { buf_puts(b, "\\#"); continue; }
     switch (*p) {
       case '\\': buf_puts(b, "\\\\"); break;
       case '"':  buf_puts(b, "\\\""); break;
@@ -632,6 +637,33 @@ static const char *cr_missing_const(const char *path, const char *leaf) {
     { "NoMethodError", NULL, "Crystal has no NoMethodError exception class" },
     { "FrozenError", NULL, "Crystal has no FrozenError exception class" },
     { "Complex", NULL, "Crystal has no Complex number type" },
+    /* Ruby exception classes Crystal's hierarchy has no name for. A `rescue`
+       clause maps StandardError -> Exception and ZeroDivisionError ->
+       DivisionByZeroError, but a bare reference (constructing one, is_a?, a
+       class value) has no Crystal form, so only the VALUE position is refused
+       here. */
+    { "StandardError", NULL, "Crystal's base is Exception; StandardError has no Crystal name outside a rescue clause" },
+    { "TypeError", NULL, "Crystal has no TypeError exception class" },
+    { "NameError", NULL, "Crystal has no NameError exception class" },
+    { "ZeroDivisionError", NULL, "Crystal spells it DivisionByZeroError (only in a rescue clause)" },
+    { "LocalJumpError", NULL, "Crystal has no LocalJumpError exception class" },
+    { "SignalException", NULL, "Crystal has no SignalException exception class" },
+    { "UncaughtThrowError", NULL, "Crystal has no UncaughtThrowError exception class" },
+    { "ScriptError", NULL, "Crystal has no ScriptError exception class" },
+    { "LoadError", NULL, "Crystal has no LoadError exception class" },
+    { "SyntaxError", NULL, "Crystal has no SyntaxError exception class" },
+    { "SystemExit", NULL, "Crystal has no SystemExit exception class" },
+    { "SystemStackError", NULL, "Crystal has no SystemStackError exception class" },
+    { "ThreadError", NULL, "Crystal has no ThreadError exception class" },
+    { "EOFError", NULL, "Crystal has no EOFError exception class" },
+    { "IOError", NULL, "Crystal has no IOError exception class" },
+    { "RangeError", NULL, "Crystal has no RangeError exception class" },
+    { "RegexpError", NULL, "Crystal has no RegexpError exception class" },
+    { "SecurityError", NULL, "Crystal has no SecurityError exception class" },
+    { "EncodingError", NULL, "Crystal has no EncodingError exception class" },
+    { "StopIteration", NULL, "Crystal has no StopIteration exception class" },
+    { "FiberError", NULL, "Crystal has no FiberError exception class" },
+    { "ClosedQueueError", NULL, "Crystal has no ClosedQueueError exception class" },
     /* The class exists; the member does not. */
     { "Float", "INFINITY", "Crystal has no Float::INFINITY" },
     { "Float", "NAN", "Crystal has no Float::NAN" },
@@ -1400,7 +1432,16 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
           int stmts = nt_ref(g->nt, parts[i], "statements");
           buf_puts(b, "#{");
           int e = cr_single_expr(g->nt, stmts);
-          if (e >= 0) cr_emit_expr(g, e, b); else cr_emit_stmts(g, stmts, b, 0);
+          if (e >= 0) {
+            cr_emit_expr(g, e, b);
+          } else {
+            /* Several statements (run for side effects; the value is the last).
+               Crystal's interpolation holds one expression, so `begin ... end`
+               wraps the sequence (`"#{a; b}"` is not valid Crystal). */
+            buf_puts(b, "begin\n");
+            cr_emit_stmts(g, stmts, b, 0);
+            buf_puts(b, "end");
+          }
           buf_puts(b, "}");
         }
       }

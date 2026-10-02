@@ -675,7 +675,7 @@ REFUSED   test_class_ivar_in_class_method
 REFUSED   test_class_ivar_not_inherited
 REFUSED   test_class_ivar_save_restore
 REFUSED   test_class_literal_constructors
-BUILDFAIL test_class_lt_builtin_parent
+REFUSED   test_class_lt_builtin_parent
 BUILDFAIL test_class_member_beats_kernel
 REFUSED   test_class_method_instance_exec_ivars
 PASS     test_class_method_int_table_arg
@@ -709,7 +709,7 @@ BUILDFAIL test_class_spaceship
 REFUSED   test_class_subclasses_name
 REFUSED   test_class_subclasses
 REFUSED   test_class_superclass
-BUILDFAIL test_class_value_builtin_and_nested
+REFUSED   test_class_value_builtin_and_nested
 REFUSED   test_class_value_builtin_new
 REFUSED   test_class_value_chained_cmethod
 REFUSED   test_class_value_cmethod_block
@@ -1182,14 +1182,14 @@ REFUSED   test_exception_empty_message
 REFUSED   test_exception_exception_subclass_copy
 REFUSED   test_exception_freeze
 BUILDFAIL test_exception_inspect_empty_message
-BUILDFAIL test_exception_inspect
+REFUSED   test_exception_inspect
 REFUSED   test_exception_introspection_accessors
 REFUSED   test_exception_message_override
 REFUSED   test_exception_module_hierarchy
 BUILDFAIL test_exception_namespaced_default_message
-BUILDFAIL test_exception_new_nil_message
+REFUSED   test_exception_new_nil_message
 REFUSED   test_exception_nonstring_message
-BUILDFAIL test_exception_nonstring_to_s
+REFUSED   test_exception_nonstring_to_s
 REFUSED   test_exception_object_methods
 REFUSED   test_exception_object_surface
 BUILDFAIL test_exception_override_message_unqueried
@@ -1277,7 +1277,7 @@ BUILDFAIL test_fiber_kill
 REFUSED   test_fiber_nested_block_capture
 REFUSED   test_fiber_nested_block
 REFUSED   test_fiber_nested_fiber
-BUILDFAIL test_fiber_raise
+REFUSED   test_fiber_raise
 REFUSED   test_fiber_reassign_capture
 REFUSED   test_fiber_return_local_jump_error
 REFUSED   test_fiber_shared_capture
@@ -1835,9 +1835,9 @@ PASS     test_interp_method_widening
 REFUSED   test_interp_mixin_method
 REFUSED   test_interpolate_handles
 REFUSED   test_interpolate_range
-BUILDFAIL test_interpolation_multistmt
+PASS     test_interpolation_multistmt
 PASS     test_interpolation_symbol_name
-BUILDFAIL test_interp_single_buffer
+DIFF     test_interp_single_buffer
 REFUSED   test_interp_symbol
 PASS     test_int_hash_missing_nil_check
 PASS     test_int_int_hash_keys_values
@@ -2058,7 +2058,7 @@ REFUSED   test_issue_3019
 REFUSED   test_issue_3020
 REFUSED   test_issue_3021
 REFUSED   test_issue_3022
-BUILDFAIL test_issue_3023
+REFUSED   test_issue_3023
 REFUSED   test_issue_3024b
 REFUSED   test_issue_3024
 REFUSED   test_issue_3026
@@ -2109,7 +2109,7 @@ REFUSED   test_issue_3069
 BUILDFAIL test_issue_3070
 REFUSED   test_issue_3071
 REFUSED   test_issue_3072
-BUILDFAIL test_issue_3073
+REFUSED   test_issue_3073
 REFUSED   test_issue_3074
 REFUSED   test_issue_3076
 REFUSED   test_issue_3077
@@ -2122,7 +2122,7 @@ REFUSED   test_issue_3084
 REFUSED   test_issue_3085
 REFUSED   test_issue_3086
 REFUSED   test_issue_3087
-BUILDFAIL test_issue_3088
+REFUSED   test_issue_3088
 REFUSED   test_issue_3089
 REFUSED   test_issue_3090
 REFUSED   test_issue_3091
@@ -3615,7 +3615,7 @@ REFUSED   test_rescue_roots_under_collection
 BUILDFAIL test_rescue_target_reused_local
 REFUSED   test_rescue_value_empty_container
 REFUSED   test_rescue_var_subclass_method
-BUILDFAIL test_rescue_walks_class_hierarchy
+REFUSED   test_rescue_walks_class_hierarchy
 DIFF     test_rescue_widens_nil_local_to_exception
 REFUSED   test_respond_to_boxed_struct
 BUILDFAIL test_respond_to_class_builtins

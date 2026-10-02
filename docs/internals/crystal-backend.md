@@ -237,19 +237,19 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | **P14 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | **673** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | **307** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | **49** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | **317** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | **3725** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | **P15 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | **663** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | **308** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | **50** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | **305** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | **3735** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
 P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`, P12 `9f4e8772`,
-P13 `7725fc9d`.)
+P13 `7725fc9d`, P14 `3adf0168`.)
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -267,8 +267,9 @@ Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 11
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 12
 **+2 PASS, −2 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 13
-**+2 PASS, −1 DIFF, −44 BUILDFAIL, +43 REFUSED**, and Phase 14
-**+0 PASS, +0 DIFF, −61 BUILDFAIL, +61 REFUSED** — all with zero PASS regressions
+**+2 PASS, −1 DIFF, −44 BUILDFAIL, +43 REFUSED**, Phase 14
+**+0 PASS, +0 DIFF, −61 BUILDFAIL, +61 REFUSED**, and Phase 15
+**+1 PASS, +1 DIFF, −12 BUILDFAIL, +10 REFUSED** — all with zero PASS regressions
 and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
@@ -547,6 +548,27 @@ The safety property is simple: a method Crystal lacks can never appear in a PASS
 program, so these refusals cannot regress one. Net **61 `BUILDFAIL`s became
 refusals, with zero PASS or DIFF change** — emit-clean fell 734 → 673, again by
 design.
+
+Phase 15 fixed two real emitter bugs in string interpolation and refused the
+missing Ruby exception classes:
+
+- **Literal `#{` in a string.** A Ruby string holding a literal `#{` (from a
+  single-quoted literal or an escaped interpolation) was emitted verbatim into a
+  Crystal double-quoted string, where `#{` opens an interpolation — so the
+  literal was `Unterminated string interpolation`. `cr_emit_escaped` now escapes
+  the `#` of a literal `#{`.
+- **Multi-statement interpolation.** `"#{a; b; c}"` was emitted as several
+  statements inside `#{}`, which Crystal's grammar does not accept. The sequence
+  is now wrapped in `begin ... end` (a Crystal expression whose value is the last
+  statement), preserving Ruby's run-every-statement / value-is-the-last rule.
+  Fixed `interpolation_multistmt` (BUILDFAIL → PASS) and moved
+  `interp_single_buffer` to a DIFF (its remaining difference is Float notation).
+- **Ruby exception classes with no Crystal name** — `StandardError`,
+  `TypeError`, `NameError`, `ZeroDivisionError`, `LocalJumpError`,
+  `SignalException`, `UncaughtThrowError` and ~15 more — are now refused in a
+  *value* position (constructing one, `is_a?`, a class value). A `rescue` clause
+  still maps `StandardError → Exception` and `ZeroDivisionError →
+  DivisionByZeroError`; only the bare reference has no Crystal form.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
