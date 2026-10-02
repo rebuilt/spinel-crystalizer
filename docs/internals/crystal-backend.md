@@ -237,18 +237,18 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | **P11 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | **777** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | **303** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | **52** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | **3621** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | **P12 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | **777** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | **305** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | **50** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | **3621** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
-P9 `a3fc1ffd`, P10 `d06db81e`.)
+P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`.)
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -263,8 +263,9 @@ BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
 Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
 **+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED**, Phase 9
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 10
-**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 11
-**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS regressions
+**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 11
+**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 12
+**+2 PASS, −2 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS regressions
 and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
@@ -466,6 +467,34 @@ backends share one definition of the semantics), and a block form yields each
 field via `.each`. Fixed `str_split_trailing_empty`,
 `str_split_space_dynamic_limit` and `string_split_block`. A Regexp or Char
 separator keeps the plain path, so `regexp_split_compat` remains a DIFF.
+
+Phase 12 took on the **iterator / Tuple** cluster. Two contained fixes landed: a
+blockless `each_index` is a lazy `Iterator` in Crystal, so `each_index.map { }`
+returned a `MapIterator` where Ruby returns an Array — it is now materialized
+with `.to_a`; and `Enumerable#first(n)` on an iterator answers a lazy iterator, so
+`first(n)` now gets a trailing `.to_a` (identity for an Array). Together these
+fixed `issue_3160` and `issue_3171`.
+
+The rest of the cluster is genuinely blocked, and the reason is worth recording
+because it is the same shape in every case: **Crystal's Tuple is Ruby's pair
+Array, and the two are only interchangeable on one side.** `each_with_index`,
+`with_index`, `zip` and `chunk` yield `{a, b}` Tuples where Ruby yields `[a, b]`
+Arrays. A whole-capture or `p` of the pair wants the Array spelling (`{}` vs
+`[]`), but a destructuring block (`|a, b|`) works on a Tuple by auto-splat and
+fails on an Array (Crystal does not auto-splat arrays). Since Ruby's `Pair` has
+no static type, no single emission is right for both uses of the same call —
+`enumerator_with_index_gc` even contains both in one program. Converting to an
+Array also erases the positional types (`Tuple#to_a` is a union element type),
+so `chunk { } .map { |k, xs| ... }` stops compiling. The remaining programs
+(`each_with_index_reduce_seed`, `enumerator_with_index_gc`, `issue_3225`,
+`poly_builtin_arm_container_read`) need either a per-`Tuple` inspect override,
+which Crystal does not allow (`Tuple` cannot be reopened), or a context-aware
+shape choice in the emitter. The `each`/`each_slice`-returns-the-receiver cases
+(`range_each_slice_returns_receiver`, `enumerator_*`) are blocked for a second
+reason: the desugarer materializes the receiver to `.to_a` before the call, so
+wrapping the call in `.tap` would return the materialized array, not Ruby's
+original receiver — and Ruby's `Enumerator` inspect format has no Crystal
+counterpart anyway.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern

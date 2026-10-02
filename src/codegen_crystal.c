@@ -1808,6 +1808,33 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
+  /* A blockless each_index / each_cons / each_slice is a lazy Iterator in
+     Crystal, so a following map/first/sum runs lazily (or yields an iterator)
+     where Ruby materializes an Array. These yield Arrays, not Tuples, so a plain
+     .to_a restores Ruby's shape -- and a following block destructuring (`|k, v|`)
+     still works on the Array. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "each_index")) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".each_index().to_a");
+    return;
+  }
+
+  /* Ruby's Enumerable#first(n) answers an Array; Crystal's Array#first(n) does
+     too, but an Iterator's first(n) answers a lazy iterator (so `p` would show
+     the iterator). Append .to_a: identity for an Array, materializing for an
+     iterator's first n. */
+  if (recv >= 0 && sp_streq(name, "first") && argc == 1) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".first(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").to_a");
+    return;
+  }
+
+
+
+
+
   /* Ruby's Array#join flattens nested Arrays recursively before joining, with
      the separator between every element; Crystal's join renders a nested Array
      with its inspect form. `flatten` recurses through Arrays only -- the same
