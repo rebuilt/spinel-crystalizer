@@ -174,7 +174,7 @@ PASS     test_at_exit_lifo
 REFUSED   test_at_exit_registered_from_thread_during_drain
 DIFF     test_at_exit_returns_proc
 PASS     test_at_exit_runs_on_abort
-BUILDFAIL test_at_exit_runs_on_exit
+PASS     test_at_exit_runs_on_exit
 PASS     test_at_exit_runs_on_uncaught
 REFUSED   test_at_exit_skipped_by_exit_bang
 REFUSED   test_attr_accessor_dead_writer_ptr_array_narrow
@@ -1288,7 +1288,7 @@ PASS     test_fiber_wide_router
 REFUSED   test_fifo_open_does_not_pin_worker
 PASS     test_file_basename_gc
 REFUSED   test_file_close_write_closed
-BUILDFAIL test_file_delete_no_args
+PASS     test_file_delete_no_args
 REFUSED   test_file_delete_splat
 BUILDFAIL test_file_dir_methods
 PASS     test_file_expand_path
@@ -1521,7 +1521,7 @@ PASS     test_hash_fetch_block_key
 PASS     test_hash_fetch_block_key_type
 PASS     test_hash_fetch_block
 REFUSED   test_hash_fetch_keyerror_message
-BUILDFAIL test_hash_fetch_keyerror
+PASS     test_hash_fetch_keyerror
 REFUSED   test_hash_fetch_values_delete_block_subset
 REFUSED   test_hash_filter_bang_return
 REFUSED   test_hash_flatten_depth
@@ -2017,7 +2017,7 @@ REFUSED   test_issue_2976
 REFUSED   test_issue_2977
 REFUSED   test_issue_2978
 REFUSED   test_issue_2979
-BUILDFAIL test_issue_2980
+PASS     test_issue_2980
 REFUSED   test_issue_2981
 REFUSED   test_issue_2982
 REFUSED   test_issue_2983
@@ -2106,7 +2106,7 @@ REFUSED   test_issue_3066
 DIFF     test_issue_3067
 REFUSED   test_issue_3068
 REFUSED   test_issue_3069
-BUILDFAIL test_issue_3070
+PASS     test_issue_3070
 REFUSED   test_issue_3071
 REFUSED   test_issue_3072
 REFUSED   test_issue_3073
@@ -3432,7 +3432,7 @@ REFUSED   test_range_enumerable
 REFUSED   test_range_enum_family
 PASS     test_range_eq_across_numeric
 REFUSED   test_range_equality
-BUILDFAIL test_range_exclude_end_size
+PASS     test_range_exclude_end_size
 BUILDFAIL test_range_exclusive_nonliteral
 REFUSED   test_range_flat_map
 REFUSED   test_range_float_begin_iterate

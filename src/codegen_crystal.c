@@ -1806,6 +1806,14 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     }
   }
 
+  /* Ruby's exit(true/false) maps success/failure to a status code; Crystal's
+     exit takes an Int or a Process::Status, not a Bool. */
+  if (recv < 0 && sp_streq(name, "exit") && argc == 1 &&
+      (nt_kind(g->nt, argv[0]) == NK_TrueNode || nt_kind(g->nt, argv[0]) == NK_FalseNode)) {
+    buf_printf(b, "exit(%d)", nt_kind(g->nt, argv[0]) == NK_TrueNode ? 0 : 1);
+    return;
+  }
+
   /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
      raises IndexError, so it maps onto the `[]?` form. */
   if (recv >= 0 && sp_streq(name, "at") && argc == 1 && ty_is_array(comp_ntype(g->c, recv))) {
@@ -1927,10 +1935,48 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   if (recv >= 0 && block < 0 &&
       (sp_streq(name, "values_at") || sp_streq(name, "zip")) &&
       ty_is_array(comp_ntype(g->c, recv))) {
+    /* `arr.values_at` with no index answers []; Crystal's values_at needs at
+       least one. `first(0)` is an empty Array of the right element type. */
+    if (sp_streq(name, "values_at") && argc == 0) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".first(0)");
+      return;
+    }
     cr_emit_recv(g, recv, b);
     buf_printf(b, ".%s(", name);
     for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
     buf_puts(b, sp_streq(name, "zip") ? ").map(&.to_a)" : ").to_a");
+    return;
+  }
+
+  /* Ruby's Enumerable#count with no argument and no block is the size; Crystal's
+     requires an item or a block (there is no 0-argument count). */
+  if (recv >= 0 && block < 0 && argc == 0 && sp_streq(name, "count")) {
+    TyKind rt = comp_ntype(g->c, recv);
+    if (ty_is_array(rt) || ty_is_hash(rt) || rt == TY_RANGE) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".size");
+      return;
+    }
+  }
+
+  /* Ruby's Hash#fetch(key) with no default raises KeyError on a miss, which is
+     exactly Crystal's `h[key]`; Crystal's own fetch() requires a default. */
+  if (recv >= 0 && block < 0 && argc == 1 && sp_streq(name, "fetch") &&
+      ty_is_hash(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, "[");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, "]");
+    return;
+  }
+
+  /* Ruby's File.delete / File.unlink with no path delete nothing and answer 0;
+     Crystal's require at least one path. */
+  if (recv >= 0 && argc == 0 && (sp_streq(name, "delete") || sp_streq(name, "unlink")) &&
+      nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+      sp_streq(nt_str(g->nt, recv, "name"), "File")) {
+    buf_puts(b, "0");
     return;
   }
 
