@@ -1774,6 +1774,34 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
+  /* A literal single-space separator selects Ruby's whitespace (awk) mode:
+     leading whitespace is stripped and runs collapse, so there are no empty
+     fields. Crystal's no-argument split is exactly that mode, while
+     split(" ") would split on literal spaces; the separator may carry a limit. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "split") &&
+      comp_ntype(g->c, recv) == TY_STRING && argc >= 1 && argc <= 2 &&
+      nt_kind(g->nt, argv[0]) == NK_StringNode &&
+      sp_streq(nt_str(g->nt, argv[0], "content"), " ")) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".split");
+    if (argc == 2) { buf_puts(b, "("); cr_emit_expr(g, argv[1], b); buf_puts(b, ")"); }
+    return;
+  }
+
+  /* Crystal's values_at answers a Tuple, and zip an Array of Tuples, where Ruby
+     answers a plain Array (of Arrays for zip). `.to_a` / `.map(&.to_a)`
+     restores Ruby's shape; a later `|a, b|` destructuring still works on an
+     Array, so this is safe when the result is consumed either way. */
+  if (recv >= 0 && block < 0 &&
+      (sp_streq(name, "values_at") || sp_streq(name, "zip")) &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_printf(b, ".%s(", name);
+    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    buf_puts(b, sp_streq(name, "zip") ? ").map(&.to_a)" : ").to_a");
+    return;
+  }
+
   /* Ruby's Array#join flattens nested Arrays recursively before joining, with
      the separator between every element; Crystal's join renders a nested Array
      with its inspect form. `flatten` recurses through Arrays only -- the same

@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | Phase 7 (`f8ba43ac`) | **Phase 8 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | **777** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | **294** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | **61** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | **3621** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | Phase 7 (`f8ba43ac`) | Phase 8 (`bc5dd918`) | **Phase 9 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | **777** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | **297** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | **58** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | **3621** | refused at the Ruby line, with a reason |
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -256,8 +256,9 @@ BUILDFAIL 426 / REFUSED 3616. Against that, Phase 4 is **+7 PASS, −10 DIFF,
 moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
 BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
 +0 REFUSED**, Phase 6 **+10 PASS, −10 DIFF, +0 BUILDFAIL, +0 REFUSED**, and
-Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 8
-**+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED** — all with zero PASS regressions
+Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
+**+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED**, and Phase 9
+**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS regressions
 and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
@@ -415,6 +416,25 @@ empties dropped unless the limit is negative) cannot be reproduced by Crystal's
 own `split`, and a blanket refusal would regress the passing
 `test/string_split_capture.rb`, so the one program is left visible rather than
 traded for a correct one.
+
+Phase 9 cleared three Ruby-shape mismatches:
+
+- **`Array#values_at` / `zip`.** Crystal answers a Tuple (and, for `zip`, an
+  Array of Tuples) where Ruby answers an Array, so the result was rendered and
+  compared with `{}` instead of `[]`. Both are now followed by `.to_a` /
+  `.map(&.to_a)`, which keeps a later `|a, b|` destructuring working. Fixed
+  `values_at` and `issue_2995`.
+- **`String#split(" ")`.** A literal single space selects Ruby's whitespace
+  (awk) mode — leading whitespace stripped, runs collapsed — which is exactly
+  Crystal's no-argument `split`; the literal-space form was splitting on spaces.
+  It is rewritten to the no-arg form (carrying a limit when present). Fixed
+  `str_split_space_whitespace`.
+
+The rest of the tuple/iterator tail (`each_with_index` and `chunk` yielding
+Tuples, `each`/`each_slice` returning nil instead of the receiver, un-materialized
+lazy iterators) and the remaining whitespace/limit/trailing-empty `split` cases
+need the emitter's iterator/materialization machinery reworked, and are left as
+the tracked 58 DIFFs.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
