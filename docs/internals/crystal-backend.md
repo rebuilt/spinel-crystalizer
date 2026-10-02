@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | **Phase 7 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | **778** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | **289** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | **67** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | **3620** | refused at the Ruby line, with a reason |
+| outcome | baseline `bd1f9b4a` | Phase 2 (`a8455324`) | Phase 3 (`2b722b6d`) | Phase 4 (`42923c6d`) | Phase 5 (`d115b402`) | Phase 6 (`a5eb7684`) | Phase 7 (`f8ba43ac`) | **Phase 8 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | **777** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | **294** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | **61** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | **3621** | refused at the Ruby line, with a reason |
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -256,8 +256,9 @@ BUILDFAIL 426 / REFUSED 3616. Against that, Phase 4 is **+7 PASS, −10 DIFF,
 moved from DIFF to PASS (a fixed translation), DIFF to a named refusal, or
 BUILDFAIL to a named refusal. Phase 5 adds **+4 PASS, −1 DIFF, −3 BUILDFAIL,
 +0 REFUSED**, Phase 6 **+10 PASS, −10 DIFF, +0 BUILDFAIL, +0 REFUSED**, and
-Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS
-regressions and no change to any program other than the ones named below.
+Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 8
+**+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED** — all with zero PASS regressions
+and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
@@ -385,6 +386,35 @@ formatting, and the full corpus shows no PASS regression. It resolved
 `issue_3138`, `p_as_expression`, `print_puts_expression_and_kinds`,
 `to_h_with_block` and `typed_hash_inspect_and_each_value`, and let the
 `struct_to_h_print` difference-ledger entry be promoted from DIVERGE to AGREE.
+
+Phase 8 closed most of the **Regexp** cluster:
+
+- **`Regexp#to_s` / `#inspect`.** CRuby renders a pattern as `(?<on>-<off>:src)`
+  for `to_s` (and `"#{/re/}"`), with the flag letters in the order `m,i,x`
+  enabled-first, and as `/src/flags` for `inspect`. Crystal prints
+  `(?-imsx:...)` — its own flag set (`s` for dotall) and order — and orders
+  inspect's flags `i,m,x`. The emitted `Regex#to_s` / `#inspect` shim reproduces
+  CRuby's exact spelling (and its `/`-escaping). Fixed `issue_3061`,
+  `regexp_render_source_variable`, `regexp_string_interpolation`.
+- **`Regexp#options`.** Ruby returns the Integer bitmask (1=IGNORECASE,
+  2=EXTENDED, 4=MULTILINE); Crystal returns its `Regex::Options` enum, which the
+  stdlib uses internally and so cannot be overridden. `.options` on a regex
+  receiver is rewritten to the shim's `ruby_options`. Fixed `regexp_source_options`.
+- **`\h` / `\H`.** Ruby's are the hex-digit class; PCRE2 reads them as horizontal
+  whitespace (and its negation), so the pattern is rewritten at emit time,
+  splicing the members inside a character class and wrapping them outside. Fixed
+  `regex_hex_shorthand`.
+- **Sub/gsub pre/post-match backreferences.** `` \` `` and `\'` (and `\+`, the
+  last group) are expanded by Ruby and left literal by Crystal, so they join
+  `\&` and `\k<name>` in the honest refusal. `sub_prematch_backref` moves
+  DIFF → REFUSED.
+
+`test/regexp_split_compat.rb` stays a documented DIFF: CRuby's `split(regex)`
+(zero-width matches split into characters, capture groups included, trailing
+empties dropped unless the limit is negative) cannot be reproduced by Crystal's
+own `split`, and a blanket refusal would regress the passing
+`test/string_split_capture.rb`, so the one program is left visible rather than
+traded for a correct one.
 
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern

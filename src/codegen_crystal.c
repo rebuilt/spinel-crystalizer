@@ -472,7 +472,20 @@ static void cr_emit_charset_literal(Buf *b, const char *s, int expand) {
    the Crystal literal early; re-escape it. Backslashes are left as-is -- they
    are regex syntax in both Ruby and Crystal, not string escapes. */
 static void cr_emit_regex_pat(Buf *b, const char *s) {
+  int in_class = 0;
   for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+    /* Ruby's \h / \H are the hex-digit class [0-9a-fA-F]; PCRE2 reads \h as
+       horizontal whitespace and \H as its negation, so translate. Inside a
+       character class the members splice in; outside they form a class. */
+    if (*p == '\\' && (p[1] == 'h' || p[1] == 'H')) {
+      if (in_class) buf_puts(b, p[1] == 'H' ? "^0-9a-fA-F" : "0-9a-fA-F");
+      else          buf_puts(b, p[1] == 'H' ? "[^0-9a-fA-F]" : "[0-9a-fA-F]");
+      p++;
+      continue;
+    }
+    if (*p == '\\' && p[1]) { buf_putn(b, (const char *)p, 2); p++; continue; }
+    if (*p == '[') in_class = 1;
+    else if (*p == ']') in_class = 0;
     if (*p == '/') buf_puts(b, "\\/");
     else buf_putn(b, (const char *)p, 1);
   }
@@ -537,17 +550,19 @@ static int cr_str_has_named_format(const char *s) {
 }
 
 /* Does a sub/gsub replacement string use a Ruby backreference that Crystal's
-   replacement parser answers differently? `\&` is the whole match in Ruby but
-   stays literal in Crystal, and `\k<name>` expands to the empty string in Ruby
-   when the group did not participate while Crystal raises IndexError. `\\` is a
-   literal backslash in both and is skipped, so "\\\\&" is not a backreference. */
+   replacement parser answers differently? `\&` is the whole match, `` \` `` the
+   pre-match and `\'` the post-match in Ruby but all stay literal in Crystal;
+   `\+` is the last matched group, likewise unexpanded; and `\k<name>` expands to
+   the empty string in Ruby when the group did not participate while Crystal
+   raises IndexError. `\\` is a literal backslash in both and is skipped, so
+   "\\\\&" is not a backreference. */
 static int cr_str_has_ruby_only_replacement(const char *s) {
   if (!s) return 0;
   for (const char *p = s; *p; p++) {
     if (*p != '\\') continue;
     char c = p[1];
     if (c == '\\') { p++; continue; }
-    if (c == '&') return 1;
+    if (c == '&' || c == '`' || c == '\'' || c == '+') return 1;
     if (c == 'k' && p[2] == '<') return 1;
   }
   return 0;
@@ -1799,6 +1814,17 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     }
   }
 
+  /* Regexp#options in Ruby is an Integer bitmask (1=IGNORECASE, 2=EXTENDED,
+     4=MULTILINE); Crystal's `options` returns its own Options enum, which the
+     stdlib uses internally, so it cannot be overridden. Answer through the
+     shim's ruby_options helper instead. */
+  if (recv >= 0 && sp_streq(name, "options") && argc == 0 &&
+      comp_ntype(g->c, recv) == TY_REGEX) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".ruby_options");
+    return;
+  }
+
   /* Ruby's sub/gsub replacement strings expand `\&` (the whole match) and
      `\k<name>` (empty when the group did not participate); Crystal's replacement
      parser leaves `\&` literal and raises IndexError for a non-participating
@@ -1807,8 +1833,9 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   if (recv >= 0 && (sp_streq(name, "sub") || sp_streq(name, "gsub")) &&
       argc == 2 && nt_kind(g->nt, argv[1]) == NK_StringNode &&
       cr_str_has_ruby_only_replacement(nt_str(g->nt, argv[1], "content"))) {
-    cr_mark_unsupported(g, id, "a sub/gsub replacement using Ruby's `\\&` or "
-                              "`\\k<name>` (Crystal's replacement language differs)");
+    cr_mark_unsupported(g, id, "a sub/gsub replacement using a Ruby-only "
+                              "backreference (whole match, pre/post match, "
+                              "last group, or named group)");
     buf_puts(b, "nil");
     return;
   }
@@ -2631,6 +2658,53 @@ char *codegen_program_crystal(const NodeTable *nt) {
     "  end\n"
     "  def to_s(io : IO) : Nil\n"
     "    inspect(io)\n"
+    "  end\n"
+    "end\n\n");
+  /* CRuby renders a Regexp as `(?<on>[-]<off>:source)` from #to_s (and
+     `"#{/re/}"`), in the flag order m,i,x with the enabled letters first, then
+     `-`, then the disabled ones. Crystal prints `(?-imsx:...)` (its own flag set
+     and order) and its slash-escaping differs. #inspect already matches
+     (`/source/flags`), so only #to_s is replaced. #options answers the CRuby
+     Integer bitmask (1=IGNORECASE, 2=EXTENDED, 4=MULTILINE) via ruby_options;
+     the emitter rewrites `.options` to it, since Crystal's own `options` returns
+     its Options enum and is used internally. */
+  buf_puts(&b,
+    "class Regex\n"
+    "  def to_s(io : IO) : Nil\n"
+    "    o = options\n"
+    "    io << \"(?\"\n"
+    "    io << 'm' if o.multiline?\n"
+    "    io << 'i' if o.ignore_case?\n"
+    "    io << 'x' if o.extended?\n"
+    "    io << '-'\n"
+    "    io << 'm' unless o.multiline?\n"
+    "    io << 'i' unless o.ignore_case?\n"
+    "    io << 'x' unless o.extended?\n"
+    "    io << ':'\n"
+    "    sp_regex_source(io)\n"
+    "    io << ')'\n"
+    "  end\n"
+    "  def inspect(io : IO) : Nil\n"
+    "    io << '/'\n"
+    "    sp_regex_source(io)\n"
+    "    io << '/'\n"
+    "    o = options\n"
+    "    io << 'm' if o.multiline?\n"
+    "    io << 'i' if o.ignore_case?\n"
+    "    io << 'x' if o.extended?\n"
+    "  end\n"
+    "  private def sp_regex_source(io : IO) : Nil\n"
+    "    source.each_char do |c|\n"
+    "      if c == '/'\n"
+    "        io << '\\\\' << '/'\n"
+    "      else\n"
+    "        io << c\n"
+    "      end\n"
+    "    end\n"
+    "  end\n"
+    "  def ruby_options : Int32\n"
+    "    o = options\n"
+    "    (o.ignore_case? ? 1 : 0) | (o.extended? ? 2 : 0) | (o.multiline? ? 4 : 0)\n"
     "  end\n"
     "end\n\n");
 
