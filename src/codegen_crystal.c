@@ -1774,17 +1774,23 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
-  /* A literal single-space separator selects Ruby's whitespace (awk) mode:
-     leading whitespace is stripped and runs collapse, so there are no empty
-     fields. Crystal's no-argument split is exactly that mode, while
-     split(" ") would split on literal spaces; the separator may carry a limit. */
-  if (recv >= 0 && block < 0 && sp_streq(name, "split") &&
-      comp_ntype(g->c, recv) == TY_STRING && argc >= 1 && argc <= 2 &&
-      nt_kind(g->nt, argv[0]) == NK_StringNode &&
-      sp_streq(nt_str(g->nt, argv[0], "content"), " ")) {
+  /* Ruby's String#split differs from Crystal's on all three of whitespace (awk)
+     mode for a single-space separator, trailing-empty dropping under the default
+     limit, and the positive-cap / negative-keep limit rule. Route a String (or
+     nil, or no) separator through the sp_ruby_split helpers. A Regexp or Char
+     separator keeps the plain path. A block yields each field (split's own
+     return value is the receiver, which the corpus does not use). */
+  int str_sep = argc == 0 || nt_kind(g->nt, argv[0]) == NK_NilNode ||
+                (recv >= 0 && comp_ntype(g->c, argv[0]) == TY_STRING);
+  if (recv >= 0 && sp_streq(name, "split") && comp_ntype(g->c, recv) == TY_STRING &&
+      argc <= 2 && str_sep) {
+    buf_puts(b, "sp_ruby_split(");
     cr_emit_recv(g, recv, b);
-    buf_puts(b, ".split");
-    if (argc == 2) { buf_puts(b, "("); cr_emit_expr(g, argv[1], b); buf_puts(b, ")"); }
+    buf_puts(b, ", ");
+    if (argc >= 1) cr_emit_expr(g, argv[0], b); else buf_puts(b, "nil");
+    if (argc == 2) { buf_puts(b, ", "); cr_emit_expr(g, argv[1], b); }
+    buf_puts(b, ")");
+    if (block >= 0) { buf_puts(b, ".each"); cr_emit_block(b, g, block, 0, recv, "each"); }
     return;
   }
 
@@ -2765,6 +2771,81 @@ char *codegen_program_crystal(const NodeTable *nt) {
     "  f = x.floor\n"
     "  return 1 if f == x\n"
     "  (f.to_i % 2 == 0) ? 1 : -1\n"
+    "end\n\n");
+  /* CRuby's String#split, ported from the C backend's sp_str_split_*: a
+     single-space (or nil) separator is whitespace (awk) mode -- leading
+     whitespace stripped, runs collapsed; the limit drops trailing empties
+     (nil/0), caps fields with the unsplit remainder last (positive), or keeps
+     trailing empties (negative). Crystal's own split differs on all three. */
+  buf_puts(&b,
+    "def sp_ws_char?(c : Char) : Bool\n"
+    "  c == ' ' || c == '\\t' || c == '\\n' || c == '\\r' || c == '\\f' || c == '\\v'\n"
+    "end\n"
+    "def sp_split_all(s : String, sep : String) : Array(String)\n"
+    "  return [] of String if s.empty?\n"
+    "  return s.chars.map(&.to_s) if sep.empty?\n"
+    "  s.split(sep)\n"
+    "end\n"
+    "def sp_split_ws(s : String) : Array(String)\n"
+    "  return [] of String if s.empty?\n"
+    "  s.split\n"
+    "end\n"
+    "def sp_split_drop_trailing(s : String, sep : String) : Array(String)\n"
+    "  return sp_split_ws(s) if sep == \" \"\n"
+    "  a = sp_split_all(s, sep)\n"
+    "  while !a.empty? && a.last.empty?\n"
+    "    a.pop\n"
+    "  end\n"
+    "  a\n"
+    "end\n"
+    "def sp_split_ws_limit(s : String, n : Int32) : Array(String)\n"
+    "  return sp_split_ws(s) if n == 0\n"
+    "  a = [] of String\n"
+    "  return a if s.empty?\n"
+    "  return [s] if n == 1\n"
+    "  cs = s.chars\n"
+    "  i = 0\n"
+    "  while i < cs.size && sp_ws_char?(cs[i])\n"
+    "    i += 1\n"
+    "  end\n"
+    "  if i >= cs.size\n"
+    "    a << \"\"\n"
+    "    return a\n"
+    "  end\n"
+    "  k = 0\n"
+    "  while i < cs.size\n"
+    "    start = i\n"
+    "    while i < cs.size && !sp_ws_char?(cs[i])\n"
+    "      i += 1\n"
+    "    end\n"
+    "    a << cs[start...i].join\n"
+    "    k += 1\n"
+    "    sep_start = i\n"
+    "    while i < cs.size && sp_ws_char?(cs[i])\n"
+    "      i += 1\n"
+    "    end\n"
+    "    if i >= cs.size\n"
+    "      a << \"\" if i > sep_start && (n < 0 || (n > 0 && k < n))\n"
+    "      break\n"
+    "    end\n"
+    "    if n > 0 && k == n - 1\n"
+    "      a << cs[i..].join\n"
+    "      break\n"
+    "    end\n"
+    "  end\n"
+    "  a\n"
+    "end\n"
+    "def sp_ruby_split(s : String, sep : String?, limit : Int64? = nil) : Array(String)\n"
+    "  if sep.nil? || sep == \" \"\n"
+    "    return limit.nil? ? sp_split_ws(s) : sp_split_ws_limit(s, limit.to_i32)\n"
+    "  end\n"
+    "  if limit.nil? || limit == 0\n"
+    "    sp_split_drop_trailing(s, sep)\n"
+    "  elsif limit < 0\n"
+    "    sp_split_all(s, sep)\n"
+    "  else\n"
+    "    s.split(sep, limit.to_i32)\n"
+    "  end\n"
     "end\n\n");
 
   int top_body = c->scopes[0].body;
