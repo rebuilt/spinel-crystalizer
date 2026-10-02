@@ -530,7 +530,7 @@ REFUSED   test_bundle_misc_a
 REFUSED   test_bundle_misc_b
 REFUSED   test_bundle_misc_c_08
 BUILDFAIL test_bundle_misc_c_09
-BUILDFAIL test_bundle_misc_c_10
+REFUSED   test_bundle_misc_c_10
 REFUSED   test_bundle_misc_c_17
 BUILDFAIL test_bundle_misc_c_23
 REFUSED   test_bundle_misc_c_26
@@ -1270,10 +1270,10 @@ REFUSED   test_ffi_write_roundtrip
 PASS     test_fiber_capture_no_leak_to_sibling
 REFUSED   test_fiber_class_reflection
 REFUSED   test_fiber_error_guards
-DIFF     test_fiber_exception_boundary
-DIFF     test_fiber_gc_root_isolation
+REFUSED   test_fiber_exception_boundary
+REFUSED   test_fiber_gc_root_isolation
 REFUSED   test_fiber_ivar_cycle_collect
-BUILDFAIL test_fiber_kill
+REFUSED   test_fiber_kill
 REFUSED   test_fiber_nested_block_capture
 REFUSED   test_fiber_nested_block
 REFUSED   test_fiber_nested_fiber
@@ -1296,7 +1296,7 @@ BUILDFAIL test_file_io_predicates_and_inspect
 BUILDFAIL test_file_join_poly_component
 REFUSED   test_file_mtime
 REFUSED   test_file_null_constant
-BUILDFAIL test_file_open_poly_mode
+REFUSED   test_file_open_poly_mode
 REFUSED   test_file_path_predicates
 REFUSED   test_file_pid_closed
 BUILDFAIL test_file_read_count
@@ -1338,7 +1338,7 @@ REFUSED   test_float_coerce_typeerror
 REFUSED   test_float_div_int_literal
 REFUSED   test_float_divmod_zerodiv
 REFUSED   test_float_hex_encoding_isa_bool_wave10
-BUILDFAIL test_float_limit_constants
+REFUSED   test_float_limit_constants
 REFUSED   test_float_mod_pow_op_assign
 REFUSED   test_float_modulo
 REFUSED   test_float_nan_identity
@@ -1361,8 +1361,8 @@ DIFF     test_float_round_truncate_ndigits
 REFUSED   test_float_round_value_based_type
 PASS     test_float_round_zero
 REFUSED   test_float_spaceship
-BUILDFAIL test_float_step_block
-BUILDFAIL test_float_step_to_a
+PASS     test_float_step_block
+DIFF     test_float_step_to_a
 REFUSED   test_float_to_int_boundary
 REFUSED   test_float_to_int_out_of_range
 REFUSED   test_float_to_r
@@ -2126,10 +2126,10 @@ REFUSED   test_issue_3088
 REFUSED   test_issue_3089
 REFUSED   test_issue_3090
 REFUSED   test_issue_3091
-BUILDFAIL test_issue_3092
+REFUSED   test_issue_3092
 REFUSED   test_issue_3093
 REFUSED   test_issue_3094
-BUILDFAIL test_issue_3095
+REFUSED   test_issue_3095
 REFUSED   test_issue_3096
 REFUSED   test_issue_3097
 REFUSED   test_issue_3098
@@ -2524,7 +2524,7 @@ PASS     test_map_to_value_type_objects
 REFUSED   test_map_untyped_block_result
 REFUSED   test_marshal_io_stream
 REFUSED   test_marshal_roundtrip
-BUILDFAIL test_marshal_symlink_float
+REFUSED   test_marshal_symlink_float
 REFUSED   test_masgn_classvar_target
 REFUSED   test_masgn_constpath_target
 REFUSED   test_masgn_index_target_widening
@@ -2544,7 +2544,7 @@ REFUSED   test_massign_proc_cell_nil
 REFUSED   test_massign_splat_rhs
 BUILDFAIL test_massign_underfill_nil
 REFUSED   test_matchdata_array_pattern
-BUILDFAIL test_matchdata_constant
+REFUSED   test_matchdata_constant
 REFUSED   test_matchdata_deconstruct_keys_type
 REFUSED   test_matchdata_frozen_query
 REFUSED   test_matchdata_gsub_named_backref
@@ -3298,7 +3298,7 @@ REFUSED   test_proc_default_reads_capture
 REFUSED   test_proc_destructured_parameters
 REFUSED   test_proc_empty_kwsplat_positional_hash
 REFUSED   test_proc_escaped_arg_types
-BUILDFAIL test_process_clock_constants
+REFUSED   test_process_clock_constants
 REFUSED   test_process_clock_gettime_unit
 REFUSED   test_process_clock_unit_validation
 REFUSED   test_process_cputime_clocks
@@ -3452,7 +3452,7 @@ BUILDFAIL test_range_select_with_index
 BUILDFAIL test_range_size_infinite_local
 REFUSED   test_range_step_bad_stride
 REFUSED   test_range_step_endless_block
-BUILDFAIL test_range_step_endless
+PASS     test_range_step_endless
 REFUSED   test_range_step_float
 PASS     test_range_step
 PASS     test_range_string_cover
@@ -3600,7 +3600,7 @@ REFUSED   test_require_value
 REFUSED   test_reraise_nested_rescue
 REFUSED   test_rescue_arms_share_a_name
 REFUSED   test_rescue_attr_with_sibling_exc_subclass
-BUILDFAIL test_rescue_bind_in_fiber_body
+REFUSED   test_rescue_bind_in_fiber_body
 REFUSED   test_rescue_bind_in_lambda_proc_body
 REFUSED   test_rescue_builtin_module_include
 REFUSED   test_rescued_missing_constant_quiet

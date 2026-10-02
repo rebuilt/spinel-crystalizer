@@ -670,6 +670,22 @@ static const char *cr_missing_const(const char *path, const char *leaf) {
     /* The class exists; the member does not. */
     { "Float", "INFINITY", "Crystal has no Float::INFINITY" },
     { "Float", "NAN", "Crystal has no Float::NAN" },
+    { "Float", "MAX", "Crystal spells it Float64::MAX; Ruby's Float::MAX is the same value but the constant has no Ruby-spelled Crystal form here" },
+    { "Float", "MIN", "Crystal has no Float::MIN" },
+    { "Float", "EPSILON", "Crystal spells it Float64::EPSILON" },
+    /* No Crystal counterpart at all. */
+    { "Marshal", NULL, "Crystal has no Marshal; its serialization format differs" },
+    { "MatchData", NULL, "Crystal spells the match type Regex::MatchData, not MatchData" },
+    /* Class-level constants with no Crystal name. */
+    { "Process", "CLOCK_MONOTONIC", "Crystal's monotonic clock is Time.monotonic, not a Process constant" },
+    { "Process", "CLOCK_REALTIME", "Crystal's wall clock is Time.utc, not a Process constant" },
+    { "File", "RDONLY", "Crystal opens with a String mode or File::Flags, which has no Ruby-spelled RDONLY" },
+    { "File", "WRONLY", "Crystal opens with a String mode or File::Flags" },
+    { "File", "RDWR", "Crystal opens with a String mode or File::Flags" },
+    { "File", "CREAT", "Crystal opens with a String mode or File::Flags" },
+    { "File", "APPEND", "Crystal opens with a String mode or File::Flags" },
+    { "File", "EXCL", "Crystal opens with a String mode or File::Flags" },
+    { "File", "TRUNC", "Crystal opens with a String mode or File::Flags" },
   };
   for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) {
     if (m[i].leaf) {
@@ -946,6 +962,7 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { "Kernel",  "gets",  "Crystal reads stdin with gets, not Kernel.gets" },
     { "Object",  "new",   "Crystal's Object is not instantiable with new" },
     { "Struct",  "new",   "only a top-level S = Struct.new(..) is translated; a Struct factory call has no Crystal form" },
+    { "Fiber",   "yield", "Crystal's Fiber.yield takes no value (Ruby's passes one out)" },
     { "Signal",  "trap",  "Crystal has no Signal.trap; a handler is not part of this subset" },
     { "Signal",  "signame", "Crystal has no Signal.signame" },
     { "Random",  "urandom", "Crystal's secure randomness is Random::Secure" },
@@ -983,6 +1000,14 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
       if (ac != 1 || comp_ntype(g->c, av[0]) != TY_INT)
         return "Crystal's Time.unix takes one Int; Time.at with a fractional or "
                "sub-second argument has no Crystal form";
+    }
+    /* Time.utc / Time.gm take at most 6 arguments in Crystal; Ruby's 7th is
+       microseconds, for which there is no slot. */
+    if (sp_streq(mod, "Time") && (sp_streq(name, "utc") || sp_streq(name, "gm"))) {
+      int ac = 0; call_args(g->nt, id, &ac);
+      if (ac == 7)
+        return "Crystal's Time.utc takes at most 6 arguments; Ruby's 7th "
+               "(microseconds) has no Crystal slot";
     }
   }
   /* A receiver with an inferred value type. Match on the Crystal type the
@@ -2061,6 +2086,21 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       sp_streq(nt_str(g->nt, recv, "name"), "File")) {
     buf_puts(b, "0");
     return;
+  }
+
+  /* Ruby's Numeric#step(limit, step) takes positional bounds; Crystal's step
+     takes named `to:` / `by:`. */
+  if (recv >= 0 && sp_streq(name, "step") && (argc == 1 || argc == 2)) {
+    TyKind rt = comp_ntype(g->c, recv);
+    if (rt == TY_INT || rt == TY_FLOAT) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".step(to: ");
+      if (argc == 2) { cr_emit_expr(g, argv[0], b); buf_puts(b, ", by: "); cr_emit_expr(g, argv[1], b); }
+      else cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+      if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
+      return;
+    }
   }
 
   /* A blockless each_index / each_cons / each_slice is a lazy Iterator in
