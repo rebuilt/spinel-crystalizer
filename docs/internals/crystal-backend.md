@@ -108,7 +108,7 @@ slicing) and *nilability inference* — these compile and run but can differ on
 edge inputs, and are tracked as [Known gaps](#known-gaps-and-limitations) for the
 receiver-type-aware work that follows.
 
-### No `untyped` in Crystal 1.21
+### No `untyped` in Crystal 1.21, and the boxed replacement
 
 Crystal 1.21 **removed the `untyped` type**. `untyped` is no longer a keyword
 (`def f(x : untyped)`, `[] of untyped`, and `Array(untyped)` are all parse
@@ -116,22 +116,25 @@ errors), and the `Any` alias that replaced it is gone too, as is `Object` as a
 generic argument ("can't use Object as generic type argument yet"). The stdlib
 source contains no use of `untyped` as a type at all.
 
-This has two consequences for the emitter:
+The first response was to refuse everything the inference left widened (`TY_POLY`
+/ `TY_UNKNOWN`) or contained in a widened container: with no `untyped` there is
+no name to write, so the emitter refused rather than emit a parse error. That was
+worth doing even though it *lowered* the emit-clean count — every program that
+emitted `untyped` was a guaranteed build failure, so converting them to
+line-anchored refusals cost no working program and removed a class of
+silently-broken output.
 
-1. There is **no dynamic dispatch** to defer to. A call on a poly receiver
-   cannot be verified by us *or* resolved by Crystal, so poly receivers are
-   refused rather than passed through.
-2. A poly container has **no spelling**. `Array(untyped)` cannot be written, so
-   poly arrays and hashes are refused instead of emitting a type that only ever
-   produced a parse error.
-
-Both were worth doing even though they *lower* the emit-clean count: every one of
-the 91 programs that emitted `untyped` was a guaranteed build failure, so
-converting them to line-anchored refusals costs no working program and removes a
-whole class of silently-broken output. For the same reason an empty array or
-hash literal is emitted as `Array(T).new` / `Hash(K, V).new` rather than the
-`[] of T` / `{} of K => V` forms, which are annotation-only and parse as errors
-the moment the literal is used as a method receiver.
+The replacement (P20, below) is the C backend's model ported to Crystal: a
+**boxed value type**. The C backend represents a widened slot as `sp_RbVal`, a
+tagged union; Crystal cannot use `untyped`, so the equivalent is a class
+`SpValue` holding a closed union of the scalar types plus `SpObject` (the base
+every emitted user class inherits), with `sp_box`/unbox helpers and
+CRuby-faithful rendering and arithmetic. `SpValue` is deliberately a **class**,
+not a struct, so an expression that is only *sometimes* widened — a method
+returning a concrete value on one path and a boxed one on another — type-checks
+as a union with `SpValue` in it. A poly container becomes `Array(SpValue)` /
+`Hash(SpValue, SpValue)`, real Crystal types. This is the same static-fast-path /
+boxed-slow-path split the C backend uses; the typed path never touches it.
 
 ## Type mapping
 
@@ -148,12 +151,54 @@ The emitter maps Spinel's inferred `TyKind` onto Crystal types:
 | `TY_INT_ARRAY` / `TY_FLOAT_ARRAY` / `TY_STR_ARRAY` | `Array(Int64)` / `Array(Float64)` / `Array(String)` |
 | `TY_STR_INT_HASH`, … | `Hash(String, Int64)`, … |
 | user class `i` | the class name (emitted as a Crystal `class`) |
-| `TY_POLY*` / `TY_UNKNOWN` | `untyped` (counted as a metric) |
+| `TY_POLY` | `SpValue` (the boxed runtime value) — with the poly runtime on |
+| `TY_POLY_ARRAY` / `TY_POLY_POLY_HASH` | `Array(SpValue)` / `Hash(SpValue, SpValue)` — with the poly runtime on |
+| `TY_UNKNOWN` | no spelling: not inferred / unsupported, counted as a metric |
 
 Locals and method parameters are annotated with their inferred type when it is
 concrete, which is what keeps `Int64` arithmetic and container element types in
 agreement. Value-type promotion, GC rooting, and the tagged-union machinery have
 no Crystal analogue — Crystal's own GC and static unions absorb them.
+
+## P20: the boxed-value runtime
+
+This phase lands the infrastructure for general (non-Rails, non-typed) Ruby: the
+runtime the emitter boxes into. It is deliberately **additive and
+zero-regression**: the runtime is emitted into every program and compiles, but
+the emitter side that *uses* it is staged behind `CR_POLY_RUNTIME` in
+`codegen_crystal.c`, currently `0`.
+
+**Runtime** (`src/crystal_runtime.h`, emitted as the `CR_RUNTIME` constant):
+`SpObject` (base class with the `sp_send` dispatch seam), `SpValue` (a class over
+a closed union `Int64 | Float64 | String | Symbol | Bool | Nil | SpObject |
+SpValue`), `sp_box` overloads, the scalar operators (`+ - * / < <= > >=`), and
+the unbox helpers (`sp_unbox_i/f/s/b`). It is generated ahead of every user class
+so `SpObject` is visible and `sp_box` is in scope at every boxing site.
+
+**Staged emitter seam** (`CR_POLY_RUNTIME`): `cr_map_type` maps `TY_POLY` →
+`SpValue` and poly containers to `Array/ Hash(SpValue…)`; poly locals and ivars
+are declared `SpValue` and boxed on write; a concrete argument to a widened
+parameter is boxed; a call on a widened receiver routes through
+`SpValue#sp_send`; a widened predicate is guarded with `truthy?`; and each class
+with user methods emits an `sp_send` arm per method.
+
+The switch is `0` because boxing an argument to a widened *parameter* without
+also dispatching and unboxing inside the callee's body turns working
+translations into build errors — exactly the function-boundary half that P22
+(the callee-body work) supplies. The corpus gate holds every phase to zero PASS
+regressions, so the seam ships inert until that half lands; flipping it is a
+one-line change plus the callee-body work, not a re-derivation.
+
+**Measured effect (P20).** The runtime alone, with the emitter seam off, is
+byte-neutral: the full 4,398-program corpus is **identical to the committed
+baseline** — PASS 327, DIFF 49, BUILDFAIL 268, REFUSED 3754, zero transitions,
+zero PASS regressions. The runtime text is emitted and compiled by every
+program, so the seam is proven to build while changing nothing.
+`scripts/crystal_difference_test.sh` pins that the runtime is present
+(`class SpValue`, `def sp_box`) and that a trivial program still builds and
+matches CRuby. The staged emitter code is exercised by building the compiler
+with `CR_POLY_RUNTIME 1`, which is how the P22 failures (boxed-container writes,
+the `sp_box` union gaps) were found and recorded.
 
 ## Ruby → Crystal divergences handled
 
@@ -250,7 +295,10 @@ output against CRuby gives:
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
 P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`, P12 `9f4e8772`,
 P13 `7725fc9d`, P14 `3adf0168`, P15 `c2f2eb1d`, P16 `ed1ea4ae`,
-P17 `9c616578`, P18 `9b7ec7d3`, P19 `0c1b225c`.)
+P17 `9c616578`, P18 `9b7ec7d3`, P19 `0c1b225c`; the P19 → P20 deltas in the
+table above belong to the honesty pass `f1234994`, not to the boxed runtime,
+which is metrics-neutral — P20 adds the runtime and its staged emitter seam and
+is measured below.)
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -274,9 +322,11 @@ Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
 **+7 PASS, +0 DIFF, −6 BUILDFAIL, −1 REFUSED**, Phase 17
 **+6 PASS, +0 DIFF, −6 BUILDFAIL, +0 REFUSED**, Phase 18
 **+4 PASS, +0 DIFF, −5 BUILDFAIL, +1 REFUSED**, Phase 19
-**+0 PASS, +0 DIFF, −7 BUILDFAIL, +7 REFUSED**, and Phase 20
-**+2 PASS, −1 DIFF, −13 BUILDFAIL, +12 REFUSED** — all with zero PASS regressions
-and no change to any program other than the ones named below.
+**+0 PASS, +0 DIFF, −7 BUILDFAIL, +7 REFUSED** — all with zero PASS regressions
+and no change to any program other than the ones named below. The P20 runtime is
+separately metrics-neutral (see [P20](#p20-the-boxed-value-runtime)); the
+`+2 PASS, −1 DIFF, −13 BUILDFAIL, +12 REFUSED` the table shows against P19 is the
+`f1234994` honesty pass.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further

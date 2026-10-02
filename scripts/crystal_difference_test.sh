@@ -117,6 +117,21 @@ expect_diverge() {
 
 # ---- AGREE: the backend translates these; output matches CRuby --------------
 
+# The boxed poly-value runtime (SpValue, sp_box, the scalar operators) is
+# emitted into every program so a widened slot has a real Crystal type. Nothing
+# in this test drives it yet, but the emitted file must still compile and run,
+# and the runtime must be present -- otherwise a later phase that boxes into it
+# would be building against a name that is not there.
+expect_agree "runtime_skeleton" 'p 1 + 1'
+if have_crystal=1; then
+  if ! grep -q 'class SpValue' "$tmp/runtime_skeleton.cr"; then
+    echo "FAIL [runtime_skeleton]: SpValue runtime not emitted"; ok=0
+  fi
+  if ! grep -q 'def sp_box' "$tmp/runtime_skeleton.cr"; then
+    echo "FAIL [runtime_skeleton]: sp_box helper not emitted"; ok=0
+  fi
+fi
+
 # [] into a Hash/Array answers nil on a miss in Ruby; Crystal raises. We emit
 # []? where the value is consumed as possibly-nil (cr_maybe_missing).
 expect_agree "index_nil_on_miss" 'h = {a: 1}; p h[:b]'

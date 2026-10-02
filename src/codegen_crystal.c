@@ -20,6 +20,7 @@
  * Crystal's own type system.
  */
 #include "analyze.h"   /* -> compiler.h -> node_table.h, types.h */
+#include "crystal_runtime.h"   /* CR_RUNTIME: the boxed poly-value runtime */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,21 @@ static void nameset_add(NameSet *s, const char *name) {
 static int cr_push_scope(CrGen *g) { return g->locals.n; }
 static void cr_pop_scope(CrGen *g, int saved) { g->locals.n = saved; }
 
+/* ---- staged poly-runtime seam ----
+
+   The boxed-value runtime (src/crystal_runtime.h: SpValue, sp_box, the scalar
+   operators, SpObject#sp_send) is emitted into every program. The emitter side
+   that USES it is staged behind this switch: `1` rewrites widened slots to
+   SpValue, boxes a concrete argument into a widened parameter, routes a call on
+   a widened receiver through sp_send, and guards a widened predicate with
+   truthy?. It is `0` until the function-boundary half lands, because boxing an
+   argument to a widened parameter without also dispatching/unboxing inside the
+   callee's body turns working translations into build errors (the corpus gate
+   holds every phase to zero PASS regressions). Flipping it on is the P22 step;
+   the code below is kept in place so that step is a one-line change plus the
+   callee-body work, not a re-derivation. */
+#define CR_POLY_RUNTIME 0
+
 /* ---- forward declarations ---- */
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
@@ -128,10 +144,20 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module);
 static void cr_emit_method(CrGen *g, Scope *s, Buf *b);
 static int cr_single_expr(const NodeTable *nt, int stmts_id);
 static void cr_scan_nil_uses(CrGen *g, int id, NilUseTally *out, int safe);
+static void cr_emit_recv(CrGen *g, int recv, Buf *b);
+
+/* A widened (poly) value: the boxed runtime type, never `untyped`. */
+static int cr_is_poly(TyKind t) { return t == TY_POLY; }
 
 /* ---- type mapping: TyKind -> Crystal type name ----
    Writes the Crystal type to b. Returns 1 when the result is a CONCRETE type
-   (usable as an annotation), 0 when it fell back to `untyped`. */
+   (usable as an annotation), 0 when there is no Crystal spelling.
+
+   TY_POLY maps to SpValue: the boxed runtime value a widened slot takes. A
+   poly container maps to a container OF SpValue, which is a real Crystal type
+   (Crystal 1.21 removed `untyped`, so `Array(untyped)` was never a spelling --
+   it only ever produced a parse error). TY_UNKNOWN stays non-concrete: it is
+   "not inferred / unsupported", not a value with a boxed representation. */
 static int cr_map_type(CrGen *g, TyKind t, Buf *b) {
   switch (t) {
     case TY_INT:        buf_puts(b, "Int64"); return 1;
@@ -144,12 +170,22 @@ static int cr_map_type(CrGen *g, TyKind t, Buf *b) {
     case TY_INT_ARRAY:      buf_puts(b, "Array(Int64)"); return 1;
     case TY_FLOAT_ARRAY:    buf_puts(b, "Array(Float64)"); return 1;
     case TY_STR_ARRAY:      buf_puts(b, "Array(String)"); return 1;
-    case TY_POLY_ARRAY:     buf_puts(b, "Array(untyped)"); return 0;
+    case TY_POLY_ARRAY:
+      if (CR_POLY_RUNTIME) { buf_puts(b, "Array(SpValue)"); return 1; }
+      buf_puts(b, "Array(untyped)"); return 0;
     case TY_STR_INT_HASH:   buf_puts(b, "Hash(String, Int64)"); return 1;
     case TY_STR_STR_HASH:   buf_puts(b, "Hash(String, String)"); return 1;
     case TY_INT_INT_HASH:   buf_puts(b, "Hash(Int64, Int64)"); return 1;
     case TY_INT_STR_HASH:   buf_puts(b, "Hash(Int64, String)"); return 1;
-    case TY_POLY_POLY_HASH: buf_puts(b, "Hash(untyped, untyped)"); return 0;
+    case TY_STR_POLY_HASH:
+      if (CR_POLY_RUNTIME) { buf_puts(b, "Hash(String, SpValue)"); return 1; }
+      break;
+    case TY_SYM_POLY_HASH:
+      if (CR_POLY_RUNTIME) { buf_puts(b, "Hash(Symbol, SpValue)"); return 1; }
+      break;
+    case TY_POLY_POLY_HASH:
+      if (CR_POLY_RUNTIME) { buf_puts(b, "Hash(SpValue, SpValue)"); return 1; }
+      buf_puts(b, "Hash(untyped, untyped)"); return 0;
     default: break;
   }
   if (ty_is_object(t)) {
@@ -211,11 +247,10 @@ static const char *cr_local(const char *n) {
 }
 
 /* The ELEMENT Crystal type of an array kind (for empty array literals).
-   Returns 1 when the result is a CONCRETE Crystal type, 0 when the element type
-   is poly/unknown -- which is an outright refusal, not something to paper over:
-   Crystal 1.21 has no `untyped` type at all (`untyped`, and the `Any` alias that
-   replaced it, are both gone), so there is no name to write for a dynamic
-   element type. Emitting one only ever produced a parse error. */
+   Returns 1 when the result is a CONCRETE Crystal type, 0 when there is no
+   Crystal spelling. A poly element is `SpValue`, the boxed runtime value: the
+   old `Object` fallback was not a type Crystal can hold in `Array(...)` as a
+   generic argument, and there was no `untyped` to name a dynamic element. */
 static int cr_array_elem_type(CrGen *g, TyKind t, Buf *b) {
   switch (t) {
     /* scalar element types (the common `a << 1` / `a << "s"` case) */
@@ -230,7 +265,10 @@ static int cr_array_elem_type(CrGen *g, TyKind t, Buf *b) {
     case TY_INT_ARRAY:      buf_puts(b, "Int64"); return 1;
     case TY_FLOAT_ARRAY:    buf_puts(b, "Float64"); return 1;
     case TY_STR_ARRAY:      buf_puts(b, "String"); return 1;
-    case TY_POLY_ARRAY:     buf_puts(b, "Object"); return 0;
+    case TY_POLY:           if (CR_POLY_RUNTIME) { buf_puts(b, "SpValue"); return 1; } break;
+    case TY_POLY_ARRAY:
+      if (CR_POLY_RUNTIME) { buf_puts(b, "SpValue"); return 1; }
+      buf_puts(b, "Object"); return 0;
     case TY_INT_ARRAY_ARRAY:  buf_puts(b, "Array(Int64)"); return 1;
     case TY_FLOAT_ARRAY_ARRAY: buf_puts(b, "Array(Float64)"); return 1;
     default: break;
@@ -293,6 +331,73 @@ static void cr_emit_type_ann(CrGen *g, TyKind t, Buf *b) {
   Buf tmp; memset(&tmp, 0, sizeof tmp);
   if (cr_map_type(g, t, &tmp)) { buf_printf(b, " : %s", tmp.p); }
   free(tmp.p);
+}
+
+/* The inferred type of local `name` in the scope that owns node `id`, or
+   TY_UNKNOWN. A local's widened type lives on its LocalVar, not on the read or
+   write node, so a poly binding is only visible through the analyzer's scope. */
+static TyKind cr_local_type(CrGen *g, int id, const char *name) {
+  Scope *sc = comp_scope_of(g->c, id);
+  LocalVar *lv = name ? scope_local(sc, name) : NULL;
+  return lv ? lv->type : TY_UNKNOWN;
+}
+
+/* The declared type of ivar `name` (leading @ included) on the class being
+   emitted, or TY_UNKNOWN. */
+static TyKind cr_ivar_type(CrGen *g, const char *name) {
+  if (g->cur_class < 0 || g->cur_class >= g->c->nclasses) return TY_UNKNOWN;
+  ClassInfo *ci = &g->c->classes[g->cur_class];
+  for (int i = 0; i < ci->nivars; i++)
+    if (ci->ivars[i] && name && sp_streq(ci->ivars[i], name)) return ci->ivar_types[i];
+  return TY_UNKNOWN;
+}
+
+/* Emit `id` as an SpValue. A poly node is already one -- the whole point of
+   the representation is that every poly-typed value IS an SpValue, so the box
+   is an identity there. Anything else is wrapped, which is what lets a
+   concrete scalar (or a Crystal union of scalars) be stored into a widened
+   slot. `sp_box` carries both overloads (SpValue identity and Raw -> SpValue),
+   so the emitted call is the same either way. */
+static void cr_emit_boxed(CrGen *g, int id, Buf *b) {
+  if (id >= 0 && cr_is_poly(comp_ntype(g->c, id))) { cr_emit_expr(g, id, b); return; }
+  buf_puts(b, "sp_box(");
+  cr_emit_expr(g, id, b);
+  buf_puts(b, ")");
+}
+
+/* Emit a predicate in a boolean context. Crystal requires a Bool where Ruby
+   accepts any value (only nil and false are falsy), so a widened predicate
+   asks its SpValue for truthiness. Used for if/unless/while/until only -- `a ||
+   b` is NOT a condition: Ruby's `||` answers the operand VALUE, so rewriting it
+   to a boolean would change the result. */
+static void cr_emit_cond(CrGen *g, int id, Buf *b) {
+  if (CR_POLY_RUNTIME && id >= 0 && cr_is_poly(comp_ntype(g->c, id))) {
+    cr_emit_recv(g, id, b);
+    buf_puts(b, ".truthy?");
+    return;
+  }
+  cr_emit_expr(g, id, b);
+}
+
+/* The scope of the user method a call resolves to, or NULL. Mirrors
+   cr_user_method_ok's resolution (top-level/bare, or the receiver's class). */
+static Scope *cr_callee_scope(CrGen *g, const char *name, TyKind rt, int bare) {
+  for (int s = 1; s < g->c->nscopes; s++) {
+    Scope *sc = &g->c->scopes[s];
+    if (!sc->name || !sp_streq(sc->name, name)) continue;
+    if (bare && (sc->class_id == -1 || sc->class_id == g->cur_class)) return sc;
+    if (!bare && ty_is_object(rt) && sc->class_id == ty_object_class(rt)) return sc;
+  }
+  return NULL;
+}
+
+/* True when the callee's parameter `idx` has a widened (poly) type, so a
+   concrete argument at that position must be boxed. */
+static int cr_param_poly(Scope *callee, int idx) {
+  if (!callee || idx < 0 || idx >= callee->nparams) return 0;
+  const char *pn = callee->pnames ? callee->pnames[idx] : NULL;
+  LocalVar *lv = pn ? scope_local(callee, pn) : NULL;
+  return lv && cr_is_poly(lv->type);
 }
 
 /* True when `id` is a read that can answer nil in Ruby -- a `[]` index into a
@@ -1415,8 +1520,12 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
         free(el.p);
         return;
       }
+      int poly_els = CR_POLY_RUNTIME && comp_ntype(g->c, id) == TY_POLY_ARRAY;
       buf_puts(b, "[");
-      for (int i = 0; i < n; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, els[i], b); }
+      for (int i = 0; i < n; i++) {
+        if (i) buf_puts(b, ", ");
+        if (poly_els) cr_emit_boxed(g, els[i], b); else cr_emit_expr(g, els[i], b);
+      }
       buf_puts(b, "]");
       return;
     }
@@ -1438,15 +1547,19 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
         free(ht.p);
         return;
       }
+      TyKind ht = comp_ntype(g->c, id);
+      int box_key = CR_POLY_RUNTIME && ht == TY_POLY_POLY_HASH;
+      int box_val = CR_POLY_RUNTIME &&
+                    (ht == TY_POLY_POLY_HASH || ht == TY_STR_POLY_HASH || ht == TY_SYM_POLY_HASH);
       buf_puts(b, "{ ");
       for (int i = 0; i < n; i++) {
         int assoc = els[i];
         int key = nt_ref(g->nt, assoc, "key");
         int val = nt_ref(g->nt, assoc, "value");
         if (i) buf_puts(b, ", ");
-        cr_emit_expr(g, key, b);
+        if (box_key) cr_emit_boxed(g, key, b); else cr_emit_expr(g, key, b);
         buf_puts(b, " => ");
-        cr_emit_expr(g, val, b);
+        if (box_val) cr_emit_boxed(g, val, b); else cr_emit_expr(g, val, b);
       }
       buf_puts(b, " }");
       return;
@@ -1623,7 +1736,7 @@ static void cr_emit_if(CrGen *g, int id, Buf *b, int indent) {
 
   cr_indent(b, indent);
   buf_puts(b, "if ");
-  cr_emit_expr(g, pred, b);
+  cr_emit_cond(g, pred, b);
   buf_puts(b, "\n");
   cr_emit_stmts(g, then, b, indent + 1);
 
@@ -1635,7 +1748,7 @@ static void cr_emit_if(CrGen *g, int id, Buf *b, int indent) {
       int ct = nt_ref(g->nt, cur, "statements");
       cr_indent(b, indent);
       buf_puts(b, "elsif ");
-      cr_emit_expr(g, cp, b);
+      cr_emit_cond(g, cp, b);
       buf_puts(b, "\n");
       cr_emit_stmts(g, ct, b, indent + 1);
       cur = nt_ref(g->nt, cur, "subsequent");
@@ -1774,9 +1887,10 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     buf_printf(b, "%c(", name[0]); cr_emit_expr(g, argv[0], b); buf_puts(b, ")");
     return;
   }
-  /* unary ! : receiver present, no arguments */
+  /* unary ! : receiver present, no arguments. Ruby's ! answers a Bool (the
+     truthiness negation), so a widened operand asks its SpValue. */
   if (recv >= 0 && argc == 0 && sp_streq(name, "!")) {
-    buf_puts(b, "!("); cr_emit_expr(g, recv, b); buf_puts(b, ")");
+    buf_puts(b, "!("); cr_emit_cond(g, recv, b); buf_puts(b, ")");
     return;
   }
   /* unary -x / +x on a value: Prism names these "-@" / "+@" with the operand as
@@ -1861,6 +1975,83 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
                               "value (Crystal takes a type)");
     buf_puts(b, "nil");
     return;
+  }
+
+  /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
+     value answers through the runtime's sp_nil? instead. */
+  if (CR_POLY_RUNTIME && recv >= 0 && argc == 0 && sp_streq(name, "nil?") && cr_is_poly(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".sp_nil?");
+    return;
+  }
+
+  /* A call on a widened receiver: the run-time value's own kind decides what
+     answers, so it goes through the boxed dispatch. This is the seam that lets
+     `x.m` work when x is a poly slot -- an Integer, a String, an Array, a user
+     object -- which before was refused. `!` and the operators have their own
+     SpValue forms and are handled above. `call` is the block/proc protocol,
+     answered by SpValue#call. */
+  if (CR_POLY_RUNTIME && recv >= 0 && cr_is_poly(comp_ntype(g->c, recv)) && !cr_user_method_ok(g, name, TY_POLY, 0) &&
+      !sp_streq(name, "!") && !sp_streq(name, "[]") && !sp_streq(name, "[]=") &&
+      !cr_is_binop(name) && !sp_streq(name, "-@") && !sp_streq(name, "+@")) {
+    if (block >= 0) {
+      cr_mark_unsupported(g, id, "a block passed to a call on a widened (poly) receiver");
+      buf_puts(b, "nil");
+      return;
+    }
+    /* The result comes back boxed; unbox it to the type this call site expects
+       (the node's inferred type) so it flows into concrete code unchanged.
+       A node the inference left poly keeps the SpValue. */
+    TyKind nt = comp_ntype(g->c, id);
+    const char *unbox = sp_streq(name, "call") ? "sp_unbox_call" : "sp_unbox";
+    if (nt == TY_INT)         buf_puts(b, "sp_unbox_i(");
+    else if (nt == TY_FLOAT)  buf_puts(b, "sp_unbox_f(");
+    else if (nt == TY_STRING) buf_puts(b, "sp_unbox_s(");
+    else if (nt == TY_BOOL)   buf_puts(b, "sp_unbox_b(");
+    (void)unbox;
+    if (sp_streq(name, "call")) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".call([");
+    } else {
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".sp_send(\"%s\", [", name);
+    }
+    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
+    buf_puts(b, "])");
+    if (nt == TY_INT || nt == TY_FLOAT || nt == TY_STRING || nt == TY_BOOL) buf_puts(b, ")");
+    return;
+  }
+
+  /* A widened container's elements are SpValue, so a write into it boxes (the
+     element type decides: Array(SpValue), or a poly-valued Hash). Staged with
+     the rest of the poly runtime. */
+  if (CR_POLY_RUNTIME && recv >= 0) {
+    TyKind ct = comp_ntype(g->c, recv);
+    if (ct == TY_POLY_ARRAY &&
+        (sp_streq(name, "<<") || sp_streq(name, "push") || sp_streq(name, "unshift"))) {
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".%s(", name);
+      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
+      buf_puts(b, ")");
+      return;
+    }
+    if ((ct == TY_POLY_ARRAY || ct == TY_POLY_POLY_HASH) && sp_streq(name, "[]=") && argc == 2) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, "[");
+      if (ct == TY_POLY_POLY_HASH) cr_emit_boxed(g, argv[0], b); else cr_emit_expr(g, argv[0], b);
+      buf_puts(b, "] = ");
+      cr_emit_boxed(g, argv[1], b);
+      return;
+    }
+    if ((ct == TY_STR_POLY_HASH || ct == TY_SYM_POLY_HASH) &&
+        sp_streq(name, "[]=") && argc == 2) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, "[");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, "] = ");
+      cr_emit_boxed(g, argv[1], b);
+      return;
+    }
   }
 
   /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
@@ -2356,6 +2547,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   /* method call: refuse a name we cannot verify, so an unknown method never
      ships as a silent build error. A nil placeholder keeps emission going; the
      run is refused at the end (codegen_program_crystal). */
+  Scope *callee = NULL;
   {
     /* A call into a compiler-synthesized "__" helper: the analyzer desugars some
        Ruby methods (between?, <=>, Enumerable#sum, ...) into __cmp_/__enumw_/
@@ -2375,6 +2567,9 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     int isa_const = sp_streq(name, "is_a?") && argc == 1 &&
                     nt_kind(g->nt, argv[0]) == NK_ConstantReadNode;
     int user_meth = cr_user_method_ok(g, name, rt, bare);
+    /* The callee's scope, so an argument at a widened parameter position can be
+       boxed to match its SpValue parameter type. */
+    if (user_meth) callee = cr_callee_scope(g, name, rt, bare);
     /* A method Crystal does not have on THIS receiver, whatever its name is in
        the allowlist. Checked after the user-method test, so a method the program
        defines always wins, and before the allowlist gate, which cannot see a
@@ -2394,7 +2589,14 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
          on an untyped (poly/unknown) receiver defers to Crystal's dynamic dispatch
          -- neither we nor Crystal can verify it statically, so allow it through. */
       int concrete = 0;
-      if (!bare) { Buf probe; memset(&probe, 0, sizeof probe); concrete = cr_map_type(g, rt, &probe); free(probe.p); }
+      /* With the poly runtime on, a widened receiver is not concrete for this
+         gate: its methods are answered by the runtime's SpValue, and an unknown
+         one is a gap the value's own dispatch reports. With it off, a widened
+         receiver keeps the baseline behaviour (refuse an unknown name). */
+      if (!bare && !(CR_POLY_RUNTIME && cr_is_poly(rt))) {
+        Buf probe; memset(&probe, 0, sizeof probe);
+        concrete = cr_map_type(g, rt, &probe); free(probe.p);
+      }
       if (bare || concrete) {
         char why[128];
         snprintf(why, sizeof why, "method '%s' is not in the Crystal subset", name);
@@ -2428,7 +2630,11 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   if (sp_streq(name, "p") || sp_streq(name, "puts") || sp_streq(name, "print") ||
       sp_streq(name, "pp"))
     g->nil_ok = 1;
-  for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+  for (int i = 0; i < argc; i++) {
+    if (i) buf_puts(b, ", ");
+    if (CR_POLY_RUNTIME && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
+    else cr_emit_expr(g, argv[i], b);
+  }
   g->nil_ok = sav2;
   buf_puts(b, ")");
 
@@ -2538,6 +2744,18 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
         }
       }
       cr_indent(b, indent);
+      /* A local the inference widened to poly is the boxed runtime type when
+         the poly runtime is active. Every write is boxed and the binding is
+         declared, so the local is an SpValue at every read (P22 flips this on
+         together with the method-boundary boxing it depends on). */
+      TyKind lt = cr_local_type(g, id, name);
+      if (CR_POLY_RUNTIME && cr_is_poly(lt) && !nameset_has(&g->locals, name)) {
+        buf_printf(b, "%s : SpValue = ", cr_local(name));
+        nameset_add(&g->locals, name);
+        cr_emit_boxed(g, val, b);
+        buf_puts(b, "\n");
+        return;
+      }
       if (!nameset_has(&g->locals, name)) {
         /* Deliberately NO type annotation in the general case. Spinel's TyKind
            carries no nilability, so an annotation like `a : String` is a claim
@@ -2574,6 +2792,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
         return;
       } else {
         buf_printf(b, "%s = ", cr_local(name));
+        if (CR_POLY_RUNTIME && cr_is_poly(lt)) { cr_emit_boxed(g, val, b); buf_puts(b, "\n"); return; }
       }
       cr_emit_expr(g, val, b);
       buf_puts(b, "\n");
@@ -2584,7 +2803,32 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       int val = nt_ref(g->nt, id, "value");
       cr_indent(b, indent);
       buf_printf(b, "%s = ", name ? name : "");
-      cr_emit_expr(g, val, b);
+      if (CR_POLY_RUNTIME && cr_is_poly(cr_ivar_type(g, name))) cr_emit_boxed(g, val, b);
+      else cr_emit_expr(g, val, b);
+      buf_puts(b, "\n");
+      return;
+    }
+    case NK_InstanceVariableOperatorWriteNode: {
+      /* `@x op= v`. Only translated when the poly runtime is on (a widened
+         ivar's compound assign goes through SpValue's operators); otherwise it
+         is refused exactly as the generic case refused it before. */
+      if (!CR_POLY_RUNTIME) {
+        cr_mark_unsupported(g, id, "InstanceVariableOperatorWriteNode");
+        return;
+      }
+      const char *name = nt_str(g->nt, id, "name");
+      const char *op   = nt_str(g->nt, id, "binary_operator");
+      int val = nt_ref(g->nt, id, "value");
+      cr_indent(b, indent);
+      if (op && (sp_streq(op, "+") || sp_streq(op, "-") || sp_streq(op, "*") ||
+                 sp_streq(op, "/") || sp_streq(op, "%"))) {
+        buf_printf(b, "%s %s= ", name ? name : "", op);
+        cr_emit_expr(g, val, b);
+      } else {
+        buf_printf(b, "%s = %s", name ? name : "", name ? name : "");
+        if (op) buf_printf(b, " %s ", op);
+        cr_emit_expr(g, val, b);
+      }
       buf_puts(b, "\n");
       return;
     }
@@ -2618,7 +2862,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       int cons = nt_ref(g->nt, id, "consequent");
       cr_indent(b, indent);
       buf_puts(b, "unless ");
-      cr_emit_expr(g, pred, b);
+      cr_emit_cond(g, pred, b);
       buf_puts(b, "\n");
       cr_emit_stmts(g, then, b, indent + 1);
       if (cons >= 0 && nt_kind(g->nt, cons) == NK_ElseNode) {
@@ -2633,7 +2877,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       int pred = nt_ref(g->nt, id, "predicate");
       int body = nt_ref(g->nt, id, "statements");
       cr_indent(b, indent); buf_puts(b, "while ");
-      cr_emit_expr(g, pred, b); buf_puts(b, "\n");
+      cr_emit_cond(g, pred, b); buf_puts(b, "\n");
       cr_emit_stmts(g, body, b, indent + 1);
       cr_indent(b, indent); buf_puts(b, "end\n");
       return;
@@ -2642,7 +2886,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       int pred = nt_ref(g->nt, id, "predicate");
       int body = nt_ref(g->nt, id, "statements");
       cr_indent(b, indent); buf_puts(b, "until ");
-      cr_emit_expr(g, pred, b); buf_puts(b, "\n");
+      cr_emit_cond(g, pred, b); buf_puts(b, "\n");
       cr_emit_stmts(g, body, b, indent + 1);
       cr_indent(b, indent); buf_puts(b, "end\n");
       return;
@@ -2817,7 +3061,10 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
 /* ---- classes ---- */
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   g->nclasses++;
-  buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
+  /* With the poly runtime on, every user class inherits SpObject so an instance
+     is a member of the value union and can be boxed at a widened slot. */
+  buf_printf(b, "%s %s%s\n", is_module ? "module" : "class", ci->name,
+             (CR_POLY_RUNTIME && !is_module && !ci->is_struct) ? " < SpObject" : "");
 
   /* typed ivar declarations (classes only; modules carry none). Crystal needs the
      annotation: a bare `@d` in a class body parses as a read, not a declaration,
@@ -2959,6 +3206,10 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
     }
   }
 
+  /* The class's own instance methods, gathered for the dynamic-dispatch method
+     emitted below (only when the poly runtime is on). */
+  Scope *dmeth[256]; int ndmeth = 0;
+
   /* methods: walk the body's DefNodes (and class-level constants) */
   int cbody = -1;
   if (ci->def_node >= 0) {
@@ -2983,6 +3234,7 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
       if (kk == NK_DefNode) {
         Scope *s = cr_scope_for_def(g->c, arr[i]);
         if (s) cr_emit_method(g, s, b);
+        if (CR_POLY_RUNTIME && s && !s->is_cmethod && s->name && ndmeth < 256) dmeth[ndmeth++] = s;
       } else if (kk == NK_ClassNode || kk == NK_ModuleNode) {
         /* nested class/module: emit recursively (Crystal is lenient about the
            indentation of nested type bodies). */
@@ -3015,6 +3267,50 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   }
   for (int i = 0; i < ci->nwriters; i++) {
     buf_printf(b, "  def %s=(v)\n    @%s = v\n  end\n", ci->writers[i], ci->writers[i]);
+  }
+
+  /* Dynamic dispatch: a widened value whose run-time kind is this class answers
+     a call through SpObject#sp_send. Each user instance method gets an arm that
+     unboxes its positional arguments and boxes the result, so a boxed caller
+     sees the same value a typed call would. Staged with the poly runtime. */
+  if (CR_POLY_RUNTIME && !is_module && !ci->is_struct &&
+      (ndmeth > 0 || ci->nreaders > 0 || ci->nwriters > 0)) {
+    buf_puts(b, "  def sp_send(name : String, args : Array(SpValue)) : SpValue\n    case name\n");
+    for (int i = 0; i < ndmeth; i++) {
+      Scope *s = dmeth[i];
+      int params = s->def_node >= 0 ? nt_ref(g->nt, s->def_node, "parameters") : -1;
+      int reqn = 0; const int *reqs = NULL;
+      if (params >= 0 && sp_streq(nt_type(g->nt, params), "ParametersNode"))
+        reqs = nt_arr(g->nt, params, "requireds", &reqn);
+      if (params >= 0 && nt_ref(g->nt, params, "block") >= 0) continue;
+      if (sp_streq(s->name, "to_s") || sp_streq(s->name, "inspect")) continue;
+      buf_printf(b, "    when \"%s\"\n      sp_box(%s(", s->name, s->name);
+      for (int a = 0; a < reqn; a++) {
+        const char *pn = nt_str(g->nt, reqs[a], "name");
+        LocalVar *lv = pn ? scope_local(s, pn) : NULL;
+        TyKind pt = lv ? lv->type : TY_UNKNOWN;
+        if (a) buf_puts(b, ", ");
+        buf_printf(b, "args[%d]", a);
+        if (pt == TY_INT)         buf_puts(b, ".to_i");
+        else if (pt == TY_FLOAT)  buf_puts(b, ".to_f");
+        else if (pt == TY_STRING || pt == TY_STRBUF) buf_puts(b, ".to_s");
+      }
+      buf_puts(b, "))\n");
+    }
+    for (int i = 0; i < ci->nreaders; i++)
+      buf_printf(b, "    when \"%s\"\n      sp_box(%s)\n", ci->readers[i], ci->readers[i]);
+    for (int i = 0; i < ci->nwriters; i++) {
+      buf_printf(b, "    when \"%s=\"\n      %s = ", ci->writers[i], ci->writers[i]);
+      TyKind wt = TY_UNKNOWN;
+      for (int v = 0; v < ci->nivars; v++)
+        if (ci->ivars[v] && sp_streq(ci->ivars[v] + 1, ci->writers[i])) wt = ci->ivar_types[v];
+      if (wt == TY_INT) buf_puts(b, "args[0].to_i");
+      else if (wt == TY_FLOAT) buf_puts(b, "args[0].to_f");
+      else if (wt == TY_STRING) buf_puts(b, "args[0].to_s");
+      else buf_puts(b, "args[0]");
+      buf_puts(b, "\n      sp_box(nil)\n");
+    }
+    buf_puts(b, "    else raise ArgumentError.new(\"undefined method '#{name}'\")\n    end\n  end\n");
   }
 
   buf_puts(b, "end\n");
@@ -3055,6 +3351,10 @@ char *codegen_program_crystal(const NodeTable *nt) {
   Buf b; memset(&b, 0, sizeof b);
   buf_puts(&b, "# Generated by Spinel (Crystal proof-of-concept backend)\n");
   buf_puts(&b, "# This file is machine-generated; do not edit.\n\n");
+  /* The boxed poly-value runtime: SpValue + its scalar operations. Emitted
+     before every user class so SpObject is a visible base and sp_box is in
+     scope at every boxing site. */
+  buf_puts(&b, CR_RUNTIME);
   /* CRuby's Hash#inspect / #to_s spelling. Crystal prints symbol keys as
      `{:a => 1}`; CRuby (4.0) prints `{a: 1}` for a plain-label key and
      `{"a-b": 1}` for one that is not, and `p` / `puts` / interpolation all go
