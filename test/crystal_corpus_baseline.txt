@@ -1356,10 +1356,10 @@ REFUSED   test_float_round_digits_cruby
 REFUSED   test_float_round_half_mode
 REFUSED   test_float_round_half
 REFUSED   test_float_round_ndigits_return_type
-BUILDFAIL test_float_round_nonliteral
-BUILDFAIL test_float_round_truncate_ndigits
+PASS     test_float_round_nonliteral
+DIFF     test_float_round_truncate_ndigits
 REFUSED   test_float_round_value_based_type
-BUILDFAIL test_float_round_zero
+PASS     test_float_round_zero
 REFUSED   test_float_spaceship
 BUILDFAIL test_float_step_block
 BUILDFAIL test_float_step_to_a
@@ -1800,7 +1800,7 @@ REFUSED   test_int_bit_beginless_raises
 REFUSED   test_int_bits_bignum_mask
 REFUSED   test_int_bracket_skip_sym_idx
 BUILDFAIL test_int_ceil_floor_round
-BUILDFAIL test_int_ceil_floor_round_truncate_ndigits
+PASS     test_int_ceil_floor_round_truncate_ndigits
 REFUSED   test_int_chr_high_byte_is_binary
 REFUSED   test_int_div_mod_pow2_const
 REFUSED   test_integer_0d_prefix
@@ -1853,7 +1853,7 @@ REFUSED   test_int_overflow_op_assign
 REFUSED   test_int_overflow_promote
 REFUSED   test_int_overflow_raises
 REFUSED   test_introspection_constant_path
-BUILDFAIL test_int_round_large_precision
+REFUSED   test_int_round_large_precision
 REFUSED   test_int_sentinel_class_nilclass
 REFUSED   test_int_to_enum_times
 REFUSED   test_io_binary_write_paths
@@ -1967,7 +1967,7 @@ PASS     test_issue_2921
 PASS     test_issue_2923
 BUILDFAIL test_issue_2924
 REFUSED   test_issue_2925
-DIFF     test_issue_2926
+PASS     test_issue_2926
 REFUSED   test_issue_2927
 PASS     test_issue_2928
 PASS     test_issue_2929

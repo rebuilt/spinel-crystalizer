@@ -1895,6 +1895,65 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
+  /* Integer#round/ceil/floor/truncate(ndigits): n >= 0 is self; n < 0 rounds to
+     10**(-n) exactly. A literal past 10**18 needs a Bignum, so refuse. */
+  if (recv >= 0 && argc == 1 && comp_ntype(g->c, recv) == TY_INT &&
+      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
+       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
+    int lit = nt_kind(g->nt, argv[0]) == NK_IntegerNode;
+    long long n = lit ? nt_int(g->nt, argv[0], "value", 0) : 0;
+    if (lit && n <= -19) {
+      cr_mark_unsupported(g, id, "Integer#round/ceil/floor/truncate with an "
+                                "ndigits below 0 (modulus past 10**18; Ruby "
+                                "returns a Bignum)");
+      buf_puts(b, "nil");
+      return;
+    }
+    if (lit && n >= 0) { cr_emit_recv(g, recv, b); return; }   /* ndigits >= 0: self */
+    buf_printf(b, "sp_int_%s(", name);
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ", ");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ")");
+    return;
+  }
+
+  /* Float#round/ceil/floor/truncate(ndigits): Crystal has Float#round(n) but no
+     digit-taking ceil/floor/truncate, so the scaling helpers. CRuby returns an
+     Integer for a literal ndigits <= 0, so append .to_i there. */
+  if (recv >= 0 && argc == 1 && comp_ntype(g->c, recv) == TY_FLOAT &&
+      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
+       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
+    int lit = nt_kind(g->nt, argv[0]) == NK_IntegerNode;
+    long long n = lit ? nt_int(g->nt, argv[0], "value", 0) : 0;
+    int want_int = lit && n <= 0;
+    if (sp_streq(name, "round")) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".round(");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+    } else {
+      buf_printf(b, "sp_flt_%s(", name);
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ", ");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+    }
+    if (want_int) buf_puts(b, ".to_i");
+    return;
+  }
+
+  /* Ruby's Float#round/ceil/floor/truncate with no argument answer an Integer;
+     Crystal's round/ceil/floor answer a Float64 and it has no truncate. */
+  if (recv >= 0 && argc == 0 && comp_ntype(g->c, recv) == TY_FLOAT &&
+      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
+       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
+    cr_emit_recv(g, recv, b);
+    if (!sp_streq(name, "truncate")) buf_printf(b, ".%s", name);
+    buf_puts(b, ".to_i");
+    return;
+  }
+
   /* Ruby's min/max answer nil on an empty collection; Crystal's min/max raise
      Enumerable::EmptyError. The `?` form returns the nilable counterpart, so it
      is used only where the surrounding context already tolerates nil -- the same
@@ -3027,6 +3086,63 @@ char *codegen_program_crystal(const NodeTable *nt) {
     "  f = x.floor\n"
     "  return 1 if f == x\n"
     "  (f.to_i % 2 == 0) ? 1 : -1\n"
+    "end\n\n");
+  /* Ruby's Integer#round/ceil/floor/truncate(ndigits): n >= 0 is self, n < 0
+     rounds to 10**(-n) with EXACT integer arithmetic (a float form loses
+     precision above 2**53, and round-half is away from zero). */
+  buf_puts(&b,
+    "def sp_int_round(x : Int64, n : Int64) : Int64\n"
+    "  return x if n >= 0\n"
+    "  d = 10_i64 ** (-n)\n"
+    "  s = x < 0 ? -1_i64 : 1_i64\n"
+    "  ((x.abs + d // 2) // d) * d * s\n"
+    "end\n"
+    "def sp_int_ceil(x : Int64, n : Int64) : Int64\n"
+    "  return x if n >= 0\n"
+    "  d = 10_i64 ** (-n)\n"
+    "  -((-x) // d) * d\n"
+    "end\n"
+    "def sp_int_floor(x : Int64, n : Int64) : Int64\n"
+    "  return x if n >= 0\n"
+    "  d = 10_i64 ** (-n)\n"
+    "  (x // d) * d\n"
+    "end\n"
+    "def sp_int_truncate(x : Int64, n : Int64) : Int64\n"
+    "  return x if n >= 0\n"
+    "  d = 10_i64 ** (-n)\n"
+    "  x.tdiv(d) * d\n"
+    "end\n\n");
+  /* Ruby's Float#ceil/floor/truncate(ndigits). Crystal has Float#round(n) (which
+     handles negative n) but no digit-taking ceil/floor/truncate, so scale,
+     round, and scale back. The result is Float64; the emitter appends .to_i when
+     CRuby returns Integer (a literal ndigits <= 0). */
+  buf_puts(&b,
+    "def sp_flt_ceil(x : Float64, n : Int64) : Float64\n"
+    "  if n >= 0\n"
+    "    f = 10.0 ** n\n"
+    "    (x * f).ceil / f\n"
+    "  else\n"
+    "    f = 10.0 ** (-n)\n"
+    "    (x / f).ceil * f\n"
+    "  end\n"
+    "end\n"
+    "def sp_flt_floor(x : Float64, n : Int64) : Float64\n"
+    "  if n >= 0\n"
+    "    f = 10.0 ** n\n"
+    "    (x * f).floor / f\n"
+    "  else\n"
+    "    f = 10.0 ** (-n)\n"
+    "    (x / f).floor * f\n"
+    "  end\n"
+    "end\n"
+    "def sp_flt_truncate(x : Float64, n : Int64) : Float64\n"
+    "  if n >= 0\n"
+    "    f = 10.0 ** n\n"
+    "    (x * f).to_i / f\n"
+    "  else\n"
+    "    f = 10.0 ** (-n)\n"
+    "    (x / f).to_i * f\n"
+    "  end\n"
     "end\n\n");
   /* CRuby's String#split, ported from the C backend's sp_str_split_*: a
      single-space (or nil) separator is whitespace (awk) mode -- leading
