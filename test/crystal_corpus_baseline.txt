@@ -667,7 +667,7 @@ REFUSED   test_class_def_order
 REFUSED   test_class_eval_reopen
 REFUSED   test_class_eval_value_form
 REFUSED   test_class_exec_def_body
-BUILDFAIL test_class_hierarchy_builtin
+REFUSED   test_class_hierarchy_builtin
 REFUSED   test_class_hierarchy_module
 REFUSED   test_class_hierarchy
 DIFF     test_class_in_collection
@@ -676,7 +676,7 @@ REFUSED   test_class_ivar_not_inherited
 REFUSED   test_class_ivar_save_restore
 REFUSED   test_class_literal_constructors
 REFUSED   test_class_lt_builtin_parent
-BUILDFAIL test_class_member_beats_kernel
+REFUSED   test_class_member_beats_kernel
 REFUSED   test_class_method_instance_exec_ivars
 PASS     test_class_method_int_table_arg
 REFUSED   test_class_method_open_class_call
@@ -1148,7 +1148,7 @@ REFUSED   test_enum_reverse_each_answer
 REFUSED   test_enum_reverse_each_chain
 REFUSED   test_enum_terminal_chunk_zip_lazy
 REFUSED   test_enum_with_index_map
-BUILDFAIL test_enum_with_index_source_root
+REFUSED   test_enum_with_index_source_root
 REFUSED   test_enum_with_index_value
 REFUSED   test_enum_with_object
 REFUSED   test_env_fetch_default_value
@@ -2266,7 +2266,7 @@ REFUSED   test_issue_3231
 REFUSED   test_issue_3232
 REFUSED   test_issue_3233
 BUILDFAIL test_issue_3235
-BUILDFAIL test_issue_3236
+REFUSED   test_issue_3236
 PASS     test_issue_3238
 REFUSED   test_issue_3239
 REFUSED   test_issue_3240
@@ -4211,7 +4211,7 @@ PASS     test_to_h_with_block
 REFUSED   test_tools_diff_classify
 REFUSED   test_tools_diff_normalize
 REFUSED   test_toplevel_alias
-BUILDFAIL test_toplevel_def_beats_kernel
+REFUSED   test_toplevel_def_beats_kernel
 BUILDFAIL test_toplevel_def_private_on_object
 REFUSED   test_toplevel_def_redefined_body
 REFUSED   test_toplevel_def_redefined
@@ -4278,7 +4278,7 @@ REFUSED   test_untyped_recv_multiset_ops
 REFUSED   test_upto_downto_block
 REFUSED   test_uri_decode_bad_escape
 REFUSED   test_uri_hostname_ipv6
-BUILDFAIL test_user_bang_value_object
+REFUSED   test_user_bang_value_object
 REFUSED   test_user_class_aset_dispatch
 PASS     test_user_class_named_like_runtime_type
 REFUSED   test_user_class_new_bare_call
@@ -4294,7 +4294,7 @@ REFUSED   test_user_inject_forwarded_block
 REFUSED   test_user_join_on_block_param
 REFUSED   test_user_method_named_eval
 REFUSED   test_user_method_shared_builtin_name
-BUILDFAIL test_user_negation_methods
+REFUSED   test_user_negation_methods
 REFUSED   test_user_operator_on_block_param
 REFUSED   test_user_pack_join_block_param
 REFUSED   test_user_round_arity_poly_numeric

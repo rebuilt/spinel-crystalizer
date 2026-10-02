@@ -199,6 +199,9 @@ static int cr_is_reserved(const char *n) {
    the format is consumed. Four slots cover the widest single printf. */
 static const char *cr_local(const char *n) {
   if (!n) return "";
+  /* Crystal rejects `_` as a method-parameter name (only block params may be
+     `_`), so rename a lone underscore consistently at every binding site. */
+  if (sp_streq(n, "_")) return "_cr__";
   if (!cr_is_reserved(n)) return n;
   static char bufs[4][96];
   static int turn;
@@ -1814,6 +1817,27 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
+  /* A blockless Kernel#loop is an infinite Enumerator (yielding nil) in Ruby;
+     Crystal's loop requires a block and has no equivalent enumerator. */
+  if (recv < 0 && sp_streq(name, "loop") && block < 0) {
+    cr_mark_unsupported(g, id, "a blockless `loop` (an infinite Enumerator in Ruby "
+                              "with no Crystal form)");
+    buf_puts(b, "nil");
+    return;
+  }
+
+  /* Crystal's is_a? / kind_of? / instance_of? take a TYPE, so a variable holding
+     a class has no Crystal form (a constant is emitted as-is). */
+  if (recv >= 0 &&
+      (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?")) &&
+      (argc != 1 || (nt_kind(g->nt, argv[0]) != NK_ConstantReadNode &&
+                     nt_kind(g->nt, argv[0]) != NK_ConstantPathNode))) {
+    cr_mark_unsupported(g, id, "is_a?/kind_of?/instance_of? with a runtime class "
+                              "value (Crystal takes a type)");
+    buf_puts(b, "nil");
+    return;
+  }
+
   /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
      raises IndexError, so it maps onto the `[]?` form. */
   if (recv >= 0 && sp_streq(name, "at") && argc == 1 && ty_is_array(comp_ntype(g->c, recv))) {
@@ -2655,6 +2679,14 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
      method and let the stdlib answer. (A program-authored `def __foo` would be
      dropped too; the PoC subset never uses one.) */
    if (s->name && s->name[0] == '_' && s->name[1] == '_') return;
+  /* Crystal's `!` is a pseudo-method the compiler refuses to let a program
+     redefine, so a Ruby `def !` has no equivalent. Refuse it (and do not emit a
+     body, which would itself be a Crystal error). */
+  if (s->name && sp_streq(s->name, "!")) {
+    cr_mark_unsupported(g, s->def_node,
+      "a user-defined `!` (Crystal's ! is a pseudo-method that cannot be redefined)");
+    return;
+  }
   g->nmethods++;
 
   /* Read the parameter list straight from the DefNode. Required and optional
