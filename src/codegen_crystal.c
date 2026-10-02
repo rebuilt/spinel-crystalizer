@@ -893,6 +893,9 @@ static const char *cr_translate_name(CrGen *g, int recv, const char *n) {
      Integer#to_i is an identity conversion that Crystal has no need to name. */
   if (sp_streq(n, "to_i") && recv >= 0 && comp_ntype(g->c, recv) == TY_TIME)
     return "to_unix";
+  /* Enumerable#inject is Enumerable#reduce; the shared desugarer rewrites the
+     symbol/block forms in place but keeps the `inject` name. */
+  if (sp_streq(n, "inject")) return "reduce";
   return n;
 }
 
@@ -1957,6 +1960,37 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
 
 
 
+
+  /* `reduce(:op)` / `inject(seed, :op)` names the fold by an OPERATOR symbol.
+     The shared desugarer rewrites only identifier-named symbols to a block
+     (desugar_reduce_method_symbol); operator symbols ride the C backend's typed
+     fold emitters, which the Crystal emitter does not have -- so it emitted
+     `reduce(:+)`, which Crystal rejects. Spell the fold as a block here. */
+  if (recv >= 0 && block < 0 && argc >= 1 &&
+      (sp_streq(name, "reduce") || sp_streq(name, "inject"))) {
+    int last = argv[argc - 1];
+    const char *sym = nt_kind(g->nt, last) == NK_SymbolNode
+                      ? nt_str(g->nt, last, "value") : NULL;
+    if (sym && cr_is_binop(sym)) {
+      /* A symbol fold over a Hash folds Ruby's [k, v] pair Arrays; Crystal's
+         Hash#reduce yields {k, v} Tuples, so the fold is a different type (and
+         a growing Tuple at that). Refuse rather than ship it. */
+      if (ty_is_hash(comp_ntype(g->c, recv))) {
+        cr_mark_unsupported(g, id, "a symbol fold over a Hash (Ruby folds [k, v] pairs)");
+        buf_puts(b, "nil");
+        return;
+      }
+      char ra[32], rb[32];
+      int t = g->tmp_seq++;
+      snprintf(ra, sizeof ra, "__sp_rd%d_a", t);
+      snprintf(rb, sizeof rb, "__sp_rd%d_b", t);
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".reduce(");
+      for (int i = 0; i < argc - 1; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+      buf_printf(b, ") do |%s, %s|\n  %s %s %s\nend", ra, rb, ra, sym, rb);
+      return;
+    }
+  }
 
   /* Ruby's Array#join flattens nested Arrays recursively before joining, with
      the separator between every element; Crystal's join renders a nested Array

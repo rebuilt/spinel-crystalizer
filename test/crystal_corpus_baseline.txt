@@ -1019,7 +1019,7 @@ BUILDFAIL test_each_slice_cons_to_a
 BUILDFAIL test_each_slice_map
 REFUSED   test_each_with_index_enumerator
 REFUSED   test_each_with_index_filter_map
-BUILDFAIL test_each_with_index_inject
+PASS     test_each_with_index_inject
 DIFF     test_each_with_index_reduce_seed
 REFUSED   test_each_with_index_struct_present
 REFUSED   test_each_with_index_sum_block
@@ -1990,7 +1990,7 @@ PASS     test_issue_2945
 PASS     test_issue_2946
 REFUSED   test_issue_2947
 BUILDFAIL test_issue_2949
-BUILDFAIL test_issue_2951
+PASS     test_issue_2951
 REFUSED   test_issue_2952
 BUILDFAIL test_issue_2953
 REFUSED   test_issue_2956
@@ -2154,7 +2154,7 @@ REFUSED   test_issue_3119
 REFUSED   test_issue_3120
 REFUSED   test_issue_3121
 REFUSED   test_issue_3124
-BUILDFAIL test_issue_3125
+PASS     test_issue_3125
 REFUSED   test_issue_3126
 REFUSED   test_issue_3127
 REFUSED   test_issue_3128
@@ -2207,7 +2207,7 @@ REFUSED   test_issue_3177
 REFUSED   test_issue_3178
 REFUSED   test_issue_3179
 REFUSED   test_issue_3180
-BUILDFAIL test_issue_3181
+PASS     test_issue_3181
 REFUSED   test_issue_3182
 REFUSED   test_issue_3183
 REFUSED   test_issue_3184
@@ -2267,7 +2267,7 @@ REFUSED   test_issue_3232
 REFUSED   test_issue_3233
 BUILDFAIL test_issue_3235
 BUILDFAIL test_issue_3236
-REFUSED   test_issue_3238
+PASS     test_issue_3238
 REFUSED   test_issue_3239
 REFUSED   test_issue_3240
 REFUSED   test_issue_3241
@@ -2715,7 +2715,7 @@ REFUSED   test_native_bool_return_width
 REFUSED   test_native_object_protocol
 REFUSED   test_native_struct_poly_dispatch_with_args
 PASS     test_negative_range_slice
-BUILDFAIL test_nested_array_element_narrows
+PASS     test_nested_array_element_narrows
 PASS     test_nested_array_eq
 REFUSED   test_nested_array_pattern_deconstruct
 REFUSED   test_nested_block_captures_outer_param
@@ -3500,7 +3500,7 @@ REFUSED   test_reduce_no_init_hash_merge
 REFUSED   test_reduce_numeric_promotion
 REFUSED   test_reduce_root
 REFUSED   test_reduce_seed_kinds
-BUILDFAIL test_reduce_symbol_only_method
+PASS     test_reduce_symbol_only_method
 REFUSED   test_regex_atomic_group
 REFUSED   test_regex_backref_oob_nil
 REFUSED   test_regex_capture_scan_toproc_count
