@@ -237,14 +237,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | **P12 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | **777** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | **305** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | **50** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | **422** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | **3621** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | **P13 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | **734** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | **307** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | **49** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | **378** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | **3664** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -264,8 +264,9 @@ Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
 **+5 PASS, −6 DIFF, +0 BUILDFAIL, +1 REFUSED**, Phase 9
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 10
 **+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 11
-**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 12
-**+2 PASS, −2 DIFF, +0 BUILDFAIL, +0 REFUSED** — all with zero PASS regressions
+**+3 PASS, −3 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 12
+**+2 PASS, −2 DIFF, +0 BUILDFAIL, +0 REFUSED**, and Phase 13
+**+2 PASS, −1 DIFF, −44 BUILDFAIL, +43 REFUSED** — all with zero PASS regressions
 and no change to any program other than the ones named below.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
@@ -496,6 +497,33 @@ wrapping the call in `.tap` would return the materialized array, not Ruby's
 original receiver — and Ruby's `Enumerator` inspect format has no Crystal
 counterpart anyway.
 
+Phase 13 was an **honesty pass on the `BUILDFAIL` bucket**, which had grown to
+422 — larger than PASS. The dominant cause (206 of 422) was `undefined method`:
+the honesty gate is a *name* allowlist plus a 2-entry receiver-typed table, so a
+method Crystal lacks on the *receiver's type* slipped through whenever the
+receiver was a local rather than a bare constant — `t.value` on a Thread,
+`t.utc`/`strftime` on a Time, `re.match?(..)` on a Regex, a Fiber transfer. Those
+compiled to "undefined method" instead of refusing at the Ruby line. The
+receiver-typed table now carries the Thread / Time / Fiber / Regex methods
+Crystal genuinely lacks (the class-receiver shapes — `Thread.value`,
+`Time.mktime` — were already in its `mod` table). Two Time methods Crystal *does*
+have equivalently are remapped rather than refused (`utc` → `to_utc`,
+no-argument `getlocal` → `to_local`); the mutating `gmtime`/`localtime` and the
+argument-taking `getlocal(offset)` have no equivalent and are refused. Net:
+**42 BUILDFAILs became line-anchored refusals, 2 became PASS, 1 DIFF became a
+refusal, and no PASS regressed** — emit-clean fell (777 → 734) by design, since
+those 42 programs were never actually building.
+
+The same phase made the metrics reproducible and regression-proof:
+
+- `scripts/crystal_corpus_list.sh` emits the corpus list deterministically
+  (top-level `test/*.rb`, minus `test/promote_*.rb` and `test/crystal_struct.rb`),
+  so the numbers above can be rebuilt from a clean tree.
+- `test/crystal_corpus_baseline.txt` is a committed snapshot, and
+  `scripts/crystal_corpus_gate.sh <results.txt>` fails if any baselined PASS
+  stops passing (other transitions are reported, not failed). This is the
+  zero-regression rule every phase here has been held to, now executable.
+
 Regex literals (`/pattern/`, including `/i /m /x` flags and `#{}` interpolation)
 translate to Crystal's native regex literal, which is the same syntax; the pattern
 text drops in verbatim with only the `/` delimiter re-escaped (the unescaped source
@@ -547,10 +575,14 @@ trade was measured and rejected). `Data.define` is deliberately *not* translated
 compares members, and a plain class answers `==` by identity, so emitting it would
 silently change results; it stays an honest refusal until member-wise equality lands.
 
-Reproduce with `scripts/crystal_corpus.sh`; it gives every build its own
-`CRYSTAL_CACHE_DIR` (a shared cache across parallel builds corrupts itself and
-manufactures ~90 bogus "compiler bug" reports) and compares outputs serially
-after the builds finish. The harness keys work files by repo-relative path, not
+Reproduce with `scripts/crystal_corpus_list.sh` (the deterministic file list) and
+`scripts/crystal_corpus.sh` (the runner):
+`scripts/crystal_corpus.sh "$(scripts/crystal_corpus_list.sh)" /tmp/run 12`.
+Check the result against the committed baseline with
+`scripts/crystal_corpus_gate.sh /tmp/run/results.txt`, which fails on any PASS
+regression. The runner gives every build its own `CRYSTAL_CACHE_DIR` (a shared
+cache across parallel builds corrupts itself and manufactures ~90 bogus "compiler
+bug" reports) and compares outputs serially after the builds finish. The harness keys work files by repo-relative path, not
 basename: the corpus has duplicate basenames in subdirectories
 (`test/main.rb`, `test/require/main.rb`, `test/collect/seed/main.rb` all basename
 to `main`), and a basename key silently overwrote one with another, so four
@@ -811,10 +843,14 @@ program compiles but can differ on edge inputs.
   CPS). This is the sharpest *semantic* gap for a full port and was deliberately
   left out of the corpus.
 - **Out of subset entirely:** class inheritance (`< Parent`) and `super`, FFI,
-  Regexp, Thread/Fiber, `for` loops, `retry` inside a rescue clause, pattern
-  matching (`case`/`in` — plain `case`/`when` does translate), most of the Ruby
-  exception classes (see the `rescue` section above), and dynamic
-  metaprogramming (which Spinel itself does not support).
+  Thread/Fiber (the concurrency model is not replicated — `Thread#value`,
+  `Fiber#transfer`, `Thread#join(timeout)` and the like are refused, Phase 13),
+  `for` loops, `retry` inside a rescue clause, pattern matching (`case`/`in` —
+  plain `case`/`when` does translate), most of the Ruby exception classes (see
+  the `rescue` section above), and dynamic metaprogramming (which Spinel itself
+  does not support). Regexp literals, rendering and the common matching methods
+  *do* translate (Phases 2 and 8); only the pattern dialect differences (`\h`,
+  which is rewritten, and named backreferences, which are refused) remain.
 
 ## Effort to go beyond the PoC
 

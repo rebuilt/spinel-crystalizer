@@ -933,6 +933,33 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
       "Crystal's String is immutable and has no <<; a Ruby append-in-place needs a mutable buffer" },
     { TY_RANGE,  "lazy",
       "Crystal's Range has no lazy; there is no lazy enumerator to build" },
+    /* Ruby's green Thread / Fiber / Time carry methods Crystal's types do not.
+       The name allowlist cannot see a receiver-typed method like `t.value`, so
+       without these the call emits Crystal that fails to compile ("undefined
+       method") instead of a line-anchored refusal. The class-receiver shapes
+       (Thread.value, Time.mktime) are handled by the `mod` table above. */
+    { TY_THREAD, "value", "Crystal's Thread has no value; join then read a shared slot" },
+    { TY_THREAD, "join",  "Crystal's Thread#join takes no timeout/limit argument" },
+    { TY_THREAD, "alive?", "Crystal's Thread has no alive?; test the Fiber state" },
+    { TY_THREAD, "status", "Crystal's Thread has no status" },
+    { TY_THREAD, "raise", "Crystal's Thread cannot be raised into" },
+    { TY_TIME, "strftime", "Crystal formats Time with to_s(format), whose directive set differs" },
+    { TY_TIME, "asctime", "Crystal's Time has no asctime; format it" },
+    { TY_TIME, "ctime",   "Crystal's Time has no ctime; format it" },
+    { TY_TIME, "xmlschema", "Crystal's Time has no xmlschema" },
+    { TY_TIME, "deconstruct_keys", "Ruby's pattern-matching protocol has no Crystal form" },
+    { TY_TIME, "between?", "Crystal's Time has no between?" },
+    { TY_TIME, "eql?",     "Crystal compares Time with ==" },
+    { TY_TIME, "tv_sec",   "Crystal spells epoch seconds to_unix" },
+    { TY_TIME, "localtime", "Ruby's localtime mutates the receiver; Crystal's Time is immutable" },
+    { TY_TIME, "gmtime",   "Ruby's gmtime mutates the receiver; Crystal's Time is immutable" },
+    { TY_TIME, "getlocal", "Ruby's getlocal(offset) has no Crystal form (to_local takes none)" },
+    { TY_FIBER, "transfer", "Crystal's Fiber cannot transfer to another fiber" },
+    { TY_FIBER, "[]=",      "Crystal's Fiber has no fiber-local []=" },
+    { TY_REGEX, "match?",  "Crystal spells it on the String (str.matches?(re))" },
+    { TY_REGEX, "eql?",    "Crystal compares Regex with ==" },
+    { TY_REGEX, "names",   "Crystal exposes named captures lazily, not as a name list" },
+    { TY_REGEX, "freeze",  "Crystal has no freeze" },
   };
   for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
     if (v[i].type == rt && sp_streq(v[i].meth, name)) return v[i].why;
@@ -1883,6 +1910,17 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       comp_ntype(g->c, recv) == TY_REGEX) {
     cr_emit_recv(g, recv, b);
     buf_puts(b, ".ruby_options");
+    return;
+  }
+
+  /* Ruby's Time#utc / #getlocal (no argument) answer a Time in the UTC / local
+     zone; Crystal spells those to_utc / to_local. The argument-taking
+     getlocal(offset) and the in-place gmtime/localtime are refused by the
+     receiver-typed table below. */
+  if (recv >= 0 && argc == 0 && comp_ntype(g->c, recv) == TY_TIME &&
+      (sp_streq(name, "utc") || sp_streq(name, "getlocal"))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, sp_streq(name, "utc") ? ".to_utc" : ".to_local");
     return;
   }
 
