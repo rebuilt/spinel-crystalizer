@@ -236,6 +236,19 @@ unboxes the yielded `SpValue` back to the block parameter's inferred type
 the poly-array *expression* type stays non-concrete — only the binding is
 written `Array(SpValue)`.
 
+**P21.1 — every argument, and index writes.** The pin inspects *every* argument
+of a `<<`/`push`/`unshift`, not just the first, so `a = []; a.push(1, "x")`
+widens to `Array(SpValue)` instead of pinning `Array(Int64)` and then failing to
+build on the `"x"`. Index writes (`a[i] = v`) are handled conservatively: Ruby
+extends a short array on assignment where Crystal's `[]=` raises, so a write is
+safe only when its value already matches the pinned element type. A disagreeing
+write, or any `[]=` beside a widening push (whose index cannot be proven in
+bounds), is refused at the write with a named reason rather than emitted as an
+`Array(<T>)` it cannot be stored into. A lone `a[0] = v` with no push has no
+element type to pin from and keeps the empty-literal refusal. P21.1 is
+corpus-neutral (the corpus's multi-argument pushes are on already-typed arrays,
+not empty-`[]` candidates) but closes those shapes in isolation.
+
 **Refusals, not silent build failures.** A heterogeneous array with any
 non-scalar element — a user object, `Struct`, `Range`, `Array`, `Hash` — cannot
 ride `SpValue`'s scalar union; boxing it needs the `SpBox`/`SpObject` wrapper

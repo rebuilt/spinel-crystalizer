@@ -322,13 +322,18 @@ static int cr_is_scalar_elem(TyKind t) {
 }
 
 /* For an empty array literal whose element type the inference left poly (the
-   common `a = []` then `a << x` inside a block), scan the pushes to that
+   common `a = []` then `a << x` inside a block), scan the writes to that
    variable and decide how to pin it. Scans the whole table -- fine for the PoC
-   corpus, where names are unambiguous. Three outcomes:
+   corpus, where names are unambiguous.
 
-   * homogeneous (every push the same kind) -> *elem is that kind; the caller
-     pins `Array(<elem>)` as before. A single object class pins to its name; a
-     container element has no Crystal spelling and the caller refuses it.
+   Every pushed argument counts, not just the first: `push`/`unshift` can take
+   several, so `a.push(1, "x")` is seen as heterogeneous instead of being pinned
+   from `1` alone and then failing to build on the `"x"`.
+
+   Three outcomes:
+   * homogeneous (every pushed element the same kind) -> *elem is that kind; the
+     caller pins `Array(<elem>)` as before. A single object class pins to its
+     name; a container element has no Crystal spelling and the caller refuses it.
    * heterogeneous, every element a scalar -> *widen=1; the caller pins
      `Array(SpValue)` and boxes each push on the way in. This is the P21
      widening: scalars already live in SpValue's Raw union, so no wrapper is
@@ -336,36 +341,85 @@ static int cr_is_scalar_elem(TyKind t) {
    * heterogeneous with any non-scalar element -> *refuse_id is that push's node
      (the first one, in source order) and *refuse_kind its element kind; the
      caller refuses there, because boxing an object/container into SpValue needs
-     SpBox/SpObject, which P21 does not emit. */
+     SpBox/SpObject, which P21 does not emit.
+
+   Index writes (`a[i] = v`) are handled conservatively. Ruby extends a short
+   array on assignment where Crystal's `[]=` raises, so a write is safe only when
+   its value already matches the pinned element type; a disagreeing write is
+   refused at the write (the baseline emitted `Array(<T>)` it could not store
+   into -- a build failure). A widened array cannot box an index write without
+   proving the index in bounds, so any `[]=` beside a widening push is refused
+   too. A lone `a[0] = v` with no push is left to the empty-literal refusal: it
+   has no element type to pin from. */
 static void cr_find_pushed_elem(CrGen *g, const char *varname,
                                 TyKind *elem, int *widen,
-                                int *refuse_id, TyKind *refuse_kind) {
+                                int *refuse_id, TyKind *refuse_kind,
+                                const char **refuse_why) {
   TyKind first = TY_UNKNOWN;
-  int heterogeneous = 0, all_scalar = 1, nonscalar_id = -1, nonscalar_kind = TY_UNKNOWN;
+  int heterogeneous = 0, all_scalar = 1, npush = 0;
+  int nonscalar_id = -1; TyKind nonscalar_kind = TY_UNKNOWN;
+
   for (int id = 0; id < g->nt->count; id++) {
     if (nt_kind(g->nt, id) != NK_CallNode) continue;
     const char *nm = nt_str(g->nt, id, "name");
-    if (!nm || !(sp_streq(nm, "<<") || sp_streq(nm, "push"))) continue;
+    if (!nm || !(sp_streq(nm, "<<") || sp_streq(nm, "push") || sp_streq(nm, "unshift"))) continue;
     int recv = nt_ref(g->nt, id, "receiver");
     if (recv < 0 || nt_kind(g->nt, recv) != NK_LocalVariableReadNode) continue;
     const char *rn = nt_str(g->nt, recv, "name");
     if (!rn || !sp_streq(rn, varname)) continue;
     int argc = 0; const int *argv = call_args(g->nt, id, &argc);
-    if (argc < 1) continue;
-    TyKind et = comp_ntype(g->c, argv[0]);
-    if (!cr_is_scalar_elem(et) && nonscalar_id < 0) { nonscalar_id = id; nonscalar_kind = et; }
-    if (!cr_is_scalar_elem(et)) all_scalar = 0;
-    if (first == TY_UNKNOWN) { first = et; continue; }
-    if (et != first) heterogeneous = 1;
+    for (int a = 0; a < argc; a++) {
+      TyKind et = comp_ntype(g->c, argv[a]);
+      npush++;
+      if (!cr_is_scalar_elem(et)) {
+        all_scalar = 0;
+        if (nonscalar_id < 0) { nonscalar_id = id; nonscalar_kind = et; }
+      }
+      if (first == TY_UNKNOWN) first = et;
+      else if (et != first) heterogeneous = 1;
+    }
   }
+
+  /* Index writes to the same local: remember whether one exists and whether its
+     value kind disagrees with the pushed element. */
+  int has_aset = 0, aset_id = -1, aset_disagrees = 0; TyKind aset_kind = TY_UNKNOWN;
+  for (int id = 0; id < g->nt->count; id++) {
+    if (nt_kind(g->nt, id) != NK_CallNode) continue;
+    const char *nm = nt_str(g->nt, id, "name");
+    if (!nm || !sp_streq(nm, "[]=")) continue;
+    int recv = nt_ref(g->nt, id, "receiver");
+    if (recv < 0 || nt_kind(g->nt, recv) != NK_LocalVariableReadNode) continue;
+    const char *rn = nt_str(g->nt, recv, "name");
+    if (!rn || !sp_streq(rn, varname)) continue;
+    int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+    if (argc < 2) continue;
+    TyKind vt = comp_ntype(g->c, argv[1]);
+    if (!has_aset) { has_aset = 1; aset_id = id; aset_kind = vt; }
+    if (first != TY_UNKNOWN && vt != first) aset_disagrees = 1;
+  }
+
   *elem = first;
   *widen = 0;
   *refuse_id = -1;
   *refuse_kind = TY_UNKNOWN;
-  if (!CR_POLY_CONTAINERS || !heterogeneous) return;   /* pre-P21, or homogeneous */
-  if (all_scalar) { *widen = 1; return; }              /* heterogeneous scalar -> widen */
-  *refuse_id = nonscalar_id;                           /* heterogeneous + object/container */
-  *refuse_kind = nonscalar_kind;
+  *refuse_why = NULL;
+  if (!CR_POLY_CONTAINERS || npush == 0) return;   /* pre-P21, or no push to pin from */
+
+  if (heterogeneous) {
+    if (all_scalar && !has_aset) { *widen = 1; return; }   /* heterogeneous scalar -> widen */
+    if (all_scalar) {
+      *refuse_id = aset_id; *refuse_kind = aset_kind;
+      *refuse_why = "an index write to an array widened by scalar pushes";
+      return;
+    }
+    *refuse_id = nonscalar_id; *refuse_kind = nonscalar_kind;
+    *refuse_why = "a heterogeneous array whose element is a user object or container";
+    return;
+  }
+  if (has_aset && aset_disagrees) {
+    *refuse_id = aset_id; *refuse_kind = aset_kind;
+    *refuse_why = "an index write whose value type disagrees with the array's element type";
+  }
 }
 
 /* Same idea for a bare `Hash.new` bound to a new local: Crystal cannot infer K
@@ -2829,19 +2883,18 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
           free(probe.p);
           if (!concrete) {
             TyKind et; int widen = 0, refuse_id = -1; TyKind refuse_kind = TY_UNKNOWN;
-            cr_find_pushed_elem(g, name, &et, &widen, &refuse_id, &refuse_kind);
-            /* A non-scalar element in a heterogeneous array cannot ride SpValue's
-               Raw union without SpBox/SpObject (P22): refuse at the first such
-               push rather than emit an Array(SpValue) it cannot be pushed into. */
+            const char *refuse_why = NULL;
+            cr_find_pushed_elem(g, name, &et, &widen, &refuse_id, &refuse_kind, &refuse_why);
+            /* A non-scalar element (or an unsafe index write) cannot ride the
+               P21 scalar-array representation: refuse at the offending write
+               rather than emit code that fails to build. */
             if (refuse_id >= 0) {
               const char *kn = ty_is_object(refuse_kind) &&
                                ty_object_class(refuse_kind) < g->c->nclasses
                                 ? g->c->classes[ty_object_class(refuse_kind)].name
                                 : ty_name(refuse_kind);
               char msg[208];
-              snprintf(msg, sizeof msg,
-                       "a heterogeneous array whose element is a user object or container (%s); "
-                       "P21 widens only scalar elements to Array(SpValue)", kn);
+              snprintf(msg, sizeof msg, "%s (%s)", refuse_why ? refuse_why : "unsupported array write", kn);
               cr_mark_unsupported(g, refuse_id, msg);
             } else if (widen) {
               /* Disagreeing scalar pushes widen the element to SpValue (P21). */

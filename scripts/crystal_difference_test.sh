@@ -195,6 +195,13 @@ a << 1
 a << "x"
 p a'
 
+# P21.1: a multi-argument push is classified from EVERY argument, so a
+# heterogeneous `push(1, "x")` widens instead of pinning Array(Int64) and then
+# failing to build on the String.
+expect_agree "poly_scalar_array_multipush" 'a = []
+a.push(1, "x")
+p a'
+
 # Consistent dot notation / renamed predicates: File.exist? is File.exists?.
 expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 
@@ -222,6 +229,13 @@ expect_refuse "a heterogeneous array whose element is a user object or container
 a = []
 a << 1
 a << Foo.new
+p a'
+# P21.1: Ruby extends a short array on `a[i] = v`; Crystal's []= raises, so an
+# index write whose value disagrees with the pinned element type is refused
+# (it would otherwise emit Array(Int64) that the String cannot be stored into).
+expect_refuse "an index write whose value type disagrees" 'a = []
+a << 1
+a[0] = "x"
 p a'
 
 # ---- DIVERGE: emitted, but differs from CRuby on a known edge ---------------
