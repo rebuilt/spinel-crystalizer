@@ -276,6 +276,35 @@ honest refusals at the offending push. `scripts/crystal_difference_test.sh`
 pins an AGREE entry for the scalar-array boxing and a REFUSE entry for the
 object-element heterogeneous array.
 
+## P22: object boxing via SpBox
+
+P22 is the other half of the boxed-value work: widened *slots* (locals, ivars,
+parameters, receivers) become `SpValue`, and a call on one dispatches.
+
+The sketch in the P20 notes — "reintroduce `< SpObject` on every user class" —
+turned out to be unsound. Crystal collapses a union of `SpObject` subclasses to
+the virtual `SpObject+`, for instances and for metaclasses, which erases the
+emitter's per-class dispatch. Adding `< SpObject` to user classes broke exactly
+the two tests that dispatch surface exists for:
+
+- `test_poly_return_value_class`: `undefined method 'label' for P (compile-time type is SpObject+)`
+- `test_cls_value_in_collection_dispatch`: `undefined method 'apply' for Stamp.class (compile-time type is SpObject+.class)`
+
+So P22 boxes an object in a **wrapper** instead: `SpBox(T) < SpObject` carries
+the object, and the object's own class keeps no superclass. The concrete `T` is
+known at each `SpBox(T)` instantiation, so a per-class dispatch overload the
+emitter generates resolves at compile time, and a union of user classes (or of
+class objects) stays concrete.
+
+**P22a — the object-boxing infrastructure (additive).** The runtime gains
+`SpBox(T) < SpObject` (a getter, `initialize`, and `inspect`/`to_s` forwarding
+to the wrapped value), and the emitter emits one
+`sp_box(v : Foo) : SpValue` per top-level user class
+(`SpValue.new(SpBox.new(v))`), skipping modules, native classes, builtin
+reopens and nested classes. Nothing calls them yet — the switch is still off —
+so P22a is corpus-neutral: PASS 327, DIFF 49, BUILDFAIL 266, REFUSED 3756, zero
+transitions. Only *objects* are wrapped; a stdlib container still has no wrapper.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter

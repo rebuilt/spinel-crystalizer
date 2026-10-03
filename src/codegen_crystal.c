@@ -39,6 +39,12 @@ const int *call_args(const NodeTable *nt, int id, int *argc);
 __attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg);
 /* True when `val` is a `Struct.new(...)` / `Data.define(...)` call (analyze_scope.c). */
 int is_struct_call(Compiler *c, int val);
+/* True when the class is a module (analyze_scope.c). */
+int comp_class_is_module(Compiler *c, ClassInfo *ci);
+/* True when `name` is a reopen of a builtin class (codegen_util.c): it inherits
+   Crystal's own type, so it gets neither a per-class sp_box overload nor a
+   generated dispatch arm. */
+int is_builtin_reopen(const char *name);
 
 /* ---- emitter state ---- */
 typedef struct { char **names; int n, cap; } NameSet;
@@ -3519,6 +3525,19 @@ static int cr_struct_def_ci(Compiler *c, int node) {
   return (cls->is_struct && !cls->is_data) ? ci : -1;
 }
 
+/* P22a: the per-class `sp_box` overload. A user object is boxed into the value
+   union through SpBox rather than by the object's class inheriting SpObject
+   (which widened a union of classes to `SpObject+` and erased the dispatch arms
+   -- see P22). Emitted only for a class Pass 1 actually emits as a Crystal type,
+   and only for a top-level one (a nested class's name is qualified); a module,
+   native class or builtin reopen has no single Crystal type to name. Additive:
+   nothing calls these until the boxing sites land. */
+static void cr_emit_sp_box_overload(ClassInfo *ci, Buf *b, int is_module) {
+  if (is_module || ci->enclosing_class != -1 || ci->is_native_class ||
+      is_builtin_reopen(ci->name)) return;
+  buf_printf(b, "def sp_box(v : %s) : SpValue\n  SpValue.new(SpBox.new(v))\nend\n\n", ci->name);
+}
+
 /* ---- entry point ---- */
 char *codegen_program_crystal(const NodeTable *nt) {
   Compiler *c = comp_new(nt);
@@ -3789,13 +3808,19 @@ char *codegen_program_crystal(const NodeTable *nt) {
         int cp = nt_ref(nt, tstmts[k], "constant_path");
         if (cp >= 0) nm = nt_str(nt, cp, "name");
         int ci = nm ? comp_class_index(c, nm) : -1;
-        if (ci >= 0) cr_emit_class(&g, &c->classes[ci], &b, kk == NK_ModuleNode);
+        if (ci >= 0) {
+          cr_emit_class(&g, &c->classes[ci], &b, kk == NK_ModuleNode);
+          cr_emit_sp_box_overload(&c->classes[ci], &b, kk == NK_ModuleNode);
+        }
       } else if (kk == NK_DefNode) {
         Scope *s = cr_scope_for_def(c, tstmts[k]);
         if (s) cr_emit_method(&g, s, &b);
       } else if (kk == NK_ConstantWriteNode) {
         int sci = cr_struct_def_ci(c, tstmts[k]);
-        if (sci >= 0) cr_emit_class(&g, &c->classes[sci], &b, 0);
+        if (sci >= 0) {
+          cr_emit_class(&g, &c->classes[sci], &b, 0);
+          cr_emit_sp_box_overload(&c->classes[sci], &b, 0);
+        }
       }
     }
   }
