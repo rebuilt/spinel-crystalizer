@@ -2141,6 +2141,131 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
 }
 
 /* ---- calls (operators, method calls, blocks) ---- */
+
+/* Ruby's `arr.<stage>.with_index(off) { |x, i| }` drives a blockless stage
+   enumerator with an index; the blockless form is a first-class Enumerator over
+   [element, index] pairs. Crystal has no blockless Array#map/each (a blockless
+   `map` is a build error: "expected to be invoked with a block") and no
+   index-taking select/reject/sort_by, so the immediate array/range chain is
+   rewritten to the indexed forms Crystal does have:
+
+     map/collect   -> map_with_index(off) { |x, i| ... }
+     each          -> tap { |r| r.each_with_index(off) { |x, i| ... } }   (each
+                      answers the receiver; Crystal's each_with_index answers Nil)
+     select/filter -> each_with_index(off).select { |x, i| ... }.map(&.[0]).to_a
+     reject        -> each_with_index(off).reject { |x, i| ... }.map(&.[0]).to_a
+
+   A blockless chain becomes each_with_index(off): a lazy Iterator of
+   {element, index} Tuples. .to_a on it converts the Tuples to [element, index]
+   Arrays (see cr_emit_call), matching Ruby's Enumerator.
+
+   Only an immediate array/range source is handled here; a stored Enumerator's
+   `with_index` goes to the Int32-offset cast in the receiver branch below.
+   Returns 1 when handled. */
+/* Crystal's `*_with_index` offsets are Int32, but an integer literal is emitted
+   as Int64 (`1_i64`); the stdlib then computes `offset + i` as an Int64 and the
+   yield fails to typecheck ("argument #2 of yield expected to be Int32"). Cast
+   the offset back to Int32 at the call. */
+static void cr_emit_wi_offset(CrGen *g, int argc, const int *argv, Buf *b) {
+  if (argc >= 1) {
+    buf_puts(b, "(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").to_i32");
+  }
+}
+
+static int cr_emit_with_index(CrGen *g, int id, Buf *b) {
+  const char *name = nt_str(g->nt, id, "name");
+  if (!name || !sp_streq(name, "with_index")) return 0;
+  int recv = nt_ref(g->nt, id, "receiver");
+  if (recv < 0) return 0;
+  int block = nt_ref(g->nt, id, "block");
+  int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+  if (nt_kind(g->nt, recv) != NK_CallNode || nt_ref(g->nt, recv, "block") >= 0) {
+    /* a stored Enumerator (or any other receiver): Crystal's Iterator#with_index
+       takes an Int32 offset, so an Int64 offset literal needs the cast. With no
+       offset the generic path is already correct. */
+    if (argc < 1) return 0;
+    buf_puts(b, "(");
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".with_index((");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").to_i32)");
+    if (block >= 0) cr_emit_block(b, g, block, 0, recv, "with_index");
+    buf_puts(b, ")");
+    return 1;
+  }
+  const char *inner = nt_str(g->nt, recv, "name");
+  if (!inner) return 0;
+  int is_map = sp_streq(inner, "map") || sp_streq(inner, "collect");
+  int is_each = sp_streq(inner, "each");
+  int is_sel = sp_streq(inner, "select") || sp_streq(inner, "filter");
+  int is_rej = sp_streq(inner, "reject");
+  if (!is_map && !is_each && !is_sel && !is_rej) return 0;
+  int arr = nt_ref(g->nt, recv, "receiver");
+  if (arr < 0) return 0;
+  TyKind at = comp_ntype(g->c, arr);
+  if (!ty_is_array(at) && at != TY_RANGE && at != TY_POLY_ARRAY) return 0;
+
+  Buf recvb; memset(&recvb, 0, sizeof recvb);
+  cr_emit_recv(g, arr, &recvb);
+  const char *r = recvb.p ? recvb.p : "";
+
+  if (block < 0) {
+    /* first-class pair Enumerator: Crystal's each_with_index Iterator yields
+       {element, index} Tuples. Ruby's yields [element, index] Arrays; a Tuple
+       auto-splats in a later block (`|x, i|`) where an Array would not, so the
+       pair stays a Tuple here and only the `.to_a` terminal converts it (see
+       the to_a case in cr_emit_call). */
+    buf_printf(b, "%s.each_with_index(", r);
+    cr_emit_wi_offset(g, argc, argv, b);
+    buf_puts(b, ")");
+    free(recvb.p);
+    return 1;
+  }
+  if (is_map) {
+    buf_printf(b, "%s.map_with_index(", r);
+    cr_emit_wi_offset(g, argc, argv, b);
+    buf_puts(b, ")");
+    cr_emit_block(b, g, block, 0, arr, "with_index");
+  } else if (is_each) {
+    buf_printf(b, "%s.tap do |__wi_recv%d|\n  __wi_recv%d.each_with_index(",
+               r, g->tmp_seq, g->tmp_seq);
+    g->tmp_seq++;
+    cr_emit_wi_offset(g, argc, argv, b);
+    buf_puts(b, ")");
+    cr_emit_block(b, g, block, 1, arr, "with_index");
+    buf_puts(b, "end");
+  } else {
+    buf_printf(b, "%s.each_with_index(", r);
+    cr_emit_wi_offset(g, argc, argv, b);
+    buf_puts(b, is_rej ? ").reject" : ").select");
+    cr_emit_block(b, g, block, 0, arr, "with_index");
+    buf_puts(b, ".map(&.[0]).to_a");
+  }
+  free(recvb.p);
+  return 1;
+}
+
+/* True when `id` is a blockless `arr.<stage>.with_index(...)` chain, whose
+   Crystal value is an Iterator of {element, index} Tuples (cr_emit_with_index). */
+static int cr_is_blockless_wi(CrGen *g, int id) {
+  if (id < 0 || nt_kind(g->nt, id) != NK_CallNode) return 0;
+  const char *nm = nt_str(g->nt, id, "name");
+  if (!nm || !sp_streq(nm, "with_index") || nt_ref(g->nt, id, "block") >= 0) return 0;
+  int recv = nt_ref(g->nt, id, "receiver");
+  if (recv < 0 || nt_kind(g->nt, recv) != NK_CallNode) return 0;
+  if (nt_ref(g->nt, recv, "block") >= 0) return 0;
+  const char *inner = nt_str(g->nt, recv, "name");
+  if (!inner || !(sp_streq(inner, "map") || sp_streq(inner, "collect") ||
+                  sp_streq(inner, "each") || sp_streq(inner, "select") ||
+                  sp_streq(inner, "filter") || sp_streq(inner, "reject"))) return 0;
+  int arr = nt_ref(g->nt, recv, "receiver");
+  if (arr < 0) return 0;
+  TyKind at = comp_ntype(g->c, arr);
+  return ty_is_array(at) || at == TY_RANGE || at == TY_POLY_ARRAY;
+}
+
 static void cr_emit_call(CrGen *g, int id, Buf *b) {
   const char *name = nt_str(g->nt, id, "name");
   int recv  = nt_ref(g->nt, id, "receiver");
@@ -2163,6 +2288,28 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
      the receiver. Crystal has the same unary operators. */
   if (recv >= 0 && argc == 0 && (sp_streq(name, "-@") || sp_streq(name, "+@"))) {
     buf_printf(b, "%c(", name[0]); cr_emit_expr(g, recv, b); buf_puts(b, ")");
+    return;
+  }
+  /* `arr.<stage>.with_index(...)` chains (map/each/select/reject) and their
+     blockless pair-Enumerator form. */
+  if (cr_emit_with_index(g, id, b)) return;
+  /* `arr.<stage>.with_index(...).to_a`: Ruby's Enumerator yields [element,
+     index] Arrays; the Crystal chain yields {element, index} Tuples. Convert at
+     the terminal so the rendering matches -- a Tuple auto-splats in a block and
+     an Array does not, so the conversion cannot be pushed any earlier. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "to_a") && cr_is_blockless_wi(g, recv)) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".map(&.to_a).to_a");
+    return;
+  }
+  /* A blockless each_with_index is a pair Enumerator in Ruby. Crystal's is a
+     lazy Iterator with no sort_by/size and without Ruby's Enumerable shape, so
+     materialize it to an Array of {element, index} Tuples -- what the
+     sort_by.with_index desugar and the to_a/to_h/reduce chains expect. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "each_with_index") &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".each_with_index().to_a");
     return;
   }
   /* Ruby's bare `raise` re-raises `$!`. Crystal has no `$!`: inside a rescue

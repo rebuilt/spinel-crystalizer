@@ -1149,7 +1149,7 @@ REFUSED   test_enum_reverse_each_chain
 REFUSED   test_enum_terminal_chunk_zip_lazy
 REFUSED   test_enum_with_index_map
 REFUSED   test_enum_with_index_source_root
-BUILDFAIL test_enum_with_index_value
+DIFF     test_enum_with_index_value
 REFUSED   test_enum_with_object
 REFUSED   test_env_fetch_default_value
 REFUSED   test_env_full_surface
@@ -1514,7 +1514,7 @@ REFUSED   test_hash_empty_block_methods
 REFUSED   test_hash_empty_literal_and_map
 REFUSED   test_hash_enumerable_batch
 REFUSED   test_hash_enumerable_eql_batch
-BUILDFAIL test_hash_enum_with_index_chain
+PASS     test_hash_enum_with_index_chain
 PASS     test_hash_eq_boxed
 REFUSED   test_hash_except
 PASS     test_hash_fetch_block_key
@@ -2260,7 +2260,7 @@ REFUSED   test_issue_3227_matrix
 BUILDFAIL test_issue_3227_poly_mutators
 REFUSED   test_issue_3227
 REFUSED   test_issue_3227_reflection_reads
-BUILDFAIL test_issue_3228
+PASS     test_issue_3228
 REFUSED   test_issue_3229
 REFUSED   test_issue_3231
 REFUSED   test_issue_3232
@@ -3448,7 +3448,7 @@ REFUSED   test_range_one_sided_search
 BUILDFAIL test_range_overlap_array_flatten_depth
 REFUSED   test_range_predicate_typed_argument
 REFUSED   test_range
-BUILDFAIL test_range_select_with_index
+PASS     test_range_select_with_index
 BUILDFAIL test_range_size_infinite_local
 REFUSED   test_range_step_bad_stride
 REFUSED   test_range_step_endless_block
@@ -3756,7 +3756,7 @@ REFUSED   test_sort_block_poly_receiver
 BUILDFAIL test_sort_by_array_key
 REFUSED   test_sort_by_rational_key
 BUILDFAIL test_sort_by_with_index_offset
-BUILDFAIL test_sort_by_with_index
+PASS     test_sort_by_with_index
 BUILDFAIL test_sort_min_max_block_comparator
 BUILDFAIL test_sort_mixed_type_raises
 REFUSED   test_sort_with_comparator
@@ -4348,7 +4348,7 @@ REFUSED   test_while_hoist_skips_block
 REFUSED   test_while_tail_return_type
 REFUSED   test_while_until_as_value
 BUILDFAIL test_with_index_enumerator
-REFUSED   test_with_index
+PASS     test_with_index
 REFUSED   test_write_payload_untyped
 REFUSED   test_yield_autosplat_kernel_string
 REFUSED   test_yield_beside_block_param_value

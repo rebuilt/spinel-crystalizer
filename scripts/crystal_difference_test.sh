@@ -245,6 +245,17 @@ expect_refuse "a heterogeneous array whose element has no boxed representation" 
 a << 1
 a << 2**100
 p a'
+# P22d: `arr.<stage>.with_index` chains. Crystal has no blockless Array#map (a
+# build error: "expected to be invoked with a block") and no index-taking
+# select/reject/sort_by, so map/each/select/reject are rewritten to Crystal's
+# indexed forms. `each.with_index` answers the receiver (Ruby's each return), and
+# the blockless pair Enumerator materializes [element, index] Arrays at `.to_a`.
+expect_agree "with_index_map" 'p [4, 5].map.with_index(1) { |x, i| x * i }'
+expect_agree "with_index_select" 'p((1..5).select.with_index { |v, i| i.even? })'
+expect_agree "with_index_each_returns_receiver" 'r = [7, 8].each.with_index { |x, i| x + i }
+p r'
+expect_agree "with_index_to_a" 'p [10, 20].each.with_index(1).to_a'
+expect_agree "sort_by_with_index" 'p ["b", "aa", "a"].sort_by.with_index { |w, i| [w.length, i] }'
 # P21.1: Ruby extends a short array on `a[i] = v`; Crystal's []= raises, so an
 # index write whose value disagrees with the pinned element type is refused
 # (it would otherwise emit Array(Int64) that the String cannot be stored into).

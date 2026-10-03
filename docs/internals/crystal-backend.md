@@ -344,8 +344,60 @@ refusal had hidden: `block_autosplat` reaches a short-array auto-splat
 the missing params, and `enum_with_index_value` reaches a `map.with_index` chain,
 which the emitter spells as a blockless `map` followed by `with_index` (a build
 error). Both are real gaps in the read/iterator surface, now visible instead of
-masked behind the array refusal; neither is caused by the boxing. Net **+1 PASS,
+masked behind the array refusal; neither is caused by the boxing (the
+`map.with_index` one is closed by P22d below, and the short-array auto-splat is
+left documented — see [P22d](#p22-object-boxing-via-spbox)). Net **+1 PASS,
 +1 DIFF, +1 BUILDFAIL, −3 REFUSED**, zero PASS regressions.
+
+**P22d — `with_index` chains (landed).** P22c surfaced two emitter gaps; this
+closes the first. Crystal has no blockless `Array#map` (a blockless `map` is a
+compile error: "expected to be invoked with a block") and no index-taking
+`select`/`reject`/`sort_by`, so Ruby's `arr.<stage>.with_index(off) { |x, i| }`
+chain did not translate. The emitter now recognizes the immediate array/range
+chain and rewrites it to Crystal's indexed forms:
+
+| Ruby | Crystal |
+| --- | --- |
+| `arr.map.with_index(off) { }` | `arr.map_with_index(off) { }` |
+| `arr.each.with_index(off) { }` | `arr.tap { \|r\| r.each_with_index(off) { } }` |
+| `arr.select.with_index(off) { }` | `arr.each_with_index(off).select { }.map(&.[0]).to_a` |
+| `arr.reject.with_index(off) { }` | `arr.each_with_index(off).reject { }.map(&.[0]).to_a` |
+| `arr.<stage>.with_index(off)` | `arr.each_with_index(off)` |
+
+Two details make the output match CRuby. Crystal's `*_with_index` take an
+**Int32** offset while an integer literal is emitted `1_i64`, so the offset is
+cast (`.to_i32`) or the stdlib's `offset + i` becomes an Int64 and the yield
+fails to typecheck. And Crystal's `each_with_index` Iterator yields
+`{element, index}` **Tuples** where Ruby yields `[element, index]` **Arrays** —
+the same Tuple/Array tension Phase 12 records. The pair stays a Tuple (a Tuple
+auto-splats in a later `|x, i|` block and an Array does not, so a blockless
+`arr.each.with_index.map { |x, i| }` keeps working), and only the `.to_a`
+terminal converts it to Arrays. The shared `sort_by.with_index` desugar rewrites
+to `each_with_index.sort_by { }.map { }`; a blockless `each_with_index` is now
+materialized (`arr.each_with_index().to_a`) so Crystal's `sort_by` — which is not
+on `Iterator` — resolves. The stored first-class Enumerator forms
+(`e = arr.each.with_index`; `e.next`/`e.peek`/`e.size`) remain unhandled: Ruby's
+Enumerator is rewindable and Crystal's Iterator is not.
+
+**Measured effect (P22d).** **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED**, zero
+PASS regressions. `hash_enum_with_index_chain`, `issue_3228`,
+`range_select_with_index`, `sort_by_with_index` and `with_index` (a previously
+*refused* program) become PASS; `enum_with_index_value` moves BUILDFAIL → DIFF
+(its stored-Enumerator re-iteration is the remaining gap). The difference ledger
+pins the five shapes.
+
+The other gap P22c surfaced — a short-array auto-splat binding fewer params than
+the block asks for (`a, b, c = ["p", 1]`; Ruby nil-fills `c`, Crystal's
+`a, b, c = ary` raises `IndexError`) — is left documented, not fixed. A safe
+translation is blocked by the same Tuple/Array tension: Crystal requires a block
+variable to keep one static type, but Ruby's auto-splat makes a param `T` when
+the element is an Array and `Nil` when a scalar is bound to the first param, so
+`a + b` cannot stay monomorphic. A conditional destructure
+(`if e.is_a?(Array) then a, b = e[0], e[1] else a, b = e, nil end`) still infers
+`b` as `T | Nil` and fails. Only the cases where the poly array's element kind is
+**statically known** to be Arrays — a container-element widening like P22c's
+`[1, [5], [2, 3]]`, which `yields[0] == TY_ARRAY` distinguishes before the
+element collapses to `TY_POLY` — are decidable, and none is in the corpus.
 
 ## Ruby → Crystal divergences handled
 
@@ -429,14 +481,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | **P22c (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | **645** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | **328** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | **50** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | **267** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | **3753** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | **P22d (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | **646** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | **333** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | **51** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | **262** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | **3752** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -481,7 +533,10 @@ offending push. P22c (see [P22](#p22-object-boxing-via-spbox)) is
 **+1 PASS, +1 DIFF, +1 BUILDFAIL, −3 REFUSED** — the widened array now accepts a
 boxable object/container element, which turns `poly_array_range_aref` into a PASS
 and, on two other programs, unblocks the rest of a file whose remaining code
-touches a pre-existing auto-splat / `with_index` gap (now visible).
+touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
+**+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
+translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
+two gaps.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
