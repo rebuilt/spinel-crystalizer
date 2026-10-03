@@ -188,6 +188,13 @@ expect_agree_file "struct_full" "test/crystal_struct.rb"
 # yielded pair in the block body instead.
 expect_agree "block_autosplat" '[[1,2],[3,4]].each { |a,b| p a+b }'
 
+# P21: an empty `[]` widened by disagreeing SCALAR pushes becomes Array(SpValue);
+# each push is boxed on the way in (sp_box) and the array inspects like CRuby's.
+expect_agree "poly_scalar_array" 'a = []
+a << 1
+a << "x"
+p a'
+
 # Consistent dot notation / renamed predicates: File.exist? is File.exists?.
 expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 
@@ -208,6 +215,14 @@ expect_refuse "BackReferenceReadNode"            '"a" =~ /a/; p $&'
 # identity, so we refuse it rather than emit a reference class that would answer
 # `==` wrong. (A plain Struct.new is a reference type and IS translated.)
 expect_refuse "the constant 'Data'"              'D = Data.define(:a); p D.new(1) == D.new(1)'
+# P21: a heterogeneous array whose element is a user object cannot ride SpValue's
+# scalar union (that needs SpBox/SpObject, deferred to P22), so it is refused at
+# the first such push rather than emitted as an Array(SpValue) that build-fails.
+expect_refuse "a heterogeneous array whose element is a user object or container" 'class Foo; end
+a = []
+a << 1
+a << Foo.new
+p a'
 
 # ---- DIVERGE: emitted, but differs from CRuby on a known edge ---------------
 

@@ -49,6 +49,11 @@ typedef struct {
   Compiler *c;
   const NodeTable *nt;
   NameSet locals;     /* declared local names in the current scope (stacked) */
+  NameSet poly_arrays;/* locals declared Array(SpValue) (a widened empty `[]`):
+                         a push to one boxes, but a push to a concrete array --
+                         even one whose analyzer kind is TY_POLY_ARRAY before the
+                         object-array narrowing -- must not. Keyed by name so the
+                         decision matches the container actually emitted. */
   int poly_sites;     /* metric: expression nodes inferred as TY_POLY/TY_UNKNOWN */
   int unsupported;    /* metric: constructs outside the PoC subset */
   int first_unsup;    /* node id of the first unsupported construct (-1 if none);
@@ -120,16 +125,26 @@ static void cr_pop_scope(CrGen *g, int saved) { g->locals.n = saved; }
 
    The boxed-value runtime (src/crystal_runtime.h: SpValue, sp_box, the scalar
    operators, SpObject#sp_send) is emitted into every program. The emitter side
-   that USES it is staged behind this switch: `1` rewrites widened slots to
-   SpValue, boxes a concrete argument into a widened parameter, routes a call on
-   a widened receiver through sp_send, and guards a widened predicate with
-   truthy?. It is `0` until the function-boundary half lands, because boxing an
-   argument to a widened parameter without also dispatching/unboxing inside the
-   callee's body turns working translations into build errors (the corpus gate
-   holds every phase to zero PASS regressions). Flipping it on is the P22 step;
-   the code below is kept in place so that step is a one-line change plus the
-   callee-body work, not a re-derivation. */
-#define CR_POLY_RUNTIME 0
+   that USES it is staged behind two independently-flippable switches, because
+   the container half and the method-boundary half have different prerequisites:
+
+     CR_POLY_CONTAINERS (P21) -- widened containers become
+       Array(SpValue)/Hash(..., SpValue); their literals and writes box, and a
+       block iterating one unboxes the element to the block parameter's type.
+       This does not need a callee body to cooperate, so it can land first.
+
+     CR_POLY_BOXED (P22) -- widened locals/ivars/parameters become SpValue, a
+       concrete argument is boxed into a widened parameter, a call on a widened
+       receiver routes through sp_send, and a widened predicate is guarded with
+       truthy?. This cannot land before the callee-body half (dispatch +
+       unboxing inside a widened method), because boxing an argument to a
+       widened parameter without it turns working translations into build
+       errors. The corpus gate holds every phase to zero PASS regressions.
+
+   The code for both is kept in place so each phase is a one-line flip (plus
+   that phase's own work), not a re-derivation. */
+#define CR_POLY_CONTAINERS 1
+#define CR_POLY_BOXED 0
 
 /* ---- forward declarations ---- */
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
@@ -171,20 +186,29 @@ static int cr_map_type(CrGen *g, TyKind t, Buf *b) {
     case TY_FLOAT_ARRAY:    buf_puts(b, "Array(Float64)"); return 1;
     case TY_STR_ARRAY:      buf_puts(b, "Array(String)"); return 1;
     case TY_POLY_ARRAY:
-      if (CR_POLY_RUNTIME) { buf_puts(b, "Array(SpValue)"); return 1; }
+      /* P21 keeps this non-concrete here on purpose. Mapping every poly-array
+         EXPRESSION to Array(SpValue) would widen reads too, and reads are
+         deferred to P22 (unboxing at the read site). The boxed container type
+         is written explicitly where it is created -- the empty-literal pin --
+         and written into where it is mutated (<< / push / []=). */
       buf_puts(b, "Array(untyped)"); return 0;
     case TY_STR_INT_HASH:   buf_puts(b, "Hash(String, Int64)"); return 1;
     case TY_STR_STR_HASH:   buf_puts(b, "Hash(String, String)"); return 1;
     case TY_INT_INT_HASH:   buf_puts(b, "Hash(Int64, Int64)"); return 1;
     case TY_INT_STR_HASH:   buf_puts(b, "Hash(Int64, String)"); return 1;
+    /* A symbol/string-keyed hash with poly values is the common `{a: 1}` /
+       `{"x" => 1}` shape: the C backend boxes those values, but Crystal can
+       type them concretely from the literal, and treating them as
+       Hash(K, SpValue) over-widens every ordinary hash. Left non-concrete: the
+       literal emits its own element types, and a use that needs the poly form
+       is handled where it is read. */
     case TY_STR_POLY_HASH:
-      if (CR_POLY_RUNTIME) { buf_puts(b, "Hash(String, SpValue)"); return 1; }
-      break;
     case TY_SYM_POLY_HASH:
-      if (CR_POLY_RUNTIME) { buf_puts(b, "Hash(Symbol, SpValue)"); return 1; }
       break;
+    /* A fully heterogeneous hash is the boxed Hash(SpValue, SpValue); as with
+       the poly array above, the type is written where the container is created
+       or mutated, not for every expression of the kind. */
     case TY_POLY_POLY_HASH:
-      if (CR_POLY_RUNTIME) { buf_puts(b, "Hash(SpValue, SpValue)"); return 1; }
       buf_puts(b, "Hash(untyped, untyped)"); return 0;
     default: break;
   }
@@ -248,9 +272,12 @@ static const char *cr_local(const char *n) {
 
 /* The ELEMENT Crystal type of an array kind (for empty array literals).
    Returns 1 when the result is a CONCRETE Crystal type, 0 when there is no
-   Crystal spelling. A poly element is `SpValue`, the boxed runtime value: the
-   old `Object` fallback was not a type Crystal can hold in `Array(...)` as a
-   generic argument, and there was no `untyped` to name a dynamic element. */
+   Crystal spelling. A poly element has NO spelling here: P21 widens only a
+   heterogeneous SCALAR array to Array(SpValue), and that pin is written by the
+   local-write path itself (it knows the pushes are scalars). Reaching this
+   function with a poly/container element means a homogeneous container-of-
+   containers or an unresolvable element, which P21 refuses rather than emit an
+   Array(SpValue) whose pushes have no sp_box overload to answer them. */
 static int cr_array_elem_type(CrGen *g, TyKind t, Buf *b) {
   switch (t) {
     /* scalar element types (the common `a << 1` / `a << "s"` case) */
@@ -265,10 +292,8 @@ static int cr_array_elem_type(CrGen *g, TyKind t, Buf *b) {
     case TY_INT_ARRAY:      buf_puts(b, "Int64"); return 1;
     case TY_FLOAT_ARRAY:    buf_puts(b, "Float64"); return 1;
     case TY_STR_ARRAY:      buf_puts(b, "String"); return 1;
-    case TY_POLY:           if (CR_POLY_RUNTIME) { buf_puts(b, "SpValue"); return 1; } break;
-    case TY_POLY_ARRAY:
-      if (CR_POLY_RUNTIME) { buf_puts(b, "SpValue"); return 1; }
-      buf_puts(b, "Object"); return 0;
+    case TY_POLY:
+    case TY_POLY_ARRAY:     buf_puts(b, "Object"); return 0;
     case TY_INT_ARRAY_ARRAY:  buf_puts(b, "Array(Int64)"); return 1;
     case TY_FLOAT_ARRAY_ARRAY: buf_puts(b, "Array(Float64)"); return 1;
     default: break;
@@ -286,11 +311,37 @@ static int cr_array_elem_type(CrGen *g, TyKind t, Buf *b) {
   return 0;
 }
 
+/* A scalar element kind that boxes into SpValue's Raw union with no wrapper:
+   Int/Float/String/Symbol/Bool/Nil. These are exactly the members of Raw that
+   a widened array may hold in P21. Anything else -- a user object, Struct,
+   Range, Array, Hash, BigInt -- would need SpBox/SpObject (P22), so a widened
+   array refuses it rather than emit a push with no sp_box overload. */
+static int cr_is_scalar_elem(TyKind t) {
+  return t == TY_INT || t == TY_FLOAT || t == TY_STRING || t == TY_STRBUF ||
+         t == TY_SYMBOL || t == TY_BOOL || t == TY_NIL;
+}
+
 /* For an empty array literal whose element type the inference left poly (the
-   common `a = []` then `a << x` inside a block), find the first push to that
-   variable and use the pushed value's type as the element type. Scans the whole
-   table -- fine for the PoC corpus, where names are unambiguous. */
-static TyKind cr_find_pushed_elem(CrGen *g, const char *varname) {
+   common `a = []` then `a << x` inside a block), scan the pushes to that
+   variable and decide how to pin it. Scans the whole table -- fine for the PoC
+   corpus, where names are unambiguous. Three outcomes:
+
+   * homogeneous (every push the same kind) -> *elem is that kind; the caller
+     pins `Array(<elem>)` as before. A single object class pins to its name; a
+     container element has no Crystal spelling and the caller refuses it.
+   * heterogeneous, every element a scalar -> *widen=1; the caller pins
+     `Array(SpValue)` and boxes each push on the way in. This is the P21
+     widening: scalars already live in SpValue's Raw union, so no wrapper is
+     needed.
+   * heterogeneous with any non-scalar element -> *refuse_id is that push's node
+     (the first one, in source order) and *refuse_kind its element kind; the
+     caller refuses there, because boxing an object/container into SpValue needs
+     SpBox/SpObject, which P21 does not emit. */
+static void cr_find_pushed_elem(CrGen *g, const char *varname,
+                                TyKind *elem, int *widen,
+                                int *refuse_id, TyKind *refuse_kind) {
+  TyKind first = TY_UNKNOWN;
+  int heterogeneous = 0, all_scalar = 1, nonscalar_id = -1, nonscalar_kind = TY_UNKNOWN;
   for (int id = 0; id < g->nt->count; id++) {
     if (nt_kind(g->nt, id) != NK_CallNode) continue;
     const char *nm = nt_str(g->nt, id, "name");
@@ -300,9 +351,21 @@ static TyKind cr_find_pushed_elem(CrGen *g, const char *varname) {
     const char *rn = nt_str(g->nt, recv, "name");
     if (!rn || !sp_streq(rn, varname)) continue;
     int argc = 0; const int *argv = call_args(g->nt, id, &argc);
-    if (argc >= 1) return comp_ntype(g->c, argv[0]);
+    if (argc < 1) continue;
+    TyKind et = comp_ntype(g->c, argv[0]);
+    if (!cr_is_scalar_elem(et) && nonscalar_id < 0) { nonscalar_id = id; nonscalar_kind = et; }
+    if (!cr_is_scalar_elem(et)) all_scalar = 0;
+    if (first == TY_UNKNOWN) { first = et; continue; }
+    if (et != first) heterogeneous = 1;
   }
-  return TY_UNKNOWN;
+  *elem = first;
+  *widen = 0;
+  *refuse_id = -1;
+  *refuse_kind = TY_UNKNOWN;
+  if (!CR_POLY_CONTAINERS || !heterogeneous) return;   /* pre-P21, or homogeneous */
+  if (all_scalar) { *widen = 1; return; }              /* heterogeneous scalar -> widen */
+  *refuse_id = nonscalar_id;                           /* heterogeneous + object/container */
+  *refuse_kind = nonscalar_kind;
 }
 
 /* Same idea for a bare `Hash.new` bound to a new local: Crystal cannot infer K
@@ -371,7 +434,7 @@ static void cr_emit_boxed(CrGen *g, int id, Buf *b) {
    b` is NOT a condition: Ruby's `||` answers the operand VALUE, so rewriting it
    to a boolean would change the result. */
 static void cr_emit_cond(CrGen *g, int id, Buf *b) {
-  if (CR_POLY_RUNTIME && id >= 0 && cr_is_poly(comp_ntype(g->c, id))) {
+  if (CR_POLY_BOXED && id >= 0 && cr_is_poly(comp_ntype(g->c, id))) {
     cr_emit_recv(g, id, b);
     buf_puts(b, ".truthy?");
     return;
@@ -1520,12 +1583,12 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
         free(el.p);
         return;
       }
-      int poly_els = CR_POLY_RUNTIME && comp_ntype(g->c, id) == TY_POLY_ARRAY;
+      /* A non-empty literal keeps its own element types (Crystal types a
+         heterogeneous literal as a union), so reads work and no boxing is
+         needed. Only an empty `[]` that a later heterogeneous push widens is
+         pinned to Array(SpValue) -- see the local-write path. */
       buf_puts(b, "[");
-      for (int i = 0; i < n; i++) {
-        if (i) buf_puts(b, ", ");
-        if (poly_els) cr_emit_boxed(g, els[i], b); else cr_emit_expr(g, els[i], b);
-      }
+      for (int i = 0; i < n; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, els[i], b); }
       buf_puts(b, "]");
       return;
     }
@@ -1547,19 +1610,19 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
         free(ht.p);
         return;
       }
-      TyKind ht = comp_ntype(g->c, id);
-      int box_key = CR_POLY_RUNTIME && ht == TY_POLY_POLY_HASH;
-      int box_val = CR_POLY_RUNTIME &&
-                    (ht == TY_POLY_POLY_HASH || ht == TY_STR_POLY_HASH || ht == TY_SYM_POLY_HASH);
+      /* A non-empty hash literal also keeps its own key/value types (Crystal
+         types it as a concrete Hash, union-valued if heterogeneous), so reads
+         work and no boxing is needed. The boxed Hash(SpValue, SpValue) form is
+         reserved for a later phase. */
       buf_puts(b, "{ ");
       for (int i = 0; i < n; i++) {
         int assoc = els[i];
         int key = nt_ref(g->nt, assoc, "key");
         int val = nt_ref(g->nt, assoc, "value");
         if (i) buf_puts(b, ", ");
-        if (box_key) cr_emit_boxed(g, key, b); else cr_emit_expr(g, key, b);
+        cr_emit_expr(g, key, b);
         buf_puts(b, " => ");
-        if (box_val) cr_emit_boxed(g, val, b); else cr_emit_expr(g, val, b);
+        cr_emit_expr(g, val, b);
       }
       buf_puts(b, " }");
       return;
@@ -1815,6 +1878,20 @@ static void cr_emit_case(CrGen *g, int id, Buf *b, int indent) {
    from `each_slice(2)` equally well -- so it cannot regress an iterator that was
    already building, and it mirrors what the shared analyzer already does for a
    parenthesized `|(a, b)|` source param (analyze_pass.c, block_destr_params). */
+/* Emit the extraction of a possibly-boxed yielded value into a block parameter
+   of inferred type `pt`. `src` is the C expression holding the yielded value
+   (already `SpValue` when the container is widened). A concrete `pt` unboxes
+   through the runtime; a widened `pt` (or an unresolved one) is the identity.
+   The types match Crystal's `sp_unbox_*` helpers. */
+static void cr_emit_block_unbox(Buf *b, const char *dst, const char *src, TyKind pt) {
+  if (pt == TY_INT)         buf_printf(b, "%s = sp_unbox_i(%s)\n", dst, src);
+  else if (pt == TY_FLOAT)  buf_printf(b, "%s = sp_unbox_f(%s)\n", dst, src);
+  else if (pt == TY_STRING || pt == TY_STRBUF) buf_printf(b, "%s = sp_unbox_s(%s)\n", dst, src);
+  else if (pt == TY_SYMBOL) buf_printf(b, "%s = sp_unbox_sym(%s)\n", dst, src);
+  else if (pt == TY_BOOL)   buf_printf(b, "%s = sp_unbox_b(%s)\n", dst, src);
+  else                      buf_printf(b, "%s = %s\n", dst, src);
+}
+
 static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
                           const char *meth) {
   int params = nt_ref(g->nt, block, "parameters");
@@ -1829,23 +1906,44 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
   } else if (pty && sp_streq(pty, "ParametersNode")) {
     preqs = nt_arr(g->nt, params, "requireds", &pn);
   }
+
+  TyKind recv_ty = recv >= 0 ? comp_ntype(g->c, recv) : TY_UNKNOWN;
+
+  /* A widened array (Array(SpValue)) yields an SpValue per element, so a block
+     parameter with a concrete inferred type has to be unboxed. P21 widens only
+     arrays -- never Hash -- and only the single-yield iterators (each/map/...);
+     each_with_index's second value is a plain Int and its 2-param form falls to
+     the auto-splat path below, so the unbox here is always one value. The gate
+     is on the receiver being the widened array kind itself, so a future
+     Hash(..., SpValue) mapping cannot accidentally enable it. ty_block_yield is
+     the source of truth for the yield arity. */
+  TyKind yt[4]; memset(yt, 0, sizeof yt);
+  int nyield = (recv >= 0 && meth) ? ty_block_yield(recv_ty, meth, yt, 4) : 0;
+  int widen_block = CR_POLY_CONTAINERS && pn == 1 && nyield == 1 &&
+                    recv_ty == TY_POLY_ARRAY && yt[0] == TY_POLY;
+
   /* Ruby auto-splats only when the block asks for more values than the iterator
      yields. A parenthesized `|(a, b)|` was already desugared upstream into a
      single param, so seeing 2+ REQUIRED params here is the flat `|a, b|` form
      and the auto-splat is what Ruby would do. */
   TyKind yields[4];
   int splat = 0;
-  if (pn >= 2 && recv >= 0 && meth && ty_block_yield(comp_ntype(g->c, recv),
-                                                      meth, yields, 4) == 1)
+  if (pn >= 2 && recv >= 0 && meth && ty_block_yield(recv_ty, meth, yields, 4) == 1)
     splat = 1;
   char elem[48] = "";
   if (splat) snprintf(elem, sizeof elem, "__cr_elem%d", g->tmp_seq++);
   buf_puts(b, (splat || pn > 0) ? " do |" : " do");
   if (splat) buf_puts(b, elem);
-  for (int i = 0; i < pn && !splat; i++) {
-    const char *rn = nt_str(g->nt, preqs[i], "name");
-    if (i) buf_puts(b, ", ");
-    buf_puts(b, cr_local(rn));
+  if (widen_block && !splat) {
+    /* one synthetic param for the single yielded SpValue; unboxed in the body */
+    snprintf(elem, sizeof elem, "__cr_elem%d", g->tmp_seq++);
+    buf_puts(b, elem);
+  } else {
+    for (int i = 0; i < pn && !splat; i++) {
+      const char *rn = nt_str(g->nt, preqs[i], "name");
+      if (i) buf_puts(b, ", ");
+      buf_puts(b, cr_local(rn));
+    }
   }
   /* The real param names are declared by the destructuring assignment below, but
      they must be visible to the nil-safety name set either way: the assignment is
@@ -1861,6 +1959,15 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
       buf_puts(b, cr_local(nt_str(g->nt, preqs[i], "name")));
     }
     buf_printf(b, " = %s\n", elem);
+  } else if (widen_block) {
+    /* Unbox the single yielded SpValue to the parameter's inferred type. A
+       parameter the inference itself left poly is bound as the SpValue directly. */
+    const char *rn = nt_str(g->nt, preqs[0], "name");
+    LocalVar *lv = rn ? scope_local(comp_scope_of(g->c, block), rn) : NULL;
+    TyKind pt = lv ? lv->type : TY_UNKNOWN;
+    cr_indent(b, indent + 1);
+    if (yt[0] == TY_POLY) cr_emit_block_unbox(b, cr_local(rn), elem, pt);
+    else                  buf_printf(b, "%s = %s\n", cr_local(rn), elem);
   }
   /* The last statement of a block body is the block's return value, not a
      discarded read, so record it: the "value thrown away" rule must not turn its
@@ -1979,7 +2086,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
 
   /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
      value answers through the runtime's sp_nil? instead. */
-  if (CR_POLY_RUNTIME && recv >= 0 && argc == 0 && sp_streq(name, "nil?") && cr_is_poly(comp_ntype(g->c, recv))) {
+  if (CR_POLY_BOXED && recv >= 0 && argc == 0 && sp_streq(name, "nil?") && cr_is_poly(comp_ntype(g->c, recv))) {
     cr_emit_recv(g, recv, b);
     buf_puts(b, ".sp_nil?");
     return;
@@ -1991,7 +2098,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
      object -- which before was refused. `!` and the operators have their own
      SpValue forms and are handled above. `call` is the block/proc protocol,
      answered by SpValue#call. */
-  if (CR_POLY_RUNTIME && recv >= 0 && cr_is_poly(comp_ntype(g->c, recv)) && !cr_user_method_ok(g, name, TY_POLY, 0) &&
+  if (CR_POLY_BOXED && recv >= 0 && cr_is_poly(comp_ntype(g->c, recv)) && !cr_user_method_ok(g, name, TY_POLY, 0) &&
       !sp_streq(name, "!") && !sp_streq(name, "[]") && !sp_streq(name, "[]=") &&
       !cr_is_binop(name) && !sp_streq(name, "-@") && !sp_streq(name, "+@")) {
     if (block >= 0) {
@@ -2022,34 +2129,30 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     return;
   }
 
-  /* A widened container's elements are SpValue, so a write into it boxes (the
-     element type decides: Array(SpValue), or a poly-valued Hash). Staged with
-     the rest of the poly runtime. */
-  if (CR_POLY_RUNTIME && recv >= 0) {
-    TyKind ct = comp_ntype(g->c, recv);
-    if (ct == TY_POLY_ARRAY &&
-        (sp_streq(name, "<<") || sp_streq(name, "push") || sp_streq(name, "unshift"))) {
+  /* A widened array's elements are SpValue, so a push into it boxes. This is
+     the `a = []` then `a << 1; a << "x"` shape, where the empty-literal pin
+     made `a` an Array(SpValue); the element is boxed on the way in. Only the
+     push names are handled -- an index write (`a[i] = x`) and a
+     symbol/string-keyed hash write are left to the general path, because a
+     receiver that reads back as TY_POLY_ARRAY / TY_SYM_POLY_HASH need not have
+     been pinned to the boxed form, and boxing a concrete container's write is
+     the read/write coupling that P22 (read-side unboxing) resolves. */
+  if (CR_POLY_CONTAINERS && recv >= 0 &&
+      (sp_streq(name, "<<") || sp_streq(name, "push") || sp_streq(name, "unshift"))) {
+    /* Box only when the receiver is a local that was declared Array(SpValue) --
+       the widened empty `[]` of P21. A concrete array (including one the
+       analyzer calls TY_POLY_ARRAY before object-array narrowing) keeps its own
+       element type and must not receive a boxed value. */
+    int box_push = 0;
+    if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
+      const char *rn = nt_str(g->nt, recv, "name");
+      box_push = rn && nameset_has(&g->poly_arrays, rn);
+    }
+    if (box_push) {
       cr_emit_recv(g, recv, b);
       buf_printf(b, ".%s(", name);
       for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
       buf_puts(b, ")");
-      return;
-    }
-    if ((ct == TY_POLY_ARRAY || ct == TY_POLY_POLY_HASH) && sp_streq(name, "[]=") && argc == 2) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, "[");
-      if (ct == TY_POLY_POLY_HASH) cr_emit_boxed(g, argv[0], b); else cr_emit_expr(g, argv[0], b);
-      buf_puts(b, "] = ");
-      cr_emit_boxed(g, argv[1], b);
-      return;
-    }
-    if ((ct == TY_STR_POLY_HASH || ct == TY_SYM_POLY_HASH) &&
-        sp_streq(name, "[]=") && argc == 2) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, "[");
-      cr_emit_expr(g, argv[0], b);
-      buf_puts(b, "] = ");
-      cr_emit_boxed(g, argv[1], b);
       return;
     }
   }
@@ -2593,7 +2696,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
          gate: its methods are answered by the runtime's SpValue, and an unknown
          one is a gap the value's own dispatch reports. With it off, a widened
          receiver keeps the baseline behaviour (refuse an unknown name). */
-      if (!bare && !(CR_POLY_RUNTIME && cr_is_poly(rt))) {
+      if (!bare && !(CR_POLY_BOXED && cr_is_poly(rt))) {
         Buf probe; memset(&probe, 0, sizeof probe);
         concrete = cr_map_type(g, rt, &probe); free(probe.p);
       }
@@ -2632,7 +2735,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     g->nil_ok = 1;
   for (int i = 0; i < argc; i++) {
     if (i) buf_puts(b, ", ");
-    if (CR_POLY_RUNTIME && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
+    if (CR_POLY_BOXED && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
     else cr_emit_expr(g, argv[i], b);
   }
   g->nil_ok = sav2;
@@ -2725,8 +2828,30 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
           int concrete = cr_map_type(g, comp_ntype(g->c, val), &probe);
           free(probe.p);
           if (!concrete) {
-            TyKind et = cr_find_pushed_elem(g, name);
-            if (et != TY_UNKNOWN && et != TY_POLY) {
+            TyKind et; int widen = 0, refuse_id = -1; TyKind refuse_kind = TY_UNKNOWN;
+            cr_find_pushed_elem(g, name, &et, &widen, &refuse_id, &refuse_kind);
+            /* A non-scalar element in a heterogeneous array cannot ride SpValue's
+               Raw union without SpBox/SpObject (P22): refuse at the first such
+               push rather than emit an Array(SpValue) it cannot be pushed into. */
+            if (refuse_id >= 0) {
+              const char *kn = ty_is_object(refuse_kind) &&
+                               ty_object_class(refuse_kind) < g->c->nclasses
+                                ? g->c->classes[ty_object_class(refuse_kind)].name
+                                : ty_name(refuse_kind);
+              char msg[208];
+              snprintf(msg, sizeof msg,
+                       "a heterogeneous array whose element is a user object or container (%s); "
+                       "P21 widens only scalar elements to Array(SpValue)", kn);
+              cr_mark_unsupported(g, refuse_id, msg);
+            } else if (widen) {
+              /* Disagreeing scalar pushes widen the element to SpValue (P21). */
+              cr_indent(b, indent);
+              buf_printf(b, "%s : Array(SpValue) = Array(SpValue).new", cr_local(name));
+              nameset_add(&g->locals, name);
+              nameset_add(&g->poly_arrays, name);
+              buf_puts(b, "\n");
+              return;
+            } else if (et != TY_UNKNOWN && et != TY_POLY) {
               Buf el; memset(&el, 0, sizeof el);
               if (cr_array_elem_type(g, et, &el)) {
                 cr_indent(b, indent);
@@ -2749,7 +2874,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
          declared, so the local is an SpValue at every read (P22 flips this on
          together with the method-boundary boxing it depends on). */
       TyKind lt = cr_local_type(g, id, name);
-      if (CR_POLY_RUNTIME && cr_is_poly(lt) && !nameset_has(&g->locals, name)) {
+      if (CR_POLY_BOXED && cr_is_poly(lt) && !nameset_has(&g->locals, name)) {
         buf_printf(b, "%s : SpValue = ", cr_local(name));
         nameset_add(&g->locals, name);
         cr_emit_boxed(g, val, b);
@@ -2792,7 +2917,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
         return;
       } else {
         buf_printf(b, "%s = ", cr_local(name));
-        if (CR_POLY_RUNTIME && cr_is_poly(lt)) { cr_emit_boxed(g, val, b); buf_puts(b, "\n"); return; }
+        if (CR_POLY_BOXED && cr_is_poly(lt)) { cr_emit_boxed(g, val, b); buf_puts(b, "\n"); return; }
       }
       cr_emit_expr(g, val, b);
       buf_puts(b, "\n");
@@ -2803,7 +2928,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       int val = nt_ref(g->nt, id, "value");
       cr_indent(b, indent);
       buf_printf(b, "%s = ", name ? name : "");
-      if (CR_POLY_RUNTIME && cr_is_poly(cr_ivar_type(g, name))) cr_emit_boxed(g, val, b);
+      if (CR_POLY_BOXED && cr_is_poly(cr_ivar_type(g, name))) cr_emit_boxed(g, val, b);
       else cr_emit_expr(g, val, b);
       buf_puts(b, "\n");
       return;
@@ -2812,7 +2937,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       /* `@x op= v`. Only translated when the poly runtime is on (a widened
          ivar's compound assign goes through SpValue's operators); otherwise it
          is refused exactly as the generic case refused it before. */
-      if (!CR_POLY_RUNTIME) {
+      if (!CR_POLY_BOXED) {
         cr_mark_unsupported(g, id, "InstanceVariableOperatorWriteNode");
         return;
       }
@@ -3061,10 +3186,13 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
 /* ---- classes ---- */
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   g->nclasses++;
-  /* With the poly runtime on, every user class inherits SpObject so an instance
-     is a member of the value union and can be boxed at a widened slot. */
-  buf_printf(b, "%s %s%s\n", is_module ? "module" : "class", ci->name,
-             (CR_POLY_RUNTIME && !is_module && !ci->is_struct) ? " < SpObject" : "");
+  /* No user class inherits SpObject in P21: a widened array holds only scalars,
+     which live in SpValue's Raw union directly, so nothing needs the object base.
+     Giving every class `< SpObject` widens its type to `SpObject+`, which broke
+     inference on value-in-collection dispatch (test_poly_return_value_class /
+     test_cls_value_in_collection_dispatch). P22 reintroduces it together with the
+     callee-body work that makes a boxed object actually dispatch. */
+  buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
 
   /* typed ivar declarations (classes only; modules carry none). Crystal needs the
      annotation: a bare `@d` in a class body parses as a read, not a declaration,
@@ -3234,7 +3362,7 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
       if (kk == NK_DefNode) {
         Scope *s = cr_scope_for_def(g->c, arr[i]);
         if (s) cr_emit_method(g, s, b);
-        if (CR_POLY_RUNTIME && s && !s->is_cmethod && s->name && ndmeth < 256) dmeth[ndmeth++] = s;
+        if (CR_POLY_BOXED && s && !s->is_cmethod && s->name && ndmeth < 256) dmeth[ndmeth++] = s;
       } else if (kk == NK_ClassNode || kk == NK_ModuleNode) {
         /* nested class/module: emit recursively (Crystal is lenient about the
            indentation of nested type bodies). */
@@ -3273,7 +3401,7 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      a call through SpObject#sp_send. Each user instance method gets an arm that
      unboxes its positional arguments and boxes the result, so a boxed caller
      sees the same value a typed call would. Staged with the poly runtime. */
-  if (CR_POLY_RUNTIME && !is_module && !ci->is_struct &&
+  if (CR_POLY_BOXED && !is_module && !ci->is_struct &&
       (ndmeth > 0 || ci->nreaders > 0 || ci->nwriters > 0)) {
     buf_puts(b, "  def sp_send(name : String, args : Array(SpValue)) : SpValue\n    case name\n");
     for (int i = 0; i < ndmeth; i++) {
@@ -3645,6 +3773,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
   }
 
   free(g.locals.names);
+  free(g.poly_arrays.names);
   comp_free(c);
   return b.p;
 }

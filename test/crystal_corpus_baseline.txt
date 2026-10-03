@@ -269,7 +269,7 @@ REFUSED   test_block_arg_poly_symbol
 REFUSED   test_block_arg_poly_value
 REFUSED   test_block_autosplat_collectors
 REFUSED   test_block_autosplat_minmax_group
-BUILDFAIL test_block_autosplat
+REFUSED   test_block_autosplat
 REFUSED   test_block_body_rescue
 REFUSED   test_block_call_arity
 REFUSED   test_block_call_multi_arg_first
@@ -2938,7 +2938,7 @@ REFUSED   test_poly_array_plus_assign_boxed
 REFUSED   test_poly_array_plus_concat
 REFUSED   test_poly_array_pop_under_user_name
 BUILDFAIL test_poly_array_push_with_user_push
-BUILDFAIL test_poly_array_range_aref
+REFUSED   test_poly_array_range_aref
 DIFF     test_poly_array_readers
 REFUSED   test_poly_array_rindex_combination_block
 REFUSED   test_poly_array_set_eql

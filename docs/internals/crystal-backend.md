@@ -151,8 +151,9 @@ The emitter maps Spinel's inferred `TyKind` onto Crystal types:
 | `TY_INT_ARRAY` / `TY_FLOAT_ARRAY` / `TY_STR_ARRAY` | `Array(Int64)` / `Array(Float64)` / `Array(String)` |
 | `TY_STR_INT_HASH`, … | `Hash(String, Int64)`, … |
 | user class `i` | the class name (emitted as a Crystal `class`) |
-| `TY_POLY` | `SpValue` (the boxed runtime value) — with the poly runtime on |
-| `TY_POLY_ARRAY` / `TY_POLY_POLY_HASH` | `Array(SpValue)` / `Hash(SpValue, SpValue)` — with the poly runtime on |
+| `TY_POLY` | `SpValue` (the boxed runtime value) — with `CR_POLY_BOXED` (P22); non-concrete otherwise |
+| `TY_POLY_ARRAY` | `Array(SpValue)` for an empty `[]` pinned by heterogeneous scalar pushes (P21); no expression spelling otherwise |
+| `TY_POLY_POLY_HASH` | `Hash(SpValue, SpValue)` — with `CR_POLY_BOXED` (P22); not created in P21 |
 | `TY_UNKNOWN` | no spelling: not inferred / unsupported, counted as a metric |
 
 Locals and method parameters are annotated with their inferred type when it is
@@ -165,8 +166,9 @@ no Crystal analogue — Crystal's own GC and static unions absorb them.
 This phase lands the infrastructure for general (non-Rails, non-typed) Ruby: the
 runtime the emitter boxes into. It is deliberately **additive and
 zero-regression**: the runtime is emitted into every program and compiles, but
-the emitter side that *uses* it is staged behind `CR_POLY_RUNTIME` in
-`codegen_crystal.c`, currently `0`.
+the emitter side that *uses* it is staged behind a switch in
+`codegen_crystal.c` (`CR_POLY_RUNTIME` at P20; split into
+`CR_POLY_CONTAINERS`/`CR_POLY_BOXED` at P21, see below), currently `0`.
 
 **Runtime** (`src/crystal_runtime.h`, emitted as the `CR_RUNTIME` constant):
 `SpObject` (base class with the `sp_send` dispatch seam), `SpValue` (a class over
@@ -175,7 +177,7 @@ SpValue`), `sp_box` overloads, the scalar operators (`+ - * / < <= > >=`), and
 the unbox helpers (`sp_unbox_i/f/s/b`). It is generated ahead of every user class
 so `SpObject` is visible and `sp_box` is in scope at every boxing site.
 
-**Staged emitter seam** (`CR_POLY_RUNTIME`): `cr_map_type` maps `TY_POLY` →
+**Staged emitter seam** (the `CR_POLY_RUNTIME` switch, later split): `cr_map_type` maps `TY_POLY` →
 `SpValue` and poly containers to `Array/ Hash(SpValue…)`; poly locals and ivars
 are declared `SpValue` and boxed on write; a concrete argument to a widened
 parameter is boxed; a call on a widened receiver routes through
@@ -197,8 +199,69 @@ program, so the seam is proven to build while changing nothing.
 `scripts/crystal_difference_test.sh` pins that the runtime is present
 (`class SpValue`, `def sp_box`) and that a trivial program still builds and
 matches CRuby. The staged emitter code is exercised by building the compiler
-with `CR_POLY_RUNTIME 1`, which is how the P22 failures (boxed-container writes,
+with the seam on, which is how the P22 failures (boxed-container writes,
 the `sp_box` union gaps) were found and recorded.
+
+## P21: widened scalar arrays
+
+P21 is the first half of the boxed-value work: the **container** half, landed
+alone because it does not need a callee body to cooperate. The single staged
+switch is split into two (`codegen_crystal.c`):
+
+```
+CR_POLY_CONTAINERS 1   /* P21: widened containers */
+CR_POLY_BOXED      0   /* P22: widened locals/params/receivers */
+```
+
+P21 widens **arrays only**, and only when every pushed element is a **scalar**
+(`Int`/`Float`/`String`/`Symbol`/`Bool`/`Nil` — exactly the members of
+`SpValue::Raw`). The shape it handles is the common `a = []` followed by
+disagreeing scalar pushes:
+
+```ruby
+a = []
+a << 1
+a << "x"
+p a                     # => [1, "x"], byte-identical to CRuby
+```
+
+The empty-literal pin (`cr_find_pushed_elem`) scans the pushes. Homogeneous
+pushes pin the concrete element type as before (`Array(Int64)`, an object
+class's name, …). Heterogeneous-but-all-scalar pushes pin
+`Array(SpValue)` and record the local in `poly_arrays`; every later
+`<<`/`push`/`unshift` to it boxes its argument through `sp_box` (a scalar is
+already a `Raw` member, so no wrapper is needed), and a block iterating it
+unboxes the yielded `SpValue` back to the block parameter's inferred type
+(`sp_unbox_i/f/s/sym/b`). Reads of a widened array are still deferred to P22, so
+the poly-array *expression* type stays non-concrete — only the binding is
+written `Array(SpValue)`.
+
+**Refusals, not silent build failures.** A heterogeneous array with any
+non-scalar element — a user object, `Struct`, `Range`, `Array`, `Hash` — cannot
+ride `SpValue`'s scalar union; boxing it needs the `SpBox`/`SpObject` wrapper
+that is P22's work. P21 therefore refuses such a program **at the first
+disagreeing push** (the most precise anchor: it names the offending element's
+type), rather than emitting an `Array(SpValue)` that would fail to build:
+
+```
+spinel: prog.rb:6: a heterogeneous array whose element is a user object or container (Foo); P21 widens only scalar elements to Array(SpValue)
+```
+
+For the same reason the runtime reverts to the committed P20 text plus
+`sp_unbox_sym`: no `SpBox` class, no `Array/Hash/Range` `sp_box` overloads, and
+**no user class inherits `SpObject`**. `Hash` is not widened in P21. Giving every
+class `< SpObject` widened its type to `SpObject+` and broke inference on
+value-in-collection dispatch (`test_poly_return_value_class`,
+`test_cls_value_in_collection_dispatch`), so P22 reintroduces it together with
+the callee-body work that makes a boxed object actually dispatch.
+
+**Measured effect (P21).** PASS 327 (unchanged), DIFF 49 (unchanged),
+BUILDFAIL **266** (−2), REFUSED **3756** (+2), zero PASS regressions — the two
+transitions (`test_block_autosplat`, `test_poly_array_range_aref`) were
+BUILDFAILs caused by a heterogeneous array holding a container element, now
+honest refusals at the offending push. `scripts/crystal_difference_test.sh`
+pins an AGREE entry for the scalar-array boxing and a REFUSE entry for the
+object-element heterogeneous array.
 
 ## Ruby → Crystal divergences handled
 
@@ -282,14 +345,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | **P20 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | **644** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | **327** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | **49** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | **268** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | **3754** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | **P21 (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | **642** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | **327** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | **49** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | **266** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | **3756** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -298,7 +361,8 @@ P13 `7725fc9d`, P14 `3adf0168`, P15 `c2f2eb1d`, P16 `ed1ea4ae`,
 P17 `9c616578`, P18 `9b7ec7d3`, P19 `0c1b225c`; the P19 → P20 deltas in the
 table above belong to the honesty pass `f1234994`, not to the boxed runtime,
 which is metrics-neutral — P20 adds the runtime and its staged emitter seam and
-is measured below.)
+is measured below. The P20 → P21 deltas are the container half: **+0 PASS,
++0 DIFF, −2 BUILDFAIL, +2 REFUSED**, zero PASS regressions.)
 
 † Phase 4 drops `test/promote_*.rb` (20 programs) from the list — the same filter
 the Makefile applies to the C backend's raise/wrap runs, because those tests only
@@ -326,7 +390,10 @@ Phase 7 **+11 PASS, −11 DIFF, +0 BUILDFAIL, +0 REFUSED**, Phase 8
 and no change to any program other than the ones named below. The P20 runtime is
 separately metrics-neutral (see [P20](#p20-the-boxed-value-runtime)); the
 `+2 PASS, −1 DIFF, −13 BUILDFAIL, +12 REFUSED` the table shows against P19 is the
-`f1234994` honesty pass.
+`f1234994` honesty pass. P21 (see [P21](#p21-widened-scalar-arrays)) is
+**+0 PASS, +0 DIFF, −2 BUILDFAIL, +2 REFUSED** — the two BUILDFAILs whose
+heterogeneous array held a container element are now honest refusals at the
+offending push.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
