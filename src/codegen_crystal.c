@@ -167,6 +167,12 @@ static void cr_pop_scope(CrGen *g, ScopeMark m) {
 #define CR_POLY_BOXED 0
 #define CR_POLY_LOCALS 0
 #define CR_POLY_DISPATCH 0
+/* A widened (poly) instance variable is the boxed runtime value. Unlike a local
+   -- where Crystal's own union already resolves the methods (P22b) -- an ivar
+   must be DECLARED, and a poly one has no Crystal spelling, so it is currently a
+   hard refusal. Boxing it behind SpValue unblocks that shape; staged off until
+   measured. */
+#define CR_POLY_IVARS 1
 
 /* ---- forward declarations ---- */
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
@@ -1678,6 +1684,13 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
     }
     case NK_InstanceVariableReadNode: {
       const char *n = nt_str(g->nt, id, "name");   /* includes the leading @ */
+      /* A read of a boxed ivar that the analyzer NARROWED to a concrete scalar
+         is unboxed back; a read left poly stays the SpValue (its own methods
+         answer). Mirrors the boxed-local read in the poly-locals path. */
+      if (CR_POLY_IVARS && n && cr_is_poly(cr_ivar_type(g, n))) {
+        const char *uf = cr_unbox_fn(comp_ntype(g->c, id));
+        if (uf) { buf_printf(b, "%s(%s)", uf, n); return; }
+      }
       buf_puts(b, n ? n : "");
       return;
     }
@@ -3250,7 +3263,8 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       int val = nt_ref(g->nt, id, "value");
       cr_indent(b, indent);
       buf_printf(b, "%s = ", name ? name : "");
-      if (CR_POLY_BOXED && cr_is_poly(cr_ivar_type(g, name))) cr_emit_boxed(g, val, b);
+      if ((CR_POLY_BOXED || CR_POLY_IVARS) && cr_is_poly(cr_ivar_type(g, name)))
+        cr_emit_boxed(g, val, b);
       else cr_emit_expr(g, val, b);
       buf_puts(b, "\n");
       return;
@@ -3505,6 +3519,73 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
     buf_printf(b, "def %s(io : IO) : Nil\n  io << %s\nend\n", s->name, s->name);
 }
 
+/* True when every READ of instance variable `@name` is a shape the boxed
+   SpValue answers correctly for the value's run-time kind, so widening it to
+   SpValue cannot turn a working program into an "undefined method" build error.
+
+   The conservative rule: a read is UNSAFE iff it is the receiver of a call that
+   resolves to a concrete Crystal method on the value (not an operator, not a
+   name SpValue/SpObject answers, not a user method on a poly receiver). Every
+   other position -- returned, passed as an argument, indexed, compared, put,
+   interpolated, unboxed to the analyzer's narrowed kind -- lets the SpValue
+   travel or render, which the runtime handles. This refuses exactly the shapes
+   that would otherwise build-fail (`@units.abs` on an Integer, `@obj.foo`). */
+static int cr_call_on_concrete_value(CrGen *g, const char *pn) {
+  if (!pn) return 1;
+  if (sp_streq(pn, "to_s") || sp_streq(pn, "inspect") || sp_streq(pn, "nil?") ||
+      sp_streq(pn, "is_a?") || sp_streq(pn, "kind_of?") || sp_streq(pn, "instance_of?") ||
+      sp_streq(pn, "==") || sp_streq(pn, "!=") || sp_streq(pn, "!") ||
+      sp_streq(pn, "equal?") || sp_streq(pn, "hash") || sp_streq(pn, "class"))
+    return 0;                                   /* SpValue/SpObject answers these */
+  if (cr_is_binop(pn)) return 0;
+  if (sp_streq(pn, "[]")) return 0;   /* SpValue#[] has no arm for a container kind */
+  if (cr_user_method_ok(g, pn, TY_POLY, 0)) return 0;   /* sp_send arm */
+  return 1;                                     /* a concrete method: unsafe */
+}
+
+/* True when `id` appears as a `receiver` of some CallNode, and returns that
+   call's name via *out_name (only when it is a single such call). */
+static int cr_ivar_receiver_call(CrGen *g, int id, const char **out_name) {
+  for (int p = 0; p < g->nt->count; p++) {
+    if (nt_kind(g->nt, p) != NK_CallNode) continue;
+    if (nt_ref(g->nt, p, "receiver") != id) continue;
+    *out_name = nt_str(g->nt, p, "name");
+    return 1;
+  }
+  return 0;
+}
+
+static int cr_ivar_reads_safe(CrGen *g, ClassInfo *ci, const char *name) {
+  /* A generated/attr writer (`def b=(v); @b = v; end`) assigns the widened ivar
+     directly, bypassing the boxing write path, so the slot would receive a raw
+     value and build-fail. Refuse the ivar if the class exposes such a writer. */
+  const char *base = name && name[0] == '@' ? name + 1 : name;
+  for (int w = 0; w < ci->nwriters; w++)
+    if (ci->writers[w] && base && sp_streq(ci->writers[w], base)) return 0;
+  /* Refuse if any POLY value in the program -- this ivar's read, or a poly
+     parameter/local -- is the receiver of a concrete method Crystal cannot
+     resolve. Widening the ivar can be the first thing that lets such a program
+     emit, and then that unrelated gap becomes a BUILDFAIL in place of the honest
+     ivar refusal. Refusing here keeps the diagnostic at the real cause. */
+  for (int id = 0; id < g->nt->count; id++) {
+    NodeKind k = nt_kind(g->nt, id);
+    if (k == NK_InstanceVariableReadNode) {
+      const char *rn = nt_str(g->nt, id, "name");
+      if (!rn || !sp_streq(rn, name)) continue;
+      if (cr_unbox_fn(comp_ntype(g->c, id))) continue;   /* narrows -> unboxed */
+    } else if (k != NK_LocalVariableReadNode) {
+      continue;
+    }
+    TyKind t = comp_ntype(g->c, id);
+    if (!cr_is_poly(t)) continue;
+    if (cr_unbox_fn(t)) continue;
+    const char *pn = NULL;
+    if (cr_ivar_receiver_call(g, id, &pn) && cr_call_on_concrete_value(g, pn))
+      return 0;
+  }
+  return 1;
+}
+
 /* ---- classes ---- */
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   g->nclasses++;
@@ -3520,11 +3601,48 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      annotation: a bare `@d` in a class body parses as a read, not a declaration,
      and is rejected as an instance variable at the top level. An ivar whose type
      the inference left poly has no annotation to write, so refuse it. */
+  /* Crystal requires every declared ivar to be assigned directly in each
+     `initialize`, else the class fails to compile ("not initialized in all of
+     the 'initialize' methods, rendering it nilable"). A class whose ivar is
+     assigned only outside `initialize` -- or a class with no `initialize` -- has
+     no such assignment, so emit a synthesized `initialize` that seeds each ivar
+     to nil and declare it nilable (`T?`). `uninitialized T` would compile but
+     leave a reference ivar unreadable (a later read that Ruby answers nil
+     segfaults), so nil is the only safe seed. */
+  int has_init = 0;
+  if (!is_module && ci->def_node >= 0) {
+    const char *cty = nt_type(g->nt, ci->def_node);
+    int cbody0 = -1;
+    if (cty && (sp_streq(cty, "ClassNode") || sp_streq(cty, "ModuleNode")))
+      cbody0 = nt_ref(g->nt, ci->def_node, "body");
+    if (cbody0 >= 0) {
+      int nn = 0; const int *aa = nt_arr(g->nt, cbody0, "body", &nn);
+      for (int i = 0; i < nn; i++)
+        if (nt_kind(g->nt, aa[i]) == NK_DefNode &&
+            sp_streq(nt_str(g->nt, aa[i], "name") ? nt_str(g->nt, aa[i], "name") : "", "initialize"))
+          has_init = 1;
+    }
+  }
+  int synth_init = !is_module && !ci->is_struct && !has_init && ci->nivars > 0;
+
   int all_ivars_typed = 1;
   if (!is_module)
     for (int i = 0; i < ci->nivars; i++) {
       Buf tmp; memset(&tmp, 0, sizeof tmp);
-      if (!cr_map_type(g, ci->ivar_types[i], &tmp)) {
+      if (cr_map_type(g, ci->ivar_types[i], &tmp)) {
+        /* A synthesized initialize seeds the ivar nil, so it is nilable; a
+           defined initialize assigns it directly and keeps the concrete type. */
+        buf_printf(b, "  %s : %s%s\n", ci->ivars[i], tmp.p, synth_init ? "?" : "");
+        free(tmp.p);
+      } else if (CR_POLY_IVARS && cr_is_poly(ci->ivar_types[i]) && !has_init &&
+                 cr_ivar_reads_safe(g, ci, ci->ivars[i])) {
+        /* A widened ivar is the boxed runtime value; every write boxes through
+           `sp_box` (see the ivar-write path) and a concrete read unboxes back
+           (the ivar-read path). The value flows boxed everywhere it is only
+           forwarded, which is the dominant shape. */
+        buf_printf(b, "  %s : SpValue%s\n", ci->ivars[i], synth_init ? "?" : "");
+        free(tmp.p);
+      } else {
         free(tmp.p);
         all_ivars_typed = 0;
         cr_mark_unsupported(g, ci->def_node,
@@ -3532,9 +3650,28 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
                             "requires a declared ivar type and has no untyped type");
         continue;
       }
-      buf_printf(b, "  %s : %s\n", ci->ivars[i], tmp.p);
-      free(tmp.p);
     }
+
+  if (synth_init) {
+    int any = 0;
+    for (int i = 0; i < ci->nivars; i++) {
+      Buf tmp; memset(&tmp, 0, sizeof tmp);
+      int concrete = cr_map_type(g, ci->ivar_types[i], &tmp);
+      free(tmp.p);
+      if (concrete || (CR_POLY_IVARS && cr_is_poly(ci->ivar_types[i]))) any = 1;
+    }
+    if (any) {
+      buf_puts(b, "  def initialize\n");
+      for (int i = 0; i < ci->nivars; i++) {
+        Buf tmp; memset(&tmp, 0, sizeof tmp);
+        int concrete = cr_map_type(g, ci->ivar_types[i], &tmp);
+        free(tmp.p);
+        if (concrete || (CR_POLY_IVARS && cr_is_poly(ci->ivar_types[i])))
+          buf_printf(b, "    %s = nil\n", ci->ivars[i]);
+      }
+      buf_puts(b, "  end\n");
+    }
+  }
 
   /* A Struct.new(:a, :b) has no user `initialize`: the constructor takes the
      members positionally and assigns them. Emit it as a Crystal

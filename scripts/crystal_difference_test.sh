@@ -256,6 +256,23 @@ expect_agree "with_index_each_returns_receiver" 'r = [7, 8].each.with_index { |x
 p r'
 expect_agree "with_index_to_a" 'p [10, 20].each.with_index(1).to_a'
 expect_agree "sort_by_with_index" 'p ["b", "aa", "a"].sort_by.with_index { |w, i| [w.length, i] }'
+# P22e: a widened (poly) instance variable is boxed as SpValue. A read that Ruby
+# answers nil before any write does too, and puts/interpolation render the run
+# time kind like CRuby.
+expect_agree "poly_ivar_stores" 'class C
+  def set_int; @x = 42; end
+  def set_str; @x = "hi"; end
+  def show; puts @x; end
+end
+c = C.new
+c.set_int; c.show
+c.set_str; c.show'
+expect_agree "poly_ivar_unset_reads_nil" 'class C
+  def x; @x; end
+  def y_nilp; @y.nil?; end
+end
+p C.new.x
+p C.new.y_nilp'
 # P21.1: Ruby extends a short array on `a[i] = v`; Crystal's []= raises, so an
 # index write whose value disagrees with the pinned element type is refused
 # (it would otherwise emit Array(Int64) that the String cannot be stored into).

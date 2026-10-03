@@ -399,6 +399,48 @@ the element is an Array and `Nil` when a scalar is bound to the first param, so
 `[1, [5], [2, 3]]`, which `yields[0] == TY_ARRAY` distinguishes before the
 element collapses to `TY_POLY` — are decidable, and none is in the corpus.
 
+**P22e — boxed instance variables (landed).** A widened (poly) instance variable
+is the other slot the P22b evidence points at. Unlike a *local* — where Crystal's
+own union already resolves the methods, which is why boxing a local was
+net-negative — an ivar must be **declared**, and a poly one has no Crystal
+spelling, so it was a hard refusal (511 corpus programs, the single largest
+bucket). P22e declares it `SpValue`, boxes every write through `sp_box`, and
+unboxes a read the analyzer narrowed to a concrete scalar.
+
+Two things had to be made safe, and their safety is what keeps the refusals
+honest rather than trading them for build errors:
+
+- **A synthesized `initialize` seeds the ivar nil and the declaration becomes
+  nilable (`T?`).** Crystal refuses to compile a class whose declared ivar is not
+  assigned in its `initialize` ("rendering it nilable"); a class that only
+  assigns it elsewhere (or has no `initialize`) therefore needs the seed. The
+  seed must be `nil`, not `uninitialized T`: a read-before-write that Ruby
+  answers `nil` would otherwise read a garbage reference and *segfault*
+  (`test/uninit_ivar_returns_nil` pins it). The synthesized `initialize` is
+  emitted only when the class has none, so a user `initialize` is never
+  shadowed.
+- **The ivar is widened only when every read is a shape `SpValue` answers.**
+  `cr_ivar_reads_safe` refuses the ivar when a read is the receiver of a
+  concrete Crystal method the runtime has no arm for (`@units.abs` on an
+  Integer), when the class exposes an `attr_accessor` writer that would assign
+  the raw value past the boxing path, or when some *other* poly value in the
+  program (a poly parameter) already has such a call — because widening the ivar
+  can be the first thing that lets that program emit, and refusing here keeps the
+  diagnostic at the real cause instead of turning an honest ivar refusal into a
+  `map`/`gsub` build error.
+
+**Measured effect (P22e).** **+7 PASS, +2 DIFF, −7 BUILDFAIL, −11 REFUSED**, zero
+PASS regressions, and **no REFUSED→BUILDFAIL trade**: every changed program moved
+REFUSED or BUILDFAIL to PASS (or DIFF), because the read-safety gate refuses
+exactly the programs that would otherwise build-fail. The four bucket programs
+that became PASS are `array_new_poly_size`, `ivar_ternary_mixed`,
+`param_inference_if_predicate`, `uninit_ivar_returns_nil`, `void_value_begin_writer_tail`
+and `void_value_if_writer_arm`; `map_to_heap_objects` moves BUILDFAIL → PASS. The
+two DIFFs (`map_untyped_block_result`, `send_setter_returns_method_value`) are a
+lazy-`map` rendering and a setter-return difference, both separate gaps now
+visible instead of hidden. The remaining ~500 programs in the bucket each have an
+unsafe read or writer and keep their refusal.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -481,14 +523,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | **P22d (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | **646** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | **333** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | **51** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | **262** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | **3752** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | **P22e (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | 646 | **648** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | 333 | **340** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | 51 | **53** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | 262 | **260** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | 3752 | **3745** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -536,7 +578,8 @@ and, on two other programs, unblocks the rest of a file whose remaining code
 touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
-two gaps.
+two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)).
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further

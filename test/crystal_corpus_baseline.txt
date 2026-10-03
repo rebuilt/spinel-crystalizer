@@ -111,7 +111,7 @@ REFUSED   test_array_new_bare_receiver
 PASS     test_array_new_block_nested_int_table
 REFUSED   test_array_new_block_strbuf_local
 REFUSED   test_array_new_container_default
-REFUSED   test_array_new_poly_size
+PASS     test_array_new_poly_size
 REFUSED   test_array_object_id
 REFUSED   test_array_op_assign_concat
 REFUSED   test_array_op_assign_reads_slot_first
@@ -2372,7 +2372,7 @@ REFUSED   test_ivar_table_appended_row
 REFUSED   test_ivar_table_boxed_row_store
 REFUSED   test_ivar_table_late_typed_row_store
 REFUSED   test_ivar_tail_write_return
-REFUSED   test_ivar_ternary_mixed
+PASS     test_ivar_ternary_mixed
 REFUSED   test_ivar_type_per_owning_class
 REFUSED   test_ivar_widen_poly_writer
 REFUSED   test_join_separator_slot
@@ -2519,9 +2519,9 @@ REFUSED   test_mapped_array_mutable_elements
 REFUSED   test_map_recv_emitted_once
 REFUSED   test_map_result_widened_by_composition
 REFUSED   test_map_shadowed_param_poly_arg
-BUILDFAIL test_map_to_heap_objects
+PASS     test_map_to_heap_objects
 PASS     test_map_to_value_type_objects
-REFUSED   test_map_untyped_block_result
+DIFF     test_map_untyped_block_result
 REFUSED   test_marshal_io_stream
 REFUSED   test_marshal_roundtrip
 REFUSED   test_marshal_symlink_float
@@ -2878,7 +2878,7 @@ REFUSED   test_param_body_hash_inference
 REFUSED   test_param_container_foreign_writes
 REFUSED   test_param_default_references_sibling
 REFUSED   test_param_include_body_widen
-REFUSED   test_param_inference_if_predicate
+PASS     test_param_inference_if_predicate
 REFUSED   test_param_lengthlike_body_widen
 PASS     test_param_narrow_from_body_call
 REFUSED   test_param_nil_default_narrowed
@@ -3693,7 +3693,7 @@ PASS     test_send_literal_and_user
 REFUSED   test_send_name_from_container_local
 REFUSED   test_send_name_from_container
 REFUSED   test_send_reaches_toplevel_def
-BUILDFAIL test_send_setter_returns_method_value
+DIFF     test_send_setter_returns_method_value
 REFUSED   test_send_traceable_name
 REFUSED   test_set_algebra_operand_enum
 REFUSED   test_set_basic
@@ -4260,7 +4260,7 @@ REFUSED   test_undefined_constant_warns
 REFUSED   test_undef_method_raises
 REFUSED   test_unicode_case_latin1
 REFUSED   test_uninit_const_raises_nameerror
-REFUSED   test_uninit_ivar_returns_nil
+PASS     test_uninit_ivar_returns_nil
 REFUSED   test_uniq_block
 REFUSED   test_uniq_user_eql_hash
 REFUSED   test_unless_return_path_hash
@@ -4327,10 +4327,10 @@ REFUSED   test_virtual_dispatch_void_override_empty_base
 REFUSED   test_virtual_dispatch_void_override
 REFUSED   test_visibility_explicit_receiver
 REFUSED   test_void_value_and_case
-REFUSED   test_void_value_begin_writer_tail
+PASS     test_void_value_begin_writer_tail
 REFUSED   test_void_value_case_writer_arm
 REFUSED   test_void_value_hash_store_nil
-REFUSED   test_void_value_if_writer_arm
+PASS     test_void_value_if_writer_arm
 PASS     test_void_value_in_value_position
 PASS     test_volatile_strip_skips_coerced_arg
 REFUSED   test_waitpid_thread_drains_pipe
