@@ -152,7 +152,7 @@ The emitter maps Spinel's inferred `TyKind` onto Crystal types:
 | `TY_STR_INT_HASH`, … | `Hash(String, Int64)`, … |
 | user class `i` | the class name (emitted as a Crystal `class`) |
 | `TY_POLY` | `SpValue` (the boxed runtime value) — with `CR_POLY_BOXED` (P22); non-concrete otherwise |
-| `TY_POLY_ARRAY` | `Array(SpValue)` for an empty `[]` pinned by heterogeneous scalar pushes (P21); no expression spelling otherwise |
+| `TY_POLY_ARRAY` | `Array(SpValue)` for an empty `[]` pinned by heterogeneous pushes (P21 scalars; P22 user objects/containers via `SpBox`); no expression spelling otherwise |
 | `TY_POLY_POLY_HASH` | `Hash(SpValue, SpValue)` — with `CR_POLY_BOXED` (P22); not created in P21 |
 | `TY_UNKNOWN` | no spelling: not inferred / unsupported, counted as a metric |
 
@@ -322,6 +322,31 @@ operand overloads, metaclass/container `sp_box`) remain. The evidence points to
 boxing at widened **boundaries** (a parameter, a container element) rather than
 at the local slot.
 
+**P22c — boxed container elements (landed).** The first boundary the evidence
+points at is the container element. With the `SpBox` wrapper in place, the
+empty-`[]` pin now widens a heterogeneous array whose non-scalar elements have an
+`sp_box` overload: a user object (its per-class overload from P22a) or a stdlib
+container (`Array`/`Hash`/`Range`). Each push boxes through `cr_emit_boxed`, and
+the array's `inspect`/`to_s` forward through `SpValue` → `SpBox` → the wrapped
+value, so `p a` renders like CRuby's (`[1, [5]]`, or `[1, Foo(2)]` for a class
+with a defined `inspect`). `cr_boxable_elem` is the gate: an element with no
+overload — BigInt is the common case, since it has no Crystal spelling in the
+boxed runtime — keeps the honest refusal, now naming the element's kind
+(`a heterogeneous array whose element has no boxed representation (bigint)`).
+
+The widening is regression-safe **by construction**: it only fires on an empty
+`[]` literal whose pushes were previously refused, so no PASS program can
+change. Three corpus programs newly emit. `poly_array_range_aref` becomes **PASS**
+— its `[5]` container element boxes and the range-slice reads work on
+`Array(SpValue)` unchanged. The other two expose pre-existing emitter gaps the
+refusal had hidden: `block_autosplat` reaches a short-array auto-splat
+(`a, b, c = ["p", 1]`), which raises `IndexError` in Crystal where Ruby nil-fills
+the missing params, and `enum_with_index_value` reaches a `map.with_index` chain,
+which the emitter spells as a blockless `map` followed by `with_index` (a build
+error). Both are real gaps in the read/iterator surface, now visible instead of
+masked behind the array refusal; neither is caused by the boxing. Net **+1 PASS,
++1 DIFF, +1 BUILDFAIL, −3 REFUSED**, zero PASS regressions.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -404,14 +429,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | **P21 (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | **642** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | **327** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | **49** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | **266** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | **3756** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | **P22c (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | **645** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | **328** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | **50** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | **267** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | **3753** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -452,7 +477,11 @@ separately metrics-neutral (see [P20](#p20-the-boxed-value-runtime)); the
 `f1234994` honesty pass. P21 (see [P21](#p21-widened-scalar-arrays)) is
 **+0 PASS, +0 DIFF, −2 BUILDFAIL, +2 REFUSED** — the two BUILDFAILs whose
 heterogeneous array held a container element are now honest refusals at the
-offending push.
+offending push. P22c (see [P22](#p22-object-boxing-via-spbox)) is
+**+1 PASS, +1 DIFF, +1 BUILDFAIL, −3 REFUSED** — the widened array now accepts a
+boxable object/container element, which turns `poly_array_range_aref` into a PASS
+and, on two other programs, unblocks the rest of a file whose remaining code
+touches a pre-existing auto-splat / `with_index` gap (now visible).
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further

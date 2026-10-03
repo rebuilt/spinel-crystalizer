@@ -343,6 +343,41 @@ static int cr_is_scalar_elem(TyKind t) {
          t == TY_SYMBOL || t == TY_BOOL || t == TY_NIL;
 }
 
+/* An element kind that has an `sp_box` overload in the emitted runtime, so a
+   heterogeneous array holding it can be widened to Array(SpValue) and the
+   element boxed on the way in (P22). A scalar rides SpValue::Raw directly; a
+   user object hits its per-class overload (P22a); a stdlib container hits the
+   Array/Hash/Range overloads; a poly value is either already an SpValue
+   (identity) or a union of Raw members. Anything else -- BigInt, Regexp, Proc,
+   a bare unknown -- has no overload, so the array keeps the honest P21 refusal
+   rather than emitting a push that cannot resolve. */
+static int cr_boxable_elem(TyKind t) {
+  if (cr_is_scalar_elem(t)) return 1;
+  if (t == TY_POLY) return 1;
+  if (ty_is_object(t) || ty_is_obj_array(t)) return 1;
+  switch (t) {
+    case TY_INT_ARRAY:
+    case TY_FLOAT_ARRAY:
+    case TY_STR_ARRAY:
+    case TY_POLY_ARRAY:
+    case TY_INT_ARRAY_ARRAY:
+    case TY_FLOAT_ARRAY_ARRAY:
+    case TY_STR_INT_HASH:
+    case TY_STR_STR_HASH:
+    case TY_INT_INT_HASH:
+    case TY_INT_STR_HASH:
+    case TY_SYM_POLY_HASH:
+    case TY_STR_POLY_HASH:
+    case TY_POLY_POLY_HASH:
+    case TY_RANGE:
+    case TY_FLOAT_RANGE:
+    case TY_STR_RANGE:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 /* For an empty array literal whose element type the inference left poly (the
    common `a = []` then `a << x` inside a block), scan the writes to that
    variable and decide how to pin it. Scans the whole table -- fine for the PoC
@@ -356,14 +391,15 @@ static int cr_is_scalar_elem(TyKind t) {
    * homogeneous (every pushed element the same kind) -> *elem is that kind; the
      caller pins `Array(<elem>)` as before. A single object class pins to its
      name; a container element has no Crystal spelling and the caller refuses it.
-   * heterogeneous, every element a scalar -> *widen=1; the caller pins
-     `Array(SpValue)` and boxes each push on the way in. This is the P21
-     widening: scalars already live in SpValue's Raw union, so no wrapper is
-     needed.
-   * heterogeneous with any non-scalar element -> *refuse_id is that push's node
-     (the first one, in source order) and *refuse_kind its element kind; the
-     caller refuses there, because boxing an object/container into SpValue needs
-     SpBox/SpObject, which P21 does not emit.
+   * heterogeneous, every element boxable -> *widen=1; the caller pins
+     `Array(SpValue)` and boxes each push on the way in. A scalar already lives
+     in SpValue's Raw union (P21); a user object or a stdlib container is carried
+     by SpBox through the per-class / Array/Hash/Range `sp_box` overloads (P22).
+   * heterogeneous with an element that has no `sp_box` overload -> *refuse_id is
+     that push's node (the first one, in source order) and *refuse_kind its
+     element kind; the caller refuses there rather than emit a push that cannot
+     resolve. BigInt is the common case: it has no Crystal spelling in the boxed
+     runtime.
 
    Index writes (`a[i] = v`) are handled conservatively. Ruby extends a short
    array on assignment where Crystal's `[]=` raises, so a write is safe only when
@@ -379,7 +415,8 @@ static void cr_find_pushed_elem(CrGen *g, const char *varname,
                                 const char **refuse_why) {
   TyKind first = TY_UNKNOWN;
   int heterogeneous = 0, all_scalar = 1, npush = 0;
-  int nonscalar_id = -1; TyKind nonscalar_kind = TY_UNKNOWN;
+  int all_boxable = 1;
+  int unboxable_id = -1; TyKind unboxable_kind = TY_UNKNOWN;
 
   for (int id = 0; id < g->nt->count; id++) {
     if (nt_kind(g->nt, id) != NK_CallNode) continue;
@@ -393,9 +430,10 @@ static void cr_find_pushed_elem(CrGen *g, const char *varname,
     for (int a = 0; a < argc; a++) {
       TyKind et = comp_ntype(g->c, argv[a]);
       npush++;
-      if (!cr_is_scalar_elem(et)) {
-        all_scalar = 0;
-        if (nonscalar_id < 0) { nonscalar_id = id; nonscalar_kind = et; }
+      if (!cr_is_scalar_elem(et)) all_scalar = 0;
+      if (!cr_boxable_elem(et)) {
+        all_boxable = 0;
+        if (unboxable_id < 0) { unboxable_id = id; unboxable_kind = et; }
       }
       if (first == TY_UNKNOWN) first = et;
       else if (et != first) heterogeneous = 1;
@@ -428,14 +466,14 @@ static void cr_find_pushed_elem(CrGen *g, const char *varname,
   if (!CR_POLY_CONTAINERS || npush == 0) return;   /* pre-P21, or no push to pin from */
 
   if (heterogeneous) {
-    if (all_scalar && !has_aset) { *widen = 1; return; }   /* heterogeneous scalar -> widen */
-    if (all_scalar) {
-      *refuse_id = aset_id; *refuse_kind = aset_kind;
-      *refuse_why = "an index write to an array widened by scalar pushes";
+    if (!all_scalar && !all_boxable) {
+      *refuse_id = unboxable_id; *refuse_kind = unboxable_kind;
+      *refuse_why = "a heterogeneous array whose element has no boxed representation";
       return;
     }
-    *refuse_id = nonscalar_id; *refuse_kind = nonscalar_kind;
-    *refuse_why = "a heterogeneous array whose element is a user object or container";
+    if (!has_aset) { *widen = 1; return; }   /* heterogeneous (boxable) -> widen */
+    *refuse_id = aset_id; *refuse_kind = aset_kind;
+    *refuse_why = "an index write to an array widened by heterogeneous pushes";
     return;
   }
   if (has_aset && aset_disagrees) {

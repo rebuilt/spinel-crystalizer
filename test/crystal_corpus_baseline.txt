@@ -269,7 +269,7 @@ REFUSED   test_block_arg_poly_symbol
 REFUSED   test_block_arg_poly_value
 REFUSED   test_block_autosplat_collectors
 REFUSED   test_block_autosplat_minmax_group
-REFUSED   test_block_autosplat
+DIFF     test_block_autosplat
 REFUSED   test_block_body_rescue
 REFUSED   test_block_call_arity
 REFUSED   test_block_call_multi_arg_first
@@ -1149,7 +1149,7 @@ REFUSED   test_enum_reverse_each_chain
 REFUSED   test_enum_terminal_chunk_zip_lazy
 REFUSED   test_enum_with_index_map
 REFUSED   test_enum_with_index_source_root
-REFUSED   test_enum_with_index_value
+BUILDFAIL test_enum_with_index_value
 REFUSED   test_enum_with_object
 REFUSED   test_env_fetch_default_value
 REFUSED   test_env_full_surface
@@ -2938,7 +2938,7 @@ REFUSED   test_poly_array_plus_assign_boxed
 REFUSED   test_poly_array_plus_concat
 REFUSED   test_poly_array_pop_under_user_name
 BUILDFAIL test_poly_array_push_with_user_push
-REFUSED   test_poly_array_range_aref
+PASS     test_poly_array_range_aref
 DIFF     test_poly_array_readers
 REFUSED   test_poly_array_rindex_combination_block
 REFUSED   test_poly_array_set_eql

@@ -222,13 +222,28 @@ expect_refuse "BackReferenceReadNode"            '"a" =~ /a/; p $&'
 # identity, so we refuse it rather than emit a reference class that would answer
 # `==` wrong. (A plain Struct.new is a reference type and IS translated.)
 expect_refuse "the constant 'Data'"              'D = Data.define(:a); p D.new(1) == D.new(1)'
-# P21: a heterogeneous array whose element is a user object cannot ride SpValue's
-# scalar union (that needs SpBox/SpObject, deferred to P22), so it is refused at
-# the first such push rather than emitted as an Array(SpValue) that build-fails.
-expect_refuse "a heterogeneous array whose element is a user object or container" 'class Foo; end
+# P22: a heterogeneous array whose element is a user object or a stdlib container
+# is widened to Array(SpValue) and the element boxed through SpBox; the wrapped
+# object's inspect forwards, so the rendering matches CRuby's.
+expect_agree "poly_object_array" 'class Foo
+  def initialize(n); @n = n; end
+  def inspect; "Foo(#{@n})"; end
+end
 a = []
 a << 1
-a << Foo.new
+a << Foo.new(2)
+p a'
+
+expect_agree "poly_container_array" 'a = []
+a << 1
+a << [5]
+p a'
+# P22: an element with no `sp_box` overload -- a Bignum has no Crystal spelling
+# here -- keeps the honest refusal rather than emitting a push that cannot
+# resolve. The message names the element's kind.
+expect_refuse "a heterogeneous array whose element has no boxed representation" 'a = []
+a << 1
+a << 2**100
 p a'
 # P21.1: Ruby extends a short array on `a[i] = v`; Crystal's []= raises, so an
 # index write whose value disagrees with the pinned element type is refused
