@@ -1304,8 +1304,10 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
       "ancestors", "superclass", "subclasses", "method_defined?",
       "const_defined?", "const_get", "const_set", "instance_method",
       "singleton_class?", "instance_methods", "public_instance_methods",
+      "private_instance_methods", "protected_instance_methods",
+      "public_method_defined?", "private_method_defined?", "protected_method_defined?",
       "const_source_location", "define_method", "module_eval", "class_eval",
-      "constants", NULL,
+      "constants", "respond_to?", "include?", "prepend", "include_modules", NULL,
     };
     for (int i = 0; refl[i]; i++)
       if (sp_streq(name, refl[i]))
@@ -2392,15 +2394,27 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   }
 
   /* Crystal's is_a? / kind_of? / instance_of? take a TYPE, so a variable holding
-     a class has no Crystal form (a constant is emitted as-is). */
+     a class has no Crystal form (a constant is emitted as-is). A constant naming
+     a MODULE is also refused: Crystal's `is_a?` against a mixin is not Ruby's
+     `is_a?` against the module (a value whose class merely includes it answers
+     false), so the two are not interchangeable. */
   if (recv >= 0 &&
-      (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?")) &&
-      (argc != 1 || (nt_kind(g->nt, argv[0]) != NK_ConstantReadNode &&
-                     nt_kind(g->nt, argv[0]) != NK_ConstantPathNode))) {
-    cr_mark_unsupported(g, id, "is_a?/kind_of?/instance_of? with a runtime class "
-                              "value (Crystal takes a type)");
-    buf_puts(b, "nil");
-    return;
+      (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?"))) {
+    int is_const_arg = argc == 1 &&
+                       (nt_kind(g->nt, argv[0]) == NK_ConstantReadNode ||
+                        nt_kind(g->nt, argv[0]) == NK_ConstantPathNode);
+    int bad = !is_const_arg;   /* a runtime class value has no type form */
+    if (is_const_arg) {
+      const char *cn = nt_str(g->nt, argv[0], "name");
+      int ci = cn ? comp_class_index(g->c, cn) : -1;
+      if (ci >= 0 && comp_class_is_module(g->c, &g->c->classes[ci])) bad = 1;
+    }
+    if (bad) {
+      cr_mark_unsupported(g, id, "is_a?/kind_of?/instance_of? with a runtime class "
+                                "value or a module (Crystal takes a type)");
+      buf_puts(b, "nil");
+      return;
+    }
   }
 
   /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
@@ -3586,6 +3600,129 @@ static int cr_ivar_reads_safe(CrGen *g, ClassInfo *ci, const char *name) {
   return 1;
 }
 
+/* `module_function`, `private`/`public`/`protected`, and `extend`: declaration-
+   only class/module-body statements. Bare, or with symbol arguments (a named
+   method list); the modifier forms (`private def m`, `module_function def m`) are
+   separate DefNodes the analyzer has already marked. Anything with a non-symbol,
+   non-`self` argument is NOT a plain marker and is refused by the caller. */
+static int cr_visibility_decl(CrGen *g, int id) {
+  const char *nm = nt_str(g->nt, id, "name");
+  if (!nm) return 0;
+  int is_vis = sp_streq(nm, "module_function") || sp_streq(nm, "private") ||
+               sp_streq(nm, "public") || sp_streq(nm, "protected") ||
+               sp_streq(nm, "extend");
+  if (!is_vis) return 0;
+  if (nt_ref(g->nt, id, "receiver") >= 0) return 0;
+  int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+  if (argc == 0) return 1;
+  for (int i = 0; i < argc; i++) {
+    NodeKind k = nt_kind(g->nt, argv[i]);
+    /* `module_function :named` / `private :x, :y` list method names. */
+    if (k == NK_SymbolNode) continue;
+    /* `extend self` names the receiver itself. */
+    if (sp_streq(nm, "extend") && k == NK_SelfNode) continue;
+    return 0;
+  }
+  return 1;
+}
+
+/* True when a top-level/module `module M` or `class M` body for the same
+   constant name appears more than once in the program. Crystal resolves an
+   `include M` at the point it is written, so a module whose methods are added
+   by a LATER reopen is not seen by an earlier includer -- the include would
+   silently drop those methods. Such an include is refused rather than
+   mistranslated. */
+static int cr_name_reopened(CrGen *g, const char *name) {
+  if (!name) return 0;
+  int seen = 0;
+  for (int id = 0; id < g->nt->count; id++) {
+    NodeKind k = nt_kind(g->nt, id);
+    if (k != NK_ClassNode && k != NK_ModuleNode) continue;
+    int cp = nt_ref(g->nt, id, "constant_path");
+    if (cp < 0) continue;
+    const char *cn = nt_str(g->nt, cp, "name");
+    if (cn && sp_streq(cn, name)) { if (++seen > 1) return 1; }
+  }
+  return 0;
+}
+
+/* `include M` where M is a module the program defines: emit it so Crystal's own
+   mixin makes the module's methods available to the includer (the emitter does
+   NOT transplant them). A builtin mixin (`Comparable`, `Enumerable`, `Kernel`,
+   `Math`, `Forwardable`, ...) is skipped instead: Crystal's versions need a type
+   argument or have a different method surface, and the analyzer has already
+   resolved the calls. Returns 1 when the statement was consumed. */
+static int cr_include_decl(CrGen *g, int id, Buf *b) {
+  const char *nm = nt_str(g->nt, id, "name");
+  if (!nm || !sp_streq(nm, "include")) return 0;
+  if (nt_ref(g->nt, id, "receiver") >= 0) return 0;
+  int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+  if (argc == 0) return 0;
+  int emitted = 0;
+  for (int i = 0; i < argc; i++) {
+    NodeKind k = nt_kind(g->nt, argv[i]);
+    if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return 0;
+    /* A constant-path include (`include A::B`) names the module through a
+       parent chain; the leaf alone is ambiguous with a same-named top-level
+       module, and the analyzer's transplant used the flat `A_B` name. Emitting
+       the leaf would include the wrong type (or none), so refuse it rather than
+       mistranslate. */
+    if (k == NK_ConstantPathNode) return 0;
+    const char *mn = nt_str(g->nt, argv[i], "name");
+    int mod = mn ? comp_class_index(g->c, mn) : -1;
+    /* a user module: emit the include so Crystal mixes its methods in. Its
+       methods must all be defined before the include textually; a module the
+       program reopens later would lose them, so refuse that (see above). */
+    if (mod >= 0) {
+      if (cr_name_reopened(g, g->c->classes[mod].name)) {
+        if (emitted) buf_puts(b, "\n");
+        return 0;
+      }
+      if (!emitted) { cr_indent(b, 1); buf_puts(b, "include "); emitted = 1; }
+      else buf_puts(b, ", ");
+      buf_puts(b, g->c->classes[mod].name);
+      continue;
+    }
+    /* `Kernel`/`Math` are always present in Crystal and the analyzer resolved
+       their calls, so the marker is a no-op; skip it. Any OTHER builtin has a
+       Crystal surface that differs from Ruby's, so refuse rather than emit or
+       drop it silently. */
+    if (mn && (sp_streq(mn, "Kernel") || sp_streq(mn, "Math"))) continue;
+    if (emitted) buf_puts(b, "\n");
+    return 0;
+  }
+  if (emitted) buf_puts(b, "\n");
+  return 1;
+}
+
+/* True when module `ci` has a `module_function` method whose body reads or
+   writes an instance variable, and the module is included by some class. CRuby
+   runs such a method on the INCLUDER's instance, so `@x` is the instance's ivar
+   and `self` is the instance; Spinel registers the method class-level, so
+   emitting it would read a module-owned slot instead. Crystal rejects the ivar
+   in a module method outright ("@instance_vars are not yet allowed in
+   metaclasses"), so this is refused rather than mistranslated. */
+static int cr_module_function_self_dependent(CrGen *g, ClassInfo *ci, int is_module) {
+  if (!ci || !is_module) return 0;
+  int mod = (int)(ci - g->c->classes);
+  int included = 0;
+  for (int k = 0; k < g->c->nclasses && !included; k++)
+    for (int m = 0; m < g->c->classes[k].nincluded_mods; m++)
+      if (g->c->classes[k].included_mods[m] == mod) { included = 1; break; }
+  if (!included) return 0;
+  for (int s = 1; s < g->c->nscopes; s++) {
+    Scope *sc = &g->c->scopes[s];
+    if (sc->class_id != mod || !sc->is_module_function || sc->def_node < 0) continue;
+    for (int id = 0; id < g->nt->count; id++) {
+      NodeKind k = nt_kind(g->nt, id);
+      if (k != NK_InstanceVariableReadNode && k != NK_InstanceVariableWriteNode &&
+          k != NK_InstanceVariableOperatorWriteNode) continue;
+      if (comp_scope_of(g->c, id) == sc) return 1;
+    }
+  }
+  return 0;
+}
+
 /* ---- classes ---- */
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   g->nclasses++;
@@ -3595,8 +3732,27 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      inference on value-in-collection dispatch (test_poly_return_value_class /
      test_cls_value_in_collection_dispatch). P22 reintroduces it together with the
      callee-body work that makes a boxed object actually dispatch. */
+  /* A user class whose name is a Crystal stdlib generic (`Box`, `Tuple`,
+     `Array`, `Set`, `Range`, `Proc`, ...) collides: Crystal auto-parameterizes
+     the reference or rejects the definition outright ("Tuple is not a class"),
+     and the emitted file fails with a message about the stdlib type. Name the
+     collision at the class so the diagnostic points here rather than there. A
+     module name is safe (`module Box` is a plain module). */
+  if (!is_module) {
+    static const char *const CR_STDLIB_GENERICS[] = {
+      "Box", "Tuple", "StaticArray", "Pointer", "Slice", "Array", "Hash",
+      "Set", "Deque", "Channel", "Proc", "Iterator", "Range", "Comparable",
+      "Enumerable", "Indexable", "Iterable", "Union", "NamedTuple", "Regex",
+      "Time", "Mutex", "Fiber", "Thread", "Exception", NULL };
+    for (int i = 0; CR_STDLIB_GENERICS[i]; i++)
+      if (sp_streq(ci->name, CR_STDLIB_GENERICS[i])) {
+        char why[160];
+        snprintf(why, sizeof why, "a class named '%s' (a Crystal stdlib type of "
+                 "the same name is a generic and cannot be reopened)", ci->name);
+        cr_mark_unsupported(g, ci->def_node, why);
+      }
+  }
   buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
-
   /* typed ivar declarations (classes only; modules carry none). Crystal needs the
      annotation: a bare `@d` in a class body parses as a read, not a declaration,
      and is rejected as an instance variable at the top level. An ivar whose type
@@ -3838,6 +3994,29 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
                   sp_streq(nt_str(g->nt, arr[i], "name"), "attr_writer") ||
                   sp_streq(nt_str(g->nt, arr[i], "name"), "attr_accessor"))) {
         continue;   /* resolved into ci->readers/writers, emitted below */
+      } else if (kk == NK_CallNode && cr_visibility_decl(g, arr[i])) {
+        /* `module_function`, `private`/`public`/`protected` (bare or listing
+           symbols), and `extend self`/`extend M`: declaration-only statements
+           whose effect the analyzer already captured (is_module_function,
+           include membership, method resolution). Crystal does not need the
+           marker for a method to be callable, and its own `private`/`module_function`
+           have different scoping, so skip the statement rather than mistranslate
+           it. A `private_constant`/`protected` with a non-symbol argument, or any
+           other call, is still refused below. */
+        if (is_module && cr_module_function_self_dependent(g, ci, is_module))
+          cr_mark_unsupported(g, arr[i],
+                              "a module_function method that reads or writes an "
+                              "instance variable on a module an includer mixes in "
+                              "(CRuby runs it on the instance, Crystal on the module)");
+        continue;
+      } else if (kk == NK_CallNode && cr_include_decl(g, arr[i], b)) {
+        /* `include M` / `include M, N`: Crystal's own `include` mixin needs the
+           module's methods to already be Crystal type members, and a builtin
+           mixin like Comparable needs a type argument (`Comparable(T)`) that
+           changes its method surface. The analyzer has already transplanted the
+           module's methods into this class, so the statement itself is skipped
+           -- the marker was the analysis input, not an emitted behaviour. */
+        continue;
       } else {
         /* Any other statement (a call with side effects, a local write, ...) runs
            at definition time in Ruby. The two-pass emission hoists types before

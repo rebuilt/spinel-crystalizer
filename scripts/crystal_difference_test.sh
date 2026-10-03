@@ -273,6 +273,26 @@ expect_agree "poly_ivar_unset_reads_nil" 'class C
 end
 p C.new.x
 p C.new.y_nilp'
+# P22f: `include M` of a user module is emitted (Crystal mixes its methods in);
+# `module_function`/`private` and other declaration-only markers are skipped,
+# since the analyzer already captured their effect.
+expect_agree "include_user_module" 'module Greet
+  def hi; "hi"; end
+end
+class C
+  include Greet
+end
+p C.new.hi'
+expect_agree "module_function" 'module M
+  module_function
+  def twice(n); n * 2; end
+end
+p M.twice(3)'
+# P22f: a user class named like a Crystal stdlib generic cannot be reopened there.
+expect_refuse "a class named 'Box' (a Crystal stdlib type" 'class Box
+  def initialize(n); @n = n; end
+end
+p Box.new(1)'
 # P21.1: Ruby extends a short array on `a[i] = v`; Crystal's []= raises, so an
 # index write whose value disagrees with the pinned element type is refused
 # (it would otherwise emit Array(Int64) that the String cannot be stored into).

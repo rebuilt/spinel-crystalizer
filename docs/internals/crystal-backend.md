@@ -441,6 +441,49 @@ lazy-`map` rendering and a setter-return difference, both separate gaps now
 visible instead of hidden. The remaining ~500 programs in the bucket each have an
 unsafe read or writer and keep their refusal.
 
+**P22f — class/module-body declarations (landed).** The second-largest refusal
+bucket (288 programs) was "a side-effecting statement in a class/module body":
+any non-`def` statement in a class body was refused, because the two-pass
+emitter hoists types before top-level code and a genuine side effect would run out
+of order. But three groups of statements have **no emitted effect**, so skipping
+them is safe and exact:
+
+- **`module_function`, `private`/`public`/`protected`** (bare, or listing
+  symbols, plus the modifier forms the analyzer has already marked): a method is
+  callable in Crystal without the marker, and the analyzer has already recorded
+  `is_module_function` and resolved the calls. Crystal's own `module_function`/
+  `private` have different scoping, so emitting the marker would mistranslate.
+- **`include M` of a user module**: emitted, because Crystal's mixin is what
+  makes the module's methods available (the emitter does **not** transplant them).
+  A builtin mixin (`Comparable`, `Enumerable`, `Forwardable`, ...) is *refused*:
+  Crystal's `Comparable` needs a type argument and drops `between?`, and
+  `Enumerable` changes the method set, so neither emitting nor dropping the
+  marker is behaviour-preserving. `Kernel`/`Math` are always present and their
+  calls already resolved, so those are skipped.
+- **`extend self` / `extend M`**: skipped, same reason as visibility markers.
+
+Three guards keep the bucket's refusals honest rather than trading them for build
+errors: an include of a **reopened** module is refused (Crystal resolves the
+mix-in at the include, so a module whose methods are added later would silently
+lose them); a **constant-path** include (`include A::B`) is refused (the leaf
+name is ambiguous); and a `module_function` method that touches an ivar on a
+module an includer mixes in is refused (CRuby runs it on the instance, Crystal
+on the module).
+
+The same pass fixed two pre-existing gaps the unblocked programs exposed. A user
+class named like a **Crystal stdlib generic** (`Box`, `Tuple`, `Array`, `Set`,
+`Range`, `Proc`, ...) cannot be reopened there — Crystal auto-parameterizes the
+reference or rejects it ("Tuple is not a class") — so it is now a line-anchored
+refusal. And `respond_to?`/`include?`/`instance_methods`-family calls on a
+**class-object** receiver joined the reflection table, turning 8 BUILDFAILs into
+honest refusals.
+
+**Measured effect (P22f).** **+8 PASS, +0 DIFF, −16 BUILDFAIL, −8 REFUSED**, zero
+PASS regressions, and no REFUSED→BUILDFAIL trade: 8 REFUSED → PASS and 8
+BUILDFAIL → REFUSED. `include_nested_module`, `include_chain_module_nested_const`,
+`include_method_body_locals`, `mixin`, `mixin_to_s_inspect`, `module_extend_self`,
+`module_function_include` and `module_function_str_method_param` become PASS.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -523,14 +566,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | **P22e (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | 646 | **648** | emits Crystal at all (the rest refuse) |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | 333 | **340** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | 51 | **53** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | 262 | **260** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | 3752 | **3745** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | P22e | **P22f (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | 646 | 648 | **656** | emits Crystal at all (the rest refuse) |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | 333 | 340 | **348** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | 51 | 53 | **53** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | 262 | 260 | **252** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | 3752 | 3745 | **3745** | refused at the Ruby line, with a reason |
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -579,7 +622,7 @@ touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
 two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
-instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)).
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED).
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
