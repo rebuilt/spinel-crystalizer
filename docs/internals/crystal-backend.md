@@ -305,6 +305,23 @@ reopens and nested classes. Nothing calls them yet — the switch is still off �
 so P22a is corpus-neutral: PASS 327, DIFF 49, BUILDFAIL 266, REFUSED 3756, zero
 transitions. Only *objects* are wrapped; a stdlib container still has no wrapper.
 
+**P22b — boxed locals (staged off; measured net-negative).** The next step was
+to box a widened local as `SpValue` and unbox its reads. Measured, it is
+net-negative: Crystal already represents a poly local as a **union**, and a
+union resolves the local's methods natively, so boxing it discards working
+behavior. The locals-only scope is **25 PASS→non-PASS regressions and 0 gains**;
+the full boxed-slot scope (locals + ivars + parameters + receivers) is **76
+regressions and 2 gains**. Implementing the read side — unbox at a read the
+analyzer narrowed to a concrete type, boxed-local receiver dispatch, operand
+boxing, and `sp_box` overloads for metaclasses and containers — fixed 18 of the
+23 sampled regressions but introduced 33 new ones (**47 regressions vs 1 gain**);
+the one gain is poly *parameters*/equality, not locals. The code is therefore
+staged behind `CR_POLY_LOCALS`/`CR_POLY_DISPATCH`, both `0`; the additive runtime
+fixes (`sp_send` with no args, `self.` receivers in the dispatch arms, `SpValue`
+operand overloads, metaclass/container `sp_box`) remain. The evidence points to
+boxing at widened **boundaries** (a parameter, a container element) rather than
+at the local slot.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
