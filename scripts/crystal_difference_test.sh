@@ -293,6 +293,23 @@ expect_refuse "a class named 'Box' (a Crystal stdlib type" 'class Box
   def initialize(n); @n = n; end
 end
 p Box.new(1)'
+# P22g: a method that `yield`s is translated -- the signature declares `(&)` and
+# `yield` stays `yield`. A method whose `yield` calls disagree on arity is
+# refused (Ruby nil-fills the block params, Crystal infers one arity).
+expect_agree "yield_block" 'def twice
+  yield 1
+  yield 2
+end
+twice { |x| puts x }'
+expect_agree "yield_multi_arg" 'def pair
+  yield 10, 20
+end
+pair { |a, b| p a + b }'
+expect_refuse "calls take different numbers of arguments" 'def m
+  yield 1, 2
+  yield 3
+end
+m { |a, b| p [a, b] }'
 # P21.1: Ruby extends a short array on `a[i] = v`; Crystal's []= raises, so an
 # index write whose value disagrees with the pinned element type is refused
 # (it would otherwise emit Array(Int64) that the String cannot be stored into).

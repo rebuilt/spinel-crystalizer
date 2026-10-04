@@ -179,8 +179,42 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_call(CrGen *g, int id, Buf *b);
+/* The widest `yield` arity in a user method's body, or 0 when it has none. A
+   block passed to such a method must declare exactly that many parameters --
+   unlike the builtin iterators, which `ty_block_yield` describes. The arity is
+   the largest argument count of any YieldNode in the method's scope. */
+static int cr_scope_yield_arity(CrGen *g, Scope *s) {
+  if (!s || !s->yields || s->body < 0) return 0;
+  int maxn = 0;
+  for (int id = 0; id < g->nt->count; id++) {
+    if (nt_kind(g->nt, id) != NK_YieldNode) continue;
+    if (comp_scope_of(g->c, id) != s) continue;
+    int argc = 0; call_args(g->nt, id, &argc);
+    if (argc > maxn) maxn = argc;
+  }
+  return maxn;
+}
+
+/* True when a user method's `yield` calls disagree on arity (a `yield a, b`
+   beside a `yield a`). Ruby nil-fills the missing block parameters; Crystal
+   infers one block signature and rejects a later `yield` of a different arity,
+   so such a method is refused rather than emitted as a build error. */
+static int cr_scope_yield_arity_uniform(CrGen *g, Scope *s) {
+  if (!s || !s->yields) return 1;
+  int seen = -1;
+  for (int id = 0; id < g->nt->count; id++) {
+    if (nt_kind(g->nt, id) != NK_YieldNode) continue;
+    if (comp_scope_of(g->c, id) != s) continue;
+    int argc = 0; call_args(g->nt, id, &argc);
+    if (seen < 0) seen = argc;
+    else if (seen != argc) return 0;
+  }
+  return 1;
+}
+
 static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
                           const char *meth);
+static int cr_has_unverified_poly_call(CrGen *g);
 static void cr_emit_if(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_case(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module);
@@ -1953,6 +1987,25 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       if (flags & 8)  buf_puts(b, "x");
       return;
     }
+    case NK_YieldNode: {
+      /* `yield a, b` invokes the block the method was called with. Crystal's
+         `yield` is the same construct, and the signature declares `(&)` when
+         the body contains one (see cr_emit_method). Arguments are emitted as a
+         comma list; a splat is refused (Crystal's yield takes the same argument
+         forms but a Ruby splat's static type is unknown here). */
+      int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+      buf_puts(b, "yield");
+      for (int i = 0; i < argc; i++) {
+        if (nt_kind(g->nt, argv[i]) == NK_SplatNode) {
+          cr_mark_unsupported(g, argv[i], "a splat argument to yield");
+          continue;
+        }
+        buf_puts(b, i ? ", " : "(");
+        cr_emit_expr(g, argv[i], b);
+      }
+      if (argc > 0) buf_puts(b, ")");
+      return;
+    }
     default: {
       /* An expression node outside the subset (SelfNode, GlobalVariableReadNode,
          LambdaNode, ...). Emit a placeholder and record it; the run is refused at
@@ -2076,7 +2129,21 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
   int pn = 0; const int *preqs = NULL;
   if (pty && sp_streq(pty, "BlockParametersNode")) {
     int inner = nt_ref(g->nt, params, "parameters");
-    if (inner >= 0) preqs = nt_arr(g->nt, inner, "requireds", &pn);
+    if (inner >= 0) {
+      preqs = nt_arr(g->nt, inner, "requireds", &pn);
+      /* A block with optional (`|a, b=1|`), rest (`|*a|`) or numbered (`_1`)
+         parameters has no direct Crystal form here: Crystal block parameters
+         take no defaults, and a rest param's element type is unknown. Refuse so
+         the shape is named rather than emitted as a wrong-arity block. */
+      int on = 0, rn2 = 0;
+      nt_arr(g->nt, inner, "optionals", &on);
+      nt_arr(g->nt, inner, "posts", &rn2);
+      int restp = nt_ref(g->nt, inner, "rest");
+      if (on > 0 || rn2 > 0 || restp >= 0)
+        cr_mark_unsupported(g, block, "a block with optional or rest parameters");
+    }
+  } else if (pty && sp_streq(pty, "NumberedParametersNode")) {
+    cr_mark_unsupported(g, block, "a block with numbered parameters (_1, _2, ...)");
   } else if (pty && sp_streq(pty, "ParametersNode")) {
     preqs = nt_arr(g->nt, params, "requireds", &pn);
   }
@@ -2099,10 +2166,19 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
   /* Ruby auto-splats only when the block asks for more values than the iterator
      yields. A parenthesized `|(a, b)|` was already desugared upstream into a
      single param, so seeing 2+ REQUIRED params here is the flat `|a, b|` form
-     and the auto-splat is what Ruby would do. */
+     and the auto-splat is what Ruby would do. A USER method that `yield`s two
+     values is the exception: Crystal's `yield a, b` already passes two block
+     parameters, so a `|a, b|` block must NOT be desugared into a synthetic
+     single param. */
+  int user_yarity = 0;
+  if (meth) {
+    Scope *cs = cr_callee_scope(g, meth, recv_ty, recv < 0);
+    if (cs) user_yarity = cr_scope_yield_arity(g, cs);
+  }
   TyKind yields[4];
   int splat = 0;
-  if (pn >= 2 && recv >= 0 && meth && ty_block_yield(recv_ty, meth, yields, 4) == 1)
+  if (pn >= 2 && user_yarity < 2 && recv >= 0 && meth &&
+      ty_block_yield(recv_ty, meth, yields, 4) == 1)
     splat = 1;
   char elem[48] = "";
   if (splat) snprintf(elem, sizeof elem, "__cr_elem%d", g->tmp_seq++);
@@ -2373,6 +2449,20 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
                "the exception class '%s' has no Crystal equivalent: "
                CR_NO_CRYSTAL_EXC, nm ? nm : "?");
       cr_mark_unsupported(g, cls, why);
+    }
+  }
+
+  /* Ruby's `raise SomeError` with no message raises a new instance of the
+     class; Crystal's `raise` needs the instance, so a bare exception-class
+     constant becomes `raise(Cls.new)`. A non-class argument (`raise obj`) is
+     left alone. */
+  if (recv < 0 && sp_streq(name, "raise") && argc == 1) {
+    int cls = cr_peek(g, argv[0]);
+    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
+                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
+      const char *nm = cr_exception_operand(g, cls);
+      const char *cn = nm ? cr_exception_name(g, nm) : NULL;
+      if (cn && *cn) { buf_printf(b, "raise(%s.new)", cn); return; }
     }
   }
 
@@ -3504,6 +3594,28 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
     if (!bn || !bn[0]) snprintf(why, sizeof why, "an anonymous block parameter (&)");
     else snprintf(why, sizeof why, "a block parameter (&%s)", bn);
     cr_mark_unsupported(g, blkparam, why);
+  } else if (s->yields) {
+    /* The body contains a `yield`, so the method must accept a block. Crystal
+       requires it named in the signature (`def f(&)`), and the anonymous form
+       is enough because the body reaches it via `yield`, never a name. A method
+       with an explicit `&b` parameter is refused above (Crystal infers the proc
+       type from the declaration, which would silently answer nil), so the
+       anonymous block is the only shape handled. A body whose `yield` calls
+       disagree on arity is refused too: Ruby nil-fills the missing block
+       parameters, Crystal rejects the second arity outright. */
+    if (!cr_scope_yield_arity_uniform(g, s)) {
+      cr_mark_unsupported(g, s->def_node,
+                          "a method whose `yield` calls take different numbers of "
+                          "arguments (Ruby nil-fills; Crystal infers one block arity)");
+    } else if (cr_has_unverified_poly_call(g)) {
+      cr_mark_unsupported(g, s->def_node,
+                          "a yielding method in a program with a call on a poly "
+                          "(union) receiver that has no Crystal form");
+    } else {
+      if (!first) buf_puts(b, ", ");
+      first = 0;
+      buf_puts(b, "&");
+    }
   }
   buf_puts(b, ")\n");
 
@@ -3719,6 +3831,53 @@ static int cr_module_function_self_dependent(CrGen *g, ClassInfo *ci, int is_mod
           k != NK_InstanceVariableOperatorWriteNode) continue;
       if (comp_scope_of(g->c, id) == sc) return 1;
     }
+  }
+  return 0;
+}
+
+/* True when the program contains a method call on a POLY (union) receiver whose
+   name is neither a user method on a poly receiver, nor a name the emitter's
+   builtin allowlist / receiver-typed table resolves. Such a call currently slips
+   through the "a poly receiver defers to dynamic dispatch" rule and build-fails
+   (`String#each` on `(Range | String)`). A program that has one is left refused
+   where it was, instead of being unblocked by an unrelated feature (a `yield`
+   method) and then failing to build. */
+static int cr_has_unverified_poly_call(CrGen *g) {
+  for (int id = 0; id < g->nt->count; id++) {
+    if (nt_kind(g->nt, id) != NK_CallNode) continue;
+    int recv = nt_ref(g->nt, id, "receiver");
+    if (recv < 0) continue;
+    TyKind rt = comp_ntype(g->c, recv);
+    /* A true UNION (a branch result like `[0..2, "x"][0]`, typed `(Range |
+       String)`) reaches Crystal's static union dispatch, which fails when one
+       arm lacks the method. TY_POLY is different: it is the boxed SpValue, whose
+       `sp_send` answers the method (or raises NoMethodError like Ruby), so it is
+       left alone. Only a non-poly type with no concrete spelling is gated. */
+    if (rt == TY_POLY) continue;
+    Buf probe; memset(&probe, 0, sizeof probe);
+    int concrete = cr_map_type(g, rt, &probe);
+    free(probe.p);
+    if (concrete) continue;
+    const char *nm = nt_str(g->nt, id, "name");
+    if (!nm) continue;
+    if (sp_streq(nm, "[]") || sp_streq(nm, "[]=") || sp_streq(nm, "!") ||
+        cr_is_binop(nm)) continue;
+    if (sp_streq(nm, "to_s") || sp_streq(nm, "inspect") || sp_streq(nm, "nil?") ||
+        sp_streq(nm, "==") || sp_streq(nm, "!=") || sp_streq(nm, "hash") ||
+        sp_streq(nm, "class")) continue;
+    if (cr_user_method_ok(g, nm, TY_POLY, 0)) continue;
+    /* Only the BUILTIN-CONTAINER iterators/predicates fail on a mixed union
+       (`(Range | String)#each`, `(Array | String)#join`). Restrict the gate to
+       those names so a union of USER classes (`(A | B)#id`, which Crystal
+       dispatches fine) is not refused. */
+    static const char *const container_meths[] = {
+      "each", "each_with_index", "each_pair", "each_index", "map", "flat_map",
+      "select", "reject", "filter", "join", "zip", "values_at", "values",
+      "members", "sum", "reduce", "inject", "count", "min", "max", "sort",
+      "sort_by", "find", "detect", "any?", "all?", "first", "last", "index",
+      "include?", "to_h", "to_a", "group_by", "each_slice", "each_cons", NULL };
+    for (int i = 0; container_meths[i]; i++)
+      if (sp_streq(nm, container_meths[i])) return 1;
   }
   return 0;
 }
