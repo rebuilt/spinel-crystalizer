@@ -173,9 +173,19 @@ static void cr_pop_scope(CrGen *g, ScopeMark m) {
    hard refusal. Boxing it behind SpValue unblocks that shape; staged off until
    measured. */
 #define CR_POLY_IVARS 1
+/* Boundary boxing: a COMPARISON between two method parameters the analyzer left
+   a raw UNION (`def less(a, b); a <= b; end` called with Int, String, Bool, nil,
+   so the params are `Int64 | String | ...`) boxes both sides to SpValue, routing
+   the operator through the runtime's comparator instead of asking Crystal to
+   resolve `Int64#<=(String)`. Unlike CR_POLY_LOCALS this boxes no LOCAL slot: the
+   value keeps its native union everywhere else, and only a comparison is touched
+   (it answers Bool, so the box stays inside the expression). This is the
+   "boundary" the P22b evidence pointed at. */
+#define CR_POLY_BOUNDARY 1
 
 /* ---- forward declarations ---- */
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
+static TyKind cr_ivar_type(CrGen *g, const char *name);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_call(CrGen *g, int id, Buf *b);
@@ -571,6 +581,19 @@ static int cr_recv_boxed(CrGen *g, int recv) {
   return rn && cr_is_poly(cr_local_type(g, recv, rn));
 }
 
+/* True when `id` emits an SpValue already, so a boundary box must NOT wrap it
+   again. That is a boxed local read (CR_POLY_LOCALS) or a boxed ivar read whose
+   declared type is poly and is therefore declared SpValue (CR_POLY_IVARS). */
+static int cr_node_is_spvalue(CrGen *g, int id) {
+  if (id < 0) return 0;
+  if (cr_recv_boxed(g, id)) return 1;
+  if (CR_POLY_IVARS && nt_kind(g->nt, id) == NK_InstanceVariableReadNode) {
+    const char *n = nt_str(g->nt, id, "name");
+    return n && cr_is_poly(cr_ivar_type(g, n));
+  }
+  return 0;
+}
+
 /* The declared type of ivar `name` (leading @ included) on the class being
    emitted, or TY_UNKNOWN. */
 static TyKind cr_ivar_type(CrGen *g, const char *name) {
@@ -652,6 +675,30 @@ static int cr_param_poly(Scope *callee, int idx) {
   const char *pn = callee->pnames ? callee->pnames[idx] : NULL;
   LocalVar *lv = pn ? scope_local(callee, pn) : NULL;
   return lv && cr_is_poly(lv->type);
+}
+
+/* True when `id` emits as a value that a Crystal operator will try to resolve
+   through a raw UNION: a read of a method PARAMETER the analyzer left TY_POLY.
+   Such a parameter unifies across call sites (`def less(a, b); a <= b; end`
+   called with Int, String, Bool, nil) and emits as one Crystal union; the
+   operator then fails when a member lacks the overload (`Int64#<=(String)`).
+   Boxing the parameter routes the operator through the runtime comparator.
+
+   Deliberately NARROW: only a parameter read. A poly LOCAL keeps its native
+   union, which resolves operators for the members that share them -- boxing a
+   local regressed 21 programs in the P22b attempt. A parameter is the boundary
+   the call sites write into, so it is the one place boxing is both necessary and
+   confined. Any node already emitted as an SpValue (a boxed ivar) is excluded by
+   the caller. */
+static int cr_is_union_param(CrGen *g, int id) {
+  if (id < 0) return 0;
+  if (nt_kind(g->nt, id) != NK_LocalVariableReadNode) return 0;
+  const char *n = nt_str(g->nt, id, "name");
+  if (!n) return 0;
+  Scope *sc = comp_scope_of(g->c, id);
+  LocalVar *lv = scope_local(sc, n);
+  if (!lv || !lv->is_param) return 0;
+  return cr_is_poly(lv->type);
 }
 
 /* True when `id` is a read that can answer nil in Ruby -- a `[]` index into a
@@ -3010,9 +3057,42 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     /* A concrete receiver against a boxed (poly) operand: box the receiver so
        the SpValue operator runs. `Float64#-(SpValue)` does not exist, but
        `SpValue#-(Raw)` does (the operand overloads). A boxed receiver already
-       dispatches through those, so it is left as-is. */
-    if (CR_POLY_LOCALS && !cr_is_poly(comp_ntype(g->c, recv)) &&
-        cr_is_poly(comp_ntype(g->c, argv[0]))) {
+       dispatches through those, so it is left as-is.
+
+       The same reasoning applies to a raw-union operand. A method like
+       `def less(a, b); a <= b; end` called with mixed types has params typed
+       `Int64 | String | ...`, which emits as a Crystal union; `Int64#<=(String)`
+       then fails to resolve. Boxing a union operand turns the operator into
+       `SpValue#<=`, whose comparator raises ArgumentError on a Ruby-illegal
+       pair instead of failing to compile. Both operands are boxed so the
+       SpValue/SpValue overload (not the Raw one) is chosen and the boxed
+       receiver is never left comparing against a raw union. */
+    int recv_box = CR_POLY_LOCALS && cr_is_poly(comp_ntype(g->c, recv));
+    int arg_box  = CR_POLY_LOCALS && cr_is_poly(comp_ntype(g->c, argv[0]));
+    if (CR_POLY_BOUNDARY && !cr_node_is_spvalue(g, recv) && cr_is_union_param(g, recv))
+      recv_box = 1;
+    if (CR_POLY_BOUNDARY && !cr_node_is_spvalue(g, argv[0]) && cr_is_union_param(g, argv[0]))
+      arg_box = 1;
+    /* Only a COMPARISON is boxed. A comparison answers Bool, so nothing escapes
+       the operator and no result unbox is needed -- the box is fully local to
+       this expression. An arithmetic operator is NOT: its SpValue result would
+       escape into the surrounding code, where an Int-typed slot (`Array.new`,
+       `while i < n`) or a chained call (`s.size()`) rejects it. Boxing those cost
+       three corpus programs with no gain, so they are left to their native union.
+       `%` has no SpValue operator at all, which is the same case from the other
+       side. This is what `test_poly_equality_mixed_sites` needs: `a <= b` and
+       `a == b` on a parameter the call sites widened to a mixed union. */
+    int is_cmp = sp_streq(op, "==") || sp_streq(op, "!=") || sp_streq(op, "<") ||
+                 sp_streq(op, ">") || sp_streq(op, "<=") || sp_streq(op, ">=");
+    if (!is_cmp) { recv_box = 0; arg_box = 0; }
+    /* A union/poly side is boxed; the concrete peer is taken by SpValue's operand
+       overload (`SpValue#<=(Raw)`). When only the ARG is a union the receiver is
+       concrete, so the receiver is boxed instead -- it must be the SpValue for the
+       overload to exist at all. */
+    if (arg_box && !recv_box) recv_box = 1;
+    /* A boxed comparison answers Bool, so the box stays inside this expression:
+       nothing about the enclosing code changes type. */
+    if (recv_box) {
       buf_puts(b, "sp_box(");
       cr_emit_recv(g, recv, b);
       buf_puts(b, ")");
@@ -3021,7 +3101,13 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     }
     g->nil_ok = savb;
     buf_printf(b, " %s ", op);
-    cr_emit_recv(g, argv[0], b);
+    if (arg_box) {
+      buf_puts(b, "sp_box(");
+      cr_emit_recv(g, argv[0], b);
+      buf_puts(b, ")");
+    } else {
+      cr_emit_recv(g, argv[0], b);
+    }
     return;
   }
 

@@ -511,6 +511,50 @@ type-flow cases in the inlined yield body. None is caused by the `yield`
 translation, and the union guard above removes every case it can detect; the
 remainder are documented rather than hidden.
 
+**P22h — comparison at a widened parameter boundary (landed).** P22b established
+that a poly *local* must keep its native Crystal union (boxing the slot regressed
+47 programs), and pointed at widening the *boundary* instead. This is the first
+such boundary. A method parameter the call sites widened to a mixed union --
+`def less_or_equal(a, b); a <= b; end` called with `Int`, `String`, `Float`,
+`Bool` and `nil` -- emits as one Crystal union, and an operator on it resolves
+through Crystal's per-member overloads, which fails when a member lacks the
+operator (`Error: expected argument #1 to 'Int64#<=' to be Float64, ..., not
+String`). A **comparison** between two such parameters is now boxed to `SpValue`
+on both sides, so the operator runs through the runtime's comparator instead:
+`sp_box(a) <= sp_box(b)`.
+
+Three limits make the box local rather than structural:
+
+- **Only a comparison.** A comparison answers `Bool`, so the box never escapes
+  the expression. An *arithmetic* operator answers `SpValue`, which does escape:
+  `Array.new(sp_box(r) * sp_box(c), 0.0)` handed `SpValue` to a parameter typed
+  `Int`, and boxing `prefix + mid` inside a method made it **return** an
+  `SpValue`, so every later `s.size()` on that result became `undefined method
+  'size' for SpValue`. `%` has no `SpValue` operator at all. Boxing the
+  arithmetic operators cost three corpus programs and gained nothing, so they are
+  left to their native union.
+- **Only a parameter.** The gate is `LocalVar.is_param`, not "`type` is
+  `TY_POLY`". A poly local, a poly array element or a union of user classes keeps
+  its native union, which already resolves the members that share the operator.
+  Boxing every `TY_POLY` operand cost 21 programs.
+- **Only when it is not already an `SpValue`.** A boxed ivar read (`CR_POLY_IVARS`)
+  or a boxed local is left alone, so the box is never applied twice.
+
+One correction to the P22b note above, which cost real time: **`TY_POLY` does not
+mean "emitted as `SpValue`"**. It is a top type the analyzer assigns when a slot's
+writes disagree; how it *emits* depends on the slot. A widened **parameter**
+emits as a raw Crystal union, which is exactly why it needs this boundary box.
+The earlier helper that assumed otherwise silently declined to fire.
+
+**Measured effect (P22h).** **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED**, zero
+PASS regressions (gate PASS, 365 baselined), the single transition being
+`test_poly_equality_mixed_sites`: a mixed-union comparison that previously failed
+to compile now agrees with CRuby on all ten lines, including the three rescued
+`ArgumentError`s (`1 <= "x"`, `false <= true`, `nil <= nil`), which is Ruby's own
+"comparison of X with Y failed". `test_nullable_poly_hash_arg_unbox` was an
+incidental gain of the over-broad first cut and is correctly not part of this
+phase. The difference ledger pins AGREE for the case (`poly_param_compare`).
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -649,7 +693,7 @@ touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
 two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
-instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section.
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)).
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further

@@ -202,6 +202,21 @@ expect_agree "poly_scalar_array_multipush" 'a = []
 a.push(1, "x")
 p a'
 
+# P22h: a COMPARISON between method parameters the call sites widened to a mixed
+# union (here `a <= b`, used with Int, Float, String, Bool and nil) is boxed to
+# SpValue on both sides, so Crystal's Int64#<=(String) is never asked to resolve.
+# SpValue's comparator answers true for a comparable pair and raises for a
+# Ruby-illegal one (`1 <= "x"`), which the caller can rescue, matching CRuby.
+expect_agree "poly_param_compare" 'def less(a, b)
+  a <= b
+end
+p less(1, 2.0)
+begin
+  p less(1, "x")
+rescue
+  p false
+end'
+
 # Consistent dot notation / renamed predicates: File.exist? is File.exists?.
 expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 

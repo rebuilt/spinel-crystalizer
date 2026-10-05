@@ -3028,7 +3028,7 @@ DIFF     test_poly_enumerator_size
 REFUSED   test_poly_enum_range_and_scalar_recv
 REFUSED   test_poly_enum_to_a_builtin_arm
 REFUSED   test_poly_eq_large_integers
-BUILDFAIL test_poly_equality_mixed_sites
+PASS     test_poly_equality_mixed_sites
 PASS     test_poly_eq_user_cross_class
 REFUSED   test_poly_exact_numeric_ops
 BUILDFAIL test_poly_face_nilable_param
