@@ -629,7 +629,7 @@ REFUSED   test_case_when_poly_scrutinee_bound_to_local
 REFUSED   test_case_when_qualified_class
 REFUSED   test_case_when_qualified_exception
 PASS     test_case_when_regex
-BUILDFAIL test_case_when_string_range_nil_bound
+PASS       test_case_when_string_range_nil_bound
 REFUSED   test_case_when_string_range
 REFUSED   test_case_when_user_equality
 REFUSED   test_case_when_value_constant
@@ -3654,7 +3654,7 @@ REFUSED   test_ruby_engine_name
 REFUSED   test_ruby_engine_shadowed_by_multi_write
 REFUSED   test_ruby_engine_shadowed_by_path_or_write
 REFUSED   test_ruby_engine_shadowed_constant
-BUILDFAIL test_safe_nav_arg_iterators
+DIFF      test_safe_nav_arg_iterators
 REFUSED   test_safe_nav_array_returning
 REFUSED   test_safe_nav_block_calls
 REFUSED   test_safe_nav_block_family
@@ -3666,7 +3666,7 @@ REFUSED   test_safe_nav_poly_builtin_surface
 REFUSED   test_safe_nav_poly_dispatch
 REFUSED   test_safe_nav_predicate
 REFUSED   test_safe_nav_specialized_miss
-BUILDFAIL test_safe_nav_typed_receiver
+PASS       test_safe_nav_typed_receiver
 PASS     test_same_named_attr_no_widen
 REFUSED   test_same_name_forwarder_union_receiver
 REFUSED   test_scalar_isa_dead_branch
@@ -4360,7 +4360,7 @@ REFUSED   test_yielder_to_proc
 PASS     test_yielding_call_in_rescue_expr
 REFUSED   test_yielding_initialize_args_evaluated_once
 REFUSED   test_yield_inline_arg_caller_context
-BUILDFAIL test_yield_inline_ctor_self
+PASS       test_yield_inline_ctor_self
 REFUSED   test_yield_inline_default_reads_param
 REFUSED   test_yield_inline_divergent_accumulator
 REFUSED   test_yield_inline_divergent_block_map

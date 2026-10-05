@@ -3246,6 +3246,47 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     int sav = g->nil_ok;
     if (sp_streq(name, "nil?") || sp_streq(name, "inspect") || sp_streq(name, "to_s"))
       g->nil_ok = 1;
+    int safe_nav = 0;
+    {
+      /* `&.` is in the node's own `call_operator` and the emitter ignored it, so
+         every safe navigation became a plain `.`. That is right only when the
+         receiver cannot be nil; on a nilable one it is `undefined method 'm' for
+         Nil`. Rewrite it below as `try`, which is Ruby's `&.` on a nilable AND a
+         plain call on a non-nilable, so no nilability knowledge is needed --
+         Spinel's TyKind carries none. */
+      const char *cop = nt_str(g->nt, id, "call_operator");
+      if (cop && sp_streq(cop, "&.")) safe_nav = 1;
+    }
+    if (safe_nav) {
+      /* `x&.m` as a parenthesised ARGUMENT cannot use `&.` -- `p(x&.m())` is
+         `unterminated call`, because `&.` binds looser than the call's own parens.
+         `try` is the exact rewrite: it evaluates the receiver once, skips the block
+         when it is nil, and answers nil -- which is Ruby's `&.`. (A nil test in a
+         ternary does NOT narrow in Crystal, so `(x.nil? ? nil : x.m)` still
+         reported `undefined method 'm' for Nil`.) */
+      char tmp[48];
+      snprintf(tmp, sizeof tmp, "__cr_sn%d", g->tmp_seq++);
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".try { |%s| %s.%s(", tmp, tmp, mname);
+      int sav2 = g->nil_ok;
+      if (sp_streq(name, "p") || sp_streq(name, "puts") || sp_streq(name, "print") ||
+          sp_streq(name, "pp"))
+        g->nil_ok = 1;
+      for (int i = 0; i < argc; i++) {
+        if (i) buf_puts(b, ", ");
+        if (CR_POLY_BOXED && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
+        else cr_emit_expr(g, argv[i], b);
+      }
+      g->nil_ok = sav2;
+      buf_puts(b, ")");
+      /* The block belongs INSIDE the `try` braces: `x&.m { }` is a call of `m`
+         with a block, so it must read `try { |t| t.m() { ... } }`. Appending it
+         after the closing brace gave `try { |t| t.m() } do ... end`, which is a
+         parse error (`expecting identifier 'end', not 'do'`). */
+      if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
+      buf_puts(b, " }");
+      return;
+    }
     cr_emit_recv(g, recv, b);
     g->nil_ok = sav;
     buf_printf(b, ".%s", mname);
@@ -3992,6 +4033,36 @@ static int cr_has_unverified_poly_call(CrGen *g) {
   return 0;
 }
 
+/* True when `initialize` assigns `@name` on EVERY path, i.e. a top-level
+   statement of its body is a plain write to that ivar. A write nested inside an
+   if/unless/while/case/rescue/begin does not count: Ruby leaves the ivar nil on
+   the paths that skip it, so the Crystal declaration must be nilable or the class
+   is rejected ("must be Combat, not Nil"). A class with no `initialize` at all
+   assigns nothing here; the caller covers that with the synthesized seed. */
+static int cr_ivar_assigned_in_init(CrGen *g, ClassInfo *ci, const char *name) {
+  if (!ci || !name || ci->def_node < 0) return 0;
+  const char *cty = nt_type(g->nt, ci->def_node);
+  if (!cty || !(sp_streq(cty, "ClassNode") || sp_streq(cty, "ModuleNode"))) return 0;
+  int cbody = nt_ref(g->nt, ci->def_node, "body");
+  if (cbody < 0) return 0;
+  int nn = 0; const int *aa = nt_arr(g->nt, cbody, "body", &nn);
+  int init = -1;
+  for (int i = 0; i < nn; i++)
+    if (nt_kind(g->nt, aa[i]) == NK_DefNode &&
+        sp_streq(nt_str(g->nt, aa[i], "name") ? nt_str(g->nt, aa[i], "name") : "", "initialize"))
+      init = aa[i];
+  if (init < 0) return 0;
+  int body = nt_ref(g->nt, init, "body");
+  if (body < 0) return 0;
+  int bn = 0; const int *bb = nt_arr(g->nt, body, "body", &bn);
+  for (int i = 0; i < bn; i++) {
+    if (nt_kind(g->nt, bb[i]) != NK_InstanceVariableWriteNode) continue;
+    const char *w = nt_str(g->nt, bb[i], "name");
+    if (w && sp_streq(w, name)) return 1;
+  }
+  return 0;
+}
+
 /* ---- classes ---- */
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   g->nclasses++;
@@ -4053,11 +4124,21 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
   int all_ivars_typed = 1;
   if (!is_module)
     for (int i = 0; i < ci->nivars; i++) {
+      /* A declared ivar is nilable unless `initialize` assigns it
+         UNCONDITIONALLY. A class with no initialize is covered by the synthesized
+         seed; a class with one that assigns the ivar only inside a conditional
+         (`@combat = Combat.new if armed`) leaves it nil on the other path, which
+         is exactly Ruby's behaviour -- and Ruby reads such an ivar as nil, so the
+         declaration must be `T?` or Crystal rejects the class:
+         "instance variable '@combat' of Player must be Combat, not Nil". Declaring
+         it `Combat` was P22e's gap. Only TOP-LEVEL statements of the initialize
+         body count: a write nested in an if/unless/while/case/rescue does not
+         cover every path. */
+      int nilable = synth_init ||
+                    (!ci->is_struct && !cr_ivar_assigned_in_init(g, ci, ci->ivars[i]));
       Buf tmp; memset(&tmp, 0, sizeof tmp);
       if (cr_map_type(g, ci->ivar_types[i], &tmp)) {
-        /* A synthesized initialize seeds the ivar nil, so it is nilable; a
-           defined initialize assigns it directly and keeps the concrete type. */
-        buf_printf(b, "  %s : %s%s\n", ci->ivars[i], tmp.p, synth_init ? "?" : "");
+        buf_printf(b, "  %s : %s%s\n", ci->ivars[i], tmp.p, nilable ? "?" : "");
         free(tmp.p);
       } else if (CR_POLY_IVARS && cr_is_poly(ci->ivar_types[i]) && !has_init &&
                  cr_ivar_reads_safe(g, ci, ci->ivars[i])) {
@@ -4065,7 +4146,7 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
            `sp_box` (see the ivar-write path) and a concrete read unboxes back
            (the ivar-read path). The value flows boxed everywhere it is only
            forwarded, which is the dominant shape. */
-        buf_printf(b, "  %s : SpValue%s\n", ci->ivars[i], synth_init ? "?" : "");
+        buf_printf(b, "  %s : SpValue%s\n", ci->ivars[i], nilable ? "?" : "");
         free(tmp.p);
       } else {
         free(tmp.p);

@@ -235,6 +235,41 @@ c = Counter.new
 p c.bump(4)
 p c.bump(2)'
 
+# P22j: `x&.m` is `x.try { |t| t.m }`. The emitter ignored the node's
+# `call_operator`, so every safe navigation became a plain `.` -- correct only for a
+# receiver that cannot be nil. `try` is exact for both a nilable and a non-nilable
+# receiver, which matters because Spinel's TyKind carries no nilability. (`&.` itself
+# is unusable here: inside a parenthesised argument it is "unterminated call".)
+expect_agree "safe_nav_nilable_ivar" 'class Holder
+  def initialize(set)
+    @item = "v" if set
+  end
+
+  def peek
+    @item&.upcase
+  end
+end
+
+p Holder.new(true).peek
+p Holder.new(false).peek'
+
+# P22j: an ivar assigned only inside a conditional is nilable, exactly as Ruby reads
+# it. The declaration was `T` because the class HAS an initialize, and Crystal
+# rejected the class with "instance variable '@combat' of Player must be Combat, not
+# Nil".
+expect_agree "conditional_ivar_is_nilable" 'class Slot
+  def initialize(n)
+    @v = n if n > 0
+  end
+
+  def get
+    @v
+  end
+end
+
+p Slot.new(3).get
+p Slot.new(-1).get'
+
 # Consistent dot notation / renamed predicates: File.exist? is File.exists?.
 expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 

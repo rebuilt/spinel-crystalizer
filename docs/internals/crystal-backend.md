@@ -595,6 +595,46 @@ documented instead. A future P22e fix that declares a conditionally-assigned iva
 nilable would clear the second, and an `include?` remap fix the first. The ledger
 pins AGREE for the scalar case (`ivar_op_write_scalar`).
 
+**P22j — a conditionally-assigned ivar is nilable, and `&.` is not dropped (landed).**
+P22i documented two REFUSED → BUILDFAIL trades it had been masking. This clears the
+first and, in clearing it, exposed and fixed a second gap underneath.
+
+- **The ivar declaration.** P22e decided nilability from whether a class *has* an
+  `initialize`, not from whether it assigns every ivar in one unconditionally. So
+  `@combat = Combat.new if armed` left `@combat` declared `Combat`, and Crystal
+  rejected the class with `instance variable '@combat' of Player must be Combat, not
+  Nil`. `cr_ivar_assigned_in_init` now scans the **top-level** statements of
+  `initialize`'s body for a plain write to that ivar — a write nested in an
+  if/unless/while/case/rescue does not cover every path — and the declaration is `T?`
+  when the slot is not assigned there. That is Ruby-faithful: an ivar assigned only
+  conditionally reads nil on the other path, which is exactly what `T?` says.
+- **`&.` was silently dropped.** The node carries `call_operator == "&."` and
+  `cr_emit_call` never read it, so every safe navigation became a plain `.`. That is
+  right only when the receiver cannot be nil; on a nilable one it is `undefined
+  method 'm' for Nil`. The two had to land together, because declaring `Combat?`
+  turned a previously-working `.` into a build failure.
+
+  The rewrite is `x&.m(args)` → `x.try { |t| t.m(args) }`. Three Crystal behaviours
+  shaped it, each confirmed by probe after a wrong first attempt: **`&.` is unusable
+  in this position** (`p(x&.m())` is `unterminated call`, because `&.` binds looser
+  than the call's own parens); a nil test in a **ternary does not narrow**
+  (`(x.nil? ? nil : x.m)` still reported `undefined method 'm' for Nil`); and
+  **`try` is allowed on a non-nilable receiver** — which is what makes it the right
+  answer, since Spinel's `TyKind` carries no nilability and `try` is exact for both.
+  The block goes *inside* the braces (`x&.m { }` is a call of `m` with a block, so it
+  reads `try { |t| t.m() do ... end }`); appending it after the closing brace produced
+  a parse error.
+
+**Measured effect (P22j).** **+3 PASS, +1 DIFF, −4 BUILDFAIL, +0 REFUSED**, zero PASS
+regressions and **no REFUSED → BUILDFAIL trade** (gate PASS, 369 baselined):
+`safe_nav_typed_receiver` (the trade P22i documented), plus
+`case_when_string_range_nil_bound` and `yield_inline_ctor_self`, both unblocked
+incidentally by the `try` rewrite and the nilable declaration. All three agree with
+CRuby exactly. `safe_nav_arg_iterators` becomes a DIFF: it compiles now, and the
+remaining disagreement (`[1, 2, 4, 5]` against CRuby) is a pre-existing gap, documented
+rather than hidden. The ledger pins AGREE for both halves (`safe_nav_nilable_ivar`,
+`conditional_ivar_is_nilable`).
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -733,7 +773,7 @@ touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
 two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
-instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section.
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section. P22j is **+3 PASS, +1 DIFF, −4 BUILDFAIL, +0 REFUSED** — a conditionally-assigned ivar declared nilable, plus the `&.` → `try` rewrite that fix exposed (see [P22](#p22-object-boxing-via-spbox)); it clears one of P22i's two trades and adds no new ones.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
