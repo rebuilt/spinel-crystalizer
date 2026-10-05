@@ -186,6 +186,7 @@ static void cr_pop_scope(CrGen *g, ScopeMark m) {
 /* ---- forward declarations ---- */
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
 static TyKind cr_ivar_type(CrGen *g, const char *name);
+static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_call(CrGen *g, int id, Buf *b);
@@ -1299,11 +1300,55 @@ static void cr_emit_rescue(CrGen *g, int id, Buf *b, int indent) {
   buf_puts(b, "end\n");
 }
 
-static const char *cr_translate_name(CrGen *g, int recv, const char *n) {
+/* True when ANY user scope or accessor in the program defines a method named `n`.
+   Needed where the receiver's own class is not statically known: `cr_user_method_ok`
+   matches on the receiver's class, so it cannot answer for a poly value, yet a remap
+   that assumes a builtin stdlib spelling would shadow a user method carrying the
+   Ruby name. */
+static int cr_any_method_named(CrGen *g, const char *n) {
+  if (!n) return 0;
+  for (int s = 1; s < g->c->nscopes; s++) {
+    Scope *sc = &g->c->scopes[s];
+    if (sc->name && sp_streq(sc->name, n)) return 1;
+  }
+  for (int c = 0; c < g->c->nclasses; c++) {
+    ClassInfo *cl = &g->c->classes[c];
+    for (int i = 0; i < cl->nreaders; i++)
+      if (sp_streq(cl->readers[i], n)) return 1;
+    for (int i = 0; i < cl->nwriters; i++)
+      if (cl->writers[i] && sp_streq(cl->writers[i], n)) return 1;
+  }
+  return 0;
+}
+
+static const char *cr_translate_name(CrGen *g, int id, int recv, const char *n) {
   if (sp_streq(n, "include?")) {
     TyKind rt = recv >= 0 ? comp_ntype(g->c, recv) : TY_UNKNOWN;
     /* Hash#include? checks keys; Crystal's Hash answers that as has_key?. */
-    return ty_is_hash(rt) ? "has_key?" : "includes?";
+    if (ty_is_hash(rt)) return "has_key?";
+    /* A concrete user object that defines its own `include?` keeps the Ruby name --
+       there is nothing to remap to, and Crystal would reject `includes?`. */
+    if (cr_user_method_ok(g, n, rt, 0)) return n;
+    /* Crystal's Array/Set spell it `includes?`, so a CONCRETE receiver always
+       remaps, even in a program that defines its own `include?` somewhere else
+       (`@names.include?(x)` on an `Array(String)` is unaffected).
+       A receiver whose class is NOT statically known is the hard case: the value can
+       be a user class defining `include?` OR an Array, and the two arms spell the
+       method DIFFERENTLY, so no single name resolves the union
+       (`(Tags | Array(String))#include?` is `undefined method 'include?' for
+       Array(String)`, and `includes?` is undefined for Tags). Renaming cannot fix
+       that; it needs boxed dispatch. So it is refused HERE, by name, rather than
+       emitted as a build error. */
+    if (cr_any_method_named(g, n)) {
+      Buf probe; memset(&probe, 0, sizeof probe);
+      int concrete = cr_map_type(g, rt, &probe);
+      free(probe.p);
+      if (!concrete)
+        cr_mark_unsupported(g, id, "a call to a user-defined method on a receiver "
+                                   "whose class is not statically known (the union's "
+                                   "arms spell the method differently)");
+    }
+    return "includes?";
   }
   if (sp_streq(n, "length"))   return "size";        /* Array/Hash/String#length -> size */
   /* Ruby spells these predicate methods in the third person; Crystal does not. */
@@ -3238,7 +3283,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
      name (`Time.at` -> `Time.unix(..).to_local`). Emitted whole, so it runs
      before the generic receiver/method/argument form below. */
   if (block < 0 && cr_call_remap(g, id, recv, name, b)) return;
-  const char *mname = cr_translate_name(g, recv, name);
+  const char *mname = cr_translate_name(g, id, recv, name);
   if (recv >= 0) {
     /* `x.nil?` asks whether x is nil, and `x.inspect` / `x.to_s` are defined on
        Nil in Crystal, so all three want Ruby's nilable read rather than one that

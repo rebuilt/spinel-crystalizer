@@ -635,6 +635,37 @@ remaining disagreement (`[1, 2, 4, 5]` against CRuby) is a pre-existing gap, doc
 rather than hidden. The ledger pins AGREE for both halves (`safe_nav_nilable_ivar`,
 `conditional_ivar_is_nilable`).
 
+**P22k — refuse a user-defined method on a statically unknown receiver (landed).**
+This closes the second REFUSED → BUILDFAIL trade P22i documented.
+`cr_translate_name` mapped `include?` → `includes?` for every non-Hash receiver,
+which shadowed a user class's own `include?` into `undefined method 'includes? for
+Tags`.
+
+It is worth being precise about why that is **not** a rename bug, because the fix is
+not a rename. The receiver there is a `Tags | Array(String)` union and the two arms
+spell the method *differently*: `include?` is undefined for `Array(String)`, and
+`includes?` is undefined for `Tags`. No single name resolves it — only boxed
+dispatch could, which is the deferred project (see the phase notes). So the honest
+step is a **named refusal**, and three cases are distinguished:
+
+- a **Hash** receiver → `has_key?`, unchanged;
+- a **concrete user object** that defines its own `include?` → keeps the Ruby name
+  (`cr_user_method_ok`), since there is nothing to remap to;
+- any other **concrete** receiver → still remaps to `includes?`. This case matters:
+  `@names.include?(x)` on an `Array(String)` is correct even in a program that
+  defines `include?` elsewhere, so the program-wide check must not fire on it;
+- a receiver with **no concrete Crystal spelling** (a poly value) → refused by name.
+
+A new `cr_any_method_named` answers the program-wide question, because
+`cr_user_method_ok` matches on the *receiver's* class and is therefore silent for a
+poly value.
+
+**Measured effect (P22k).** **+0 PASS, +0 DIFF, −1 BUILDFAIL, +1 REFUSED**, zero PASS
+regressions and no other transition (gate PASS, 369 baselined):
+`test_poly_user_include_value` moves BUILDFAIL → REFUSED. The refusal is line-anchored
+and names the obstruction. P22i's two trades are now both cleared. The ledger pins the
+refusal.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -773,7 +804,7 @@ touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
 two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
-instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section. P22j is **+3 PASS, +1 DIFF, −4 BUILDFAIL, +0 REFUSED** — a conditionally-assigned ivar declared nilable, plus the `&.` → `try` rewrite that fix exposed (see [P22](#p22-object-boxing-via-spbox)); it clears one of P22i's two trades and adds no new ones.
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section. P22j is **+3 PASS, +1 DIFF, −4 BUILDFAIL, +0 REFUSED** — a conditionally-assigned ivar declared nilable, plus the `&.` → `try` rewrite that fix exposed (see [P22](#p22-object-boxing-via-spbox)); it clears one of P22i's two trades and adds no new ones. P22k is **+0 PASS, +0 DIFF, −1 BUILDFAIL, +1 REFUSED** — a call to a user-defined method on a statically unknown receiver is refused by name rather than emitted as a build error, closing P22i's second trade (see [P22](#p22-object-boxing-via-spbox)).
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further

@@ -3219,7 +3219,7 @@ REFUSED   test_poly_unary_minus_tower
 REFUSED   test_poly_user_binop_object_result
 REFUSED   test_poly_user_each_index
 REFUSED   test_poly_user_exception_methods
-BUILDFAIL test_poly_user_include_value
+REFUSED   test_poly_user_include_value
 PASS     test_poly_user_join_dispatch
 REFUSED   test_poly_user_nil_predicate
 REFUSED   test_poly_user_pack_unpack

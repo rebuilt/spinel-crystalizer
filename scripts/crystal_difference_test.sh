@@ -270,6 +270,18 @@ end
 p Slot.new(3).get
 p Slot.new(-1).get'
 
+# P22k: a call to a user-defined method on a receiver whose class is not statically
+# known is refused by name. Crystal's Array/Set spell `include?` as `includes?`, but a
+# user class defines it under the Ruby name -- and on a union the two arms spell the
+# method DIFFERENTLY, so neither name resolves `(Tags | Array(String))`.
+expect_refuse "a call to a user-defined method on a receiver whose class is not statically known" 'class Tags
+  def initialize(names); @names = names; end
+  def include?(n); @names.include?(n); end
+end
+def found(v) = v.include?("ruby")
+p found(Tags.new(["ruby"]))
+p found(["ruby"])'
+
 # Consistent dot notation / renamed predicates: File.exist? is File.exists?.
 expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 
