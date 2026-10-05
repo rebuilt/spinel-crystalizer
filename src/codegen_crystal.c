@@ -3460,26 +3460,50 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       return;
     }
     case NK_InstanceVariableOperatorWriteNode: {
-      /* `@x op= v`. Only translated when the poly runtime is on (a widened
-         ivar's compound assign goes through SpValue's operators); otherwise it
-         is refused exactly as the generic case refused it before. */
-      if (!CR_POLY_BOXED) {
-        cr_mark_unsupported(g, id, "InstanceVariableOperatorWriteNode");
-        return;
-      }
+      /* `@x op= v`. A CONCRETE SCALAR ivar needs no boxing at all -- Crystal carries
+         the compound forms natively -- so it emits exactly like the local case
+         below. This node used to be refused outright unless the whole-slot
+         `CR_POLY_BOXED` was on, which refused a plain `@pos += 4` on an Int64 ivar
+         for no reason at all. Two shapes stay refused, each by name. */
       const char *name = nt_str(g->nt, id, "name");
       const char *op   = nt_str(g->nt, id, "binary_operator");
       int val = nt_ref(g->nt, id, "value");
+      TyKind vt = cr_ivar_type(g, name);
       cr_indent(b, indent);
-      if (op && (sp_streq(op, "+") || sp_streq(op, "-") || sp_streq(op, "*") ||
-                 sp_streq(op, "/") || sp_streq(op, "%"))) {
-        buf_printf(b, "%s %s= ", name ? name : "", op);
-        cr_emit_expr(g, val, b);
-      } else {
-        buf_printf(b, "%s = %s", name ? name : "", name ? name : "");
-        if (op) buf_printf(b, " %s ", op);
-        cr_emit_expr(g, val, b);
+      /* Only the ARITHMETIC operators, where Crystal carries the compound form and
+         the operand needs no nil guard. `**=`, `<<=`, `|=`, `&&=`, `||=` are
+         refused rather than expanded: `<<` against a nilable Array slot, `|` against
+         a nilable Integer slot and `||` against an unset ivar each need a guard the
+         expansion does not carry. The old refusal said only the node kind
+         (`InstanceVariableOperatorWriteNode`); this one names the construct. */
+      int arith = op && (sp_streq(op, "+") || sp_streq(op, "-") || sp_streq(op, "*") ||
+                         sp_streq(op, "/") || sp_streq(op, "%"));
+      if (!arith) {
+        cr_mark_unsupported(g, id, op && *op
+          ? "a compound assignment with an operator Crystal has no compound form for"
+          : "a compound assignment to an instance variable with no operator");
+        buf_puts(b, "\n");
+        return;
       }
+      /* Only a CONCRETE SCALAR slot. A WIDENED ivar is declared `SpValue`, so the
+         compound form would need an `SpValue#op=` that does not exist, and the
+         arithmetic RESULT would have to be unboxed before it could land in the slot
+         -- the escape P22h had to avoid. A CONTAINER slot (`@a *= 2` on
+         `Array(Int64)?`) needs a nil guard the compound form does not carry; emitted
+         as-is it was `expected argument #1 to 'Array(T)#*' to be Int, not String`. */
+      int scalar = vt == TY_INT || vt == TY_BIGINT || vt == TY_FLOAT ||
+                   vt == TY_STRING || vt == TY_STRBUF || vt == TY_SYMBOL || vt == TY_BOOL;
+      if (!scalar) {
+        cr_mark_unsupported(g, id, cr_is_poly(vt)
+          ? "a compound assignment to a widened instance variable (the boxed form "
+            "has no compound operator)"
+          : "a compound assignment to an instance variable whose type is not a "
+            "concrete scalar (Crystal's compound form needs a non-nil receiver)");
+        buf_puts(b, "\n");
+        return;
+      }
+      buf_printf(b, "%s %s= ", name ? name : "", op);
+      cr_emit_expr(g, val, b);
       buf_puts(b, "\n");
       return;
     }

@@ -2518,7 +2518,7 @@ REFUSED   test_map_obj_array_poly_field
 REFUSED   test_mapped_array_mutable_elements
 REFUSED   test_map_recv_emitted_once
 REFUSED   test_map_result_widened_by_composition
-REFUSED   test_map_shadowed_param_poly_arg
+PASS     test_map_shadowed_param_poly_arg
 PASS     test_map_to_heap_objects
 PASS     test_map_to_value_type_objects
 DIFF     test_map_untyped_block_result
@@ -3219,7 +3219,7 @@ REFUSED   test_poly_unary_minus_tower
 REFUSED   test_poly_user_binop_object_result
 REFUSED   test_poly_user_each_index
 REFUSED   test_poly_user_exception_methods
-REFUSED   test_poly_user_include_value
+BUILDFAIL test_poly_user_include_value
 PASS     test_poly_user_join_dispatch
 REFUSED   test_poly_user_nil_predicate
 REFUSED   test_poly_user_pack_unpack
@@ -3666,7 +3666,7 @@ REFUSED   test_safe_nav_poly_builtin_surface
 REFUSED   test_safe_nav_poly_dispatch
 REFUSED   test_safe_nav_predicate
 REFUSED   test_safe_nav_specialized_miss
-REFUSED   test_safe_nav_typed_receiver
+BUILDFAIL test_safe_nav_typed_receiver
 PASS     test_same_named_attr_no_widen
 REFUSED   test_same_name_forwarder_union_receiver
 REFUSED   test_scalar_isa_dead_branch

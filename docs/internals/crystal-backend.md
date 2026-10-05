@@ -555,6 +555,46 @@ to compile now agrees with CRuby on all ten lines, including the three rescued
 incidental gain of the over-broad first cut and is correctly not part of this
 phase. The difference ledger pins AGREE for the case (`poly_param_compare`).
 
+**P22i — compound assignment to an instance variable (landed).**
+`NK_InstanceVariableOperatorWriteNode` (`@x op= v`) was refused outright unless the
+whole-slot `CR_POLY_BOXED` was on, which meant a plain `@count += n` on an `Int64`
+ivar — which Crystal answers natively — was refused for no reason at all. That single
+node was the sole refusal in `test_map_shadowed_param_poly_arg`. It now emits, like
+the local case beside it, under two limits:
+
+- **Only the arithmetic operators** (`+ - * / %`), where Crystal carries the compound
+  form and the operand needs no nil guard. `**=`, `<<=`, `|=`, `&&=`, `||=` are
+  refused **by name** — `<<` against a nilable `Array` slot, `|` against a nilable
+  `Integer` slot and `||` against an unset ivar each need a guard the expansion does
+  not carry. The old refusal said only `InstanceVariableOperatorWriteNode`; the new
+  one names the construct.
+- **Only a concrete scalar slot.** A widened ivar is declared `SpValue`, so the
+  compound form would need an `SpValue#op=` that does not exist, and the arithmetic
+  result would have to be unboxed before landing in the slot — the escape P22h had
+  to avoid. A container slot (`@a *= 2` on `Array(Int64)?`) needs a nil guard, so
+  `@count += n` is translated and `@a *= 2` is not.
+
+**Measured effect (P22i).** **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED**, zero
+PASS regressions (gate PASS, 366 baselined). This is a *weak* trade — one PASS for two
+programs moving from a precise refusal to a build error — and both are pre-existing
+gaps this node had been masking, neither caused by it:
+
+- `test_poly_user_include_value` — `@asked += 1` emits correctly; the class
+  separately hits `undefined method 'includes? for Tags` (an `include?` →
+  `includes?` remap gap in a *different* method).
+- `test_safe_nav_typed_receiver` — `@count += n` on `Int64` emits correctly;
+  `Player` declares `@combat : Combat` but assigns it only conditionally, so
+  Crystal's "not initialized in all of the `initialize` methods" rule fires. That
+  is P22e's `has_init` logic, not this node.
+
+Neither is cheaply guardable, and refusing a compound assign *for an unrelated
+reason* would be worse than the trade: a refusal that names the wrong construct is
+what the honesty ledger exists to prevent. P22f achieved "no REFUSED → BUILDFAIL
+trade" because its guards were predictive; here they are not, so the trades are
+documented instead. A future P22e fix that declares a conditionally-assigned ivar
+nilable would clear the second, and an `include?` remap fix the first. The ledger
+pins AGREE for the scalar case (`ivar_op_write_scalar`).
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -693,7 +733,7 @@ touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
 two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
-instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)).
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section.
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further

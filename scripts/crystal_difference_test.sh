@@ -217,6 +217,24 @@ rescue
   p false
 end'
 
+# P22i: a compound assignment to a CONCRETE SCALAR instance variable needs no
+# boxing at all -- Crystal carries `@x += v` natively. This node used to be refused
+# outright unless the whole-slot poly switch was on, which refused a plain
+# `@count += n` on an Int64 ivar for no reason.
+expect_agree "ivar_op_write_scalar" 'class Counter
+  def initialize
+    @count = 1
+  end
+
+  def bump(n)
+    @count += n
+  end
+end
+
+c = Counter.new
+p c.bump(4)
+p c.bump(2)'
+
 # Consistent dot notation / renamed predicates: File.exist? is File.exists?.
 expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 
