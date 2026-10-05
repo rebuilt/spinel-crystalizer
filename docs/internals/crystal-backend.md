@@ -305,6 +305,19 @@ reopens and nested classes. Nothing calls them yet — the switch is still off �
 so P22a is corpus-neutral: PASS 327, DIFF 49, BUILDFAIL 266, REFUSED 3756, zero
 transitions. Only *objects* are wrapped; a stdlib container still has no wrapper.
 
+**Known hole in `SpBox` (do not dispatch a boxed object yet).** `SpBox` defines
+only `val`, `initialize`, `inspect` and `to_s`. It has **no `sp_send` override**, so
+`sp_box(some_object).sp_send(name, args)` inherits `SpObject#sp_send`, which
+raises. Any gate that routes a widened receiver through `sp_box(…).sp_send(…)` is
+therefore only valid when the receiver holds a *scalar*; the moment the union has a
+user-object arm it compiles and then raises at RUN time, converting a working
+program into a DIFF with no diagnostic. Closing this needs a per-class
+`sp_box_send(v : Foo, name, args)` overload set reached through
+`SpBox#sp_send` — that is the prerequisite for any widened-receiver dispatch, and
+it is measured, not hypothetical: the scalar-on-a-widened-parameter attempt (P22l)
+lost 3 PASS programs to exactly this hole and gained none. See
+`~/.opencode/plan/crystal-backend-p22-plan-v2.md` for the full post-mortem.
+
 **P22b — boxed locals (staged off; measured net-negative).** The next step was
 to box a widened local as `SpValue` and unbox its reads. Measured, it is
 net-negative: Crystal already represents a poly local as a **union**, and a
