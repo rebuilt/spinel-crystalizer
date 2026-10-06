@@ -192,7 +192,7 @@ PASS     test_bang_op_ruby_truthy
 REFUSED   test_bang_result_through_shared_handle
 REFUSED   test_bare_arg_in_module_body
 REFUSED   test_bare_begin_no_handler
-DIFF     test_bare_call_class_before_toplevel
+PASS     test_bare_call_class_before_toplevel
 REFUSED   test_bare_call_prefers_self_over_toplevel
 REFUSED   test_bare_class_self_calls
 REFUSED   test_bare_gets_defers_to_own_gets
@@ -629,7 +629,7 @@ REFUSED   test_case_when_poly_scrutinee_bound_to_local
 REFUSED   test_case_when_qualified_class
 REFUSED   test_case_when_qualified_exception
 PASS     test_case_when_regex
-PASS       test_case_when_string_range_nil_bound
+PASS     test_case_when_string_range_nil_bound
 REFUSED   test_case_when_string_range
 REFUSED   test_case_when_user_equality
 REFUSED   test_case_when_value_constant
@@ -659,7 +659,7 @@ REFUSED   test_class_ancestors_superclass
 REFUSED   test_class_basicobject_superclass
 REFUSED   test_class_body_constant_bare_new
 REFUSED   test_class_body_dsl_call
-DIFF     test_class_case_eq
+PASS     test_class_case_eq
 PASS     test_class_constant_path_read
 REFUSED   test_class_const_as_value
 REFUSED   test_class_const_defined
@@ -775,7 +775,7 @@ BUILDFAIL test_cmethod_specialize_samename_unrelated
 REFUSED   test_cmethod_super_past_a_deep_chain
 REFUSED   test_cmethod_super
 REFUSED   test_cmethod_tail_class_ivar_write
-BUILDFAIL test_cmethod_transitive_specialization
+PASS     test_cmethod_transitive_specialization
 REFUSED   test_cmeth_return_nil_or_obj_via_intermediate
 PASS     test_codegen_class_in_module_with_explicit_parent
 PASS     test_codegen_const_lookup_in_toplevel_method
@@ -986,7 +986,7 @@ REFUSED   test_dispatch_arm_default_reads_receiver
 REFUSED   test_dispatch_inline_only_override
 REFUSED   test_dispatch_inline_only_override_variants
 REFUSED   test_dispatch_override_param_list
-BUILDFAIL test_dispatch_unused_param_nil
+PASS     test_dispatch_unused_param_nil
 REFUSED   test_dlx_subclass_ring_attr
 REFUSED   test_dns_lookup_leaves_world
 REFUSED   test_dotdotdot_leading_param_forward
@@ -1911,7 +1911,7 @@ REFUSED   test_issue203_string_new
 REFUSED   test_issue224_bare_new_inherited
 REFUSED   test_issue229_uncalled_cls_method
 REFUSED   test_issue236_chain_empty_literal
-BUILDFAIL test_issue239_cls_method_default_args
+PASS     test_issue239_cls_method_default_args
 REFUSED   test_issue_266_def_length_inference
 REFUSED   test_issue_2863
 REFUSED   test_issue_2864
@@ -2752,7 +2752,7 @@ REFUSED   test_next_value_hash
 REFUSED   test_next_value_map
 REFUSED   test_next_value_select
 REFUSED   test_next_value_side_effect
-REFUSED  test_nilable_poly_array
+REFUSED   test_nilable_poly_array
 REFUSED   test_nilable_time_strftime
 BUILDFAIL test_nilclass_bool_ops_conversions
 REFUSED   test_nil_collection_methods_raise
@@ -2991,11 +2991,11 @@ REFUSED   test_poly_dispatch_comparator_slot
 REFUSED   test_poly_dispatch_default_reads_param
 REFUSED   test_poly_dispatch_hash_param_variant
 BUILDFAIL test_poly_dispatch_inherited_attr_reader
-BUILDFAIL test_poly_dispatch_inherited_method
+PASS     test_poly_dispatch_inherited_method
 REFUSED   test_poly_dispatch_keyword_args
 REFUSED   test_poly_dispatch_kwargs_builtin_name
 PASS     test_poly_dispatch_long_class_name
-BUILDFAIL test_poly_dispatch_multilevel_inheritance
+PASS     test_poly_dispatch_multilevel_inheritance
 REFUSED   test_poly_dispatch_mutated_string
 REFUSED   test_poly_dispatch_narrow_return_type
 REFUSED   test_poly_dispatch_proc_form_reopened
@@ -3008,7 +3008,7 @@ REFUSED   test_poly_dispatch_splat_args
 REFUSED   test_poly_dispatch_splat
 REFUSED   test_poly_dispatch_string_receiver_split
 REFUSED   test_poly_dispatch_struct_arg_arm
-BUILDFAIL test_poly_dispatch_uninstantiated_arm
+PASS     test_poly_dispatch_uninstantiated_arm
 REFUSED   test_poly_dispatch_user_return_widens
 BUILDFAIL test_poly_dispatch_value_type_to_s
 REFUSED   test_poly_dispatch_yielding_method
@@ -3654,7 +3654,7 @@ REFUSED   test_ruby_engine_name
 REFUSED   test_ruby_engine_shadowed_by_multi_write
 REFUSED   test_ruby_engine_shadowed_by_path_or_write
 REFUSED   test_ruby_engine_shadowed_constant
-DIFF      test_safe_nav_arg_iterators
+DIFF     test_safe_nav_arg_iterators
 REFUSED   test_safe_nav_array_returning
 REFUSED   test_safe_nav_block_calls
 REFUSED   test_safe_nav_block_family
@@ -3666,7 +3666,7 @@ REFUSED   test_safe_nav_poly_builtin_surface
 REFUSED   test_safe_nav_poly_dispatch
 REFUSED   test_safe_nav_predicate
 REFUSED   test_safe_nav_specialized_miss
-PASS       test_safe_nav_typed_receiver
+PASS     test_safe_nav_typed_receiver
 PASS     test_same_named_attr_no_widen
 REFUSED   test_same_name_forwarder_union_receiver
 REFUSED   test_scalar_isa_dead_branch
@@ -3682,7 +3682,7 @@ REFUSED   test_self_class_new_construction
 REFUSED   test_self_class_new_in_superclass
 REFUSED   test_self_class_new_narrowed_arg
 BUILDFAIL test_self_new_with_args
-BUILDFAIL test_self_operator_subclass_dispatch
+PASS     test_self_operator_subclass_dispatch
 REFUSED   test_self_recursive_block_given_forward
 REFUSED   test_self_referential_ivar_reader
 REFUSED   test_send_computed_name_subclass_alias
@@ -4360,7 +4360,7 @@ REFUSED   test_yielder_to_proc
 PASS     test_yielding_call_in_rescue_expr
 REFUSED   test_yielding_initialize_args_evaluated_once
 REFUSED   test_yield_inline_arg_caller_context
-PASS       test_yield_inline_ctor_self
+PASS     test_yield_inline_ctor_self
 REFUSED   test_yield_inline_default_reads_param
 REFUSED   test_yield_inline_divergent_accumulator
 REFUSED   test_yield_inline_divergent_block_map

@@ -4078,6 +4078,25 @@ static int cr_has_unverified_poly_call(CrGen *g) {
   return 0;
 }
 
+/* True when a superclass in `ci`'s chain already declares `name`. Now that the
+   emitted header carries the superclass, a subclass does NOT re-declare an
+   inherited instance variable: Crystal rejects a re-declaration at a different type
+   ("instance variable '@tag' of Node, with Sub < Node, is already declared as
+   Int64"). This matters for the nilable seeding in cr_emit_class -- a subclass with
+   no `initialize` of its own never assigns the ivar, so the seeding would widen an
+   INHERITED declaration to `T?`. Before the superclass was emitted the subclass was
+   an unrelated class, so the re-declaration was harmless and the bug was invisible. */
+static int cr_class_inherits_ivar(CrGen *g, ClassInfo *ci, const char *name) {
+  if (!ci || !name) return 0;
+  for (int p = ci->parent; p >= 0 && p < g->c->nclasses; ) {
+    ClassInfo *pc = &g->c->classes[p];
+    for (int i = 0; i < pc->nivars; i++)
+      if (sp_streq(pc->ivars[i], name)) return 1;
+    p = pc->parent;
+  }
+  return 0;
+}
+
 /* True when `initialize` assigns `@name` on EVERY path, i.e. a top-level
    statement of its body is a plain write to that ivar. A write nested inside an
    if/unless/while/case/rescue/begin does not count: Ruby leaves the ivar nil on
@@ -4137,7 +4156,25 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
         cr_mark_unsupported(g, ci->def_node, why);
       }
   }
-  buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
+  /* Carry the superclass into the emitted header. `ClassInfo.parent` is the
+     superclass index the compiler already tracks, but the Crystal emitter never
+     wrote it, so `class B < A` emitted as a bare `class B` -- B did not inherit A's
+     methods, so every program that called one through a child was a BUILDFAIL that
+     no amount of dynamic dispatch could have fixed (the receiver is statically
+     concrete; there is no runtime union to dispatch over). Only a parent that is
+     itself an emitted user class is carried: a builtin/native parent is left off,
+     since `< Object` would drag in a superclass the emitter does not model. */
+  {
+    int par = -1;
+    if (!is_module && ci->parent >= 0 && ci->parent < g->c->nclasses) {
+      ClassInfo *p = &g->c->classes[ci->parent];
+      if (!p->is_native_class && p->name && p->def_node >= 0)
+        par = ci->parent;
+    }
+    if (par >= 0) buf_printf(b, "%s %s < %s\n", "class", ci->name,
+                             g->c->classes[par].name);
+    else         buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
+  }
   /* typed ivar declarations (classes only; modules carry none). Crystal needs the
      annotation: a bare `@d` in a class body parses as a read, not a declaration,
      and is rejected as an instance variable at the top level. An ivar whose type
@@ -4179,10 +4216,13 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
          it `Combat` was P22e's gap. Only TOP-LEVEL statements of the initialize
          body count: a write nested in an if/unless/while/case/rescue does not
          cover every path. */
+      int inherited = cr_class_inherits_ivar(g, ci, ci->ivars[i]);
       int nilable = synth_init ||
-                    (!ci->is_struct && !cr_ivar_assigned_in_init(g, ci, ci->ivars[i]));
+                    (!ci->is_struct && !inherited &&
+                     !cr_ivar_assigned_in_init(g, ci, ci->ivars[i]));
       Buf tmp; memset(&tmp, 0, sizeof tmp);
       if (cr_map_type(g, ci->ivar_types[i], &tmp)) {
+        if (inherited) continue;   /* the superclass already declares it */
         buf_printf(b, "  %s : %s%s\n", ci->ivars[i], tmp.p, nilable ? "?" : "");
         free(tmp.p);
       } else if (CR_POLY_IVARS && cr_is_poly(ci->ivar_types[i]) && !has_init &&

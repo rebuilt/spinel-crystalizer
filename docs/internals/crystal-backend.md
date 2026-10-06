@@ -305,6 +305,31 @@ reopens and nested classes. Nothing calls them yet — the switch is still off �
 so P22a is corpus-neutral: PASS 327, DIFF 49, BUILDFAIL 266, REFUSED 3756, zero
 transitions. Only *objects* are wrapped; a stdlib container still has no wrapper.
 
+**P22n — emit the superclass in the class header.** `cr_emit_class` ended with
+`buf_printf(b, "%s %s\n", "class", ci->name)`, so `class B < A` emitted as a bare
+`class B`: B did not inherit A's methods at all. `ClassInfo.parent` (the superclass
+index) has been tracked by the compiler the whole time — the Crystal emitter simply
+never read it. The header now carries `< A` when the parent is itself an emitted
+user class (a builtin/native parent is left off, since `< Object` would drag in a
+superclass the emitter does not model).
+
+Measured **+9 PASS, 0 regressions**: 7 BUILDFAIL→PASS and 2 DIFF→PASS. This is not
+a boxing change and it is not a dispatch change — it is the receiver being *statically*
+concrete, so no dynamic dispatch could ever have reached these programs. Calling an
+inherited method through a child (`def call_x(e) = e.x` with `e` of type `A | B`) is
+the shape that fails.
+
+The change also had to teach the ivar seeding about inheritance. P22j widens a
+declared ivar to `T?` when `initialize` does not assign it unconditionally, and a
+subclass with no `initialize` of its own never assigns an inherited ivar — so the
+seeding tried to re-declare it at the wider type, which Crystal rejects once the
+superclass is real ("instance variable '@tag' of Node, with Sub < Node, is already
+declared as Int64"). `cr_class_inherits_ivar` walks the `parent` chain and skips
+both the re-declaration and the widening for an inherited ivar. That bug was
+invisible while subclasses were unrelated classes, which is a general caution: a
+previously-unrelated emission can hide a latent type error, and making the relation
+real can expose it.
+
 **Known hole in `SpBox` (do not dispatch a boxed object yet).** `SpBox` defines
 only `val`, `initialize`, `inspect` and `to_s`. It has **no `sp_send` override**, so
 `sp_box(some_object).sp_send(name, args)` inherits `SpObject#sp_send`, which
