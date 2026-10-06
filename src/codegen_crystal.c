@@ -4554,6 +4554,87 @@ static void cr_emit_sp_box_overload(ClassInfo *ci, Buf *b, int is_module) {
   buf_printf(b, "def sp_box(v : %s) : SpValue\n  SpValue.new(SpBox.new(v))\nend\n\n", ci->name);
 }
 
+/* One `sp_box_send` arm per top-level user class: the dynamic-dispatch answer for a
+   BOXED receiver, reached from `SpBox#sp_send`. The box does not know T's methods, so
+   it hands off here, and overload resolution picks the concrete `SpBox(Foo)` at each
+   instantiation. That is what lets two arms of ONE union spell the method differently
+   and still both resolve -- the `(Tags | Array(String))#include?` shape that no single
+   renamed call could ever reach (P22k refuses it for exactly that reason).
+
+   Only ZERO-argument PUBLIC instance methods get an arm. A method with parameters
+   would need its arguments boxed and unboxed per arm, and getting that wrong yields a
+   silent wrong answer rather than a build error, so it is left to the fallback, which
+   refuses the way Ruby's NoMethodError-shaped raise would. A private method is also
+   left out: `recv.private_m` is a NoMethodError in Ruby.
+
+   Corpus note: this arm set is currently INERT -- no emitted program routes a receiver
+   through `sp_send` (that gate needs CR_POLY_DISPATCH or a boxed local, and both are
+   off), and a stdlib container boxed in the union has no arm either. It is emitted to
+   close a footgun rather than to move the corpus: before it, `sp_box(obj).sp_send(..)`
+   compiled and then raised at RUN time, which cost P22l three PASS programs. */
+static void cr_emit_sp_box_send_overload(Compiler *c, ClassInfo *ci, Buf *b,
+                                        int is_module) {
+  if (is_module || ci->enclosing_class != -1 || ci->is_native_class ||
+      is_builtin_reopen(ci->name)) return;
+  int cidx = -1;
+  for (int i = 0; i < c->nclasses; i++)
+    if (&c->classes[i] == ci) { cidx = i; break; }
+  if (cidx < 0) return;
+
+  const char *arms[64];
+  int narms = 0;
+  /* Walk `ci` AND its superclass chain: the arm is keyed on the box's CONCRETE type,
+     so a `SpBox(Derived)` must answer a method `Derived` only INHERITS from `Base`.
+     Collecting only the class's own scopes gave a subclass no arm at all -- the same
+     missing-relation trap P22n removed for the class header. A nearer definition
+     wins, so an inherited name already collected is not repeated. */
+  for (int anc = cidx; anc >= 0 && anc < c->nclasses; ) {
+    ClassInfo *ac = &c->classes[anc];
+    for (int s = 1; s < c->nscopes; s++) {
+      Scope *sc = &c->scopes[s];
+      if (sc->class_id != anc || sc->is_cmethod) continue;
+      if (!sc->name || !sc->name[0]) continue;
+      if (strncmp(sc->name, "__prep_", 7) == 0) continue;   /* compiler shadow helper */
+      if (sc->cs_synth) continue;                           /* synthesized method */
+      /* Zero-argument only: no positional params, no rest, no post-rest, no keywords,
+         and no block parameter (a block-taking method needs the proc protocol). */
+      if (sc->nparams != 0 || sc->rest_idx >= 0 || sc->npost_rest > 0 ||
+          sc->kwrest_idx >= 0 || sc->blk_param) continue;
+      /* Operators and the constructor have their own spellings; a dynamic name must
+         not reach them. */
+      if (cr_is_binop(sc->name) || sp_streq(sc->name, "==") ||
+          sp_streq(sc->name, "!") || sp_streq(sc->name, "initialize")) continue;
+      int dup = 0;
+      for (int k = 0; k < narms; k++) if (sp_streq(sc->name, arms[k])) { dup = 1; break; }
+      if (dup) continue;
+      if (narms >= (int)(sizeof arms / sizeof arms[0])) break;
+      arms[narms++] = sc->name;
+    }
+    anc = ac->parent;
+  }
+  if (!narms) return;
+
+  Buf body; memset(&body, 0, sizeof body);
+  for (int k = 0; k < narms; k++)
+    buf_printf(&body, "    when \"%s\" then sp_box(v.val.%s())\n", arms[k], arms[k]);
+
+  buf_printf(b, "def sp_box_send(v : SpBox(%s), name : String, args : Array(SpValue)) : SpValue\n",
+             ci->name);
+  buf_puts(b, "  unless args.empty?\n");
+  /* The `#{}` belong to the GENERATED Crystal, so they go through a format specifier:
+     writing them into a printf format would interpolate the spinel-side `name` at
+     generation time and bake in whatever it happened to be. */
+  buf_printf(b, "    raise ArgumentError.new(\"%%s() given %%d arguments, expected 0\" %% "
+                "{name, args.size})\n");
+  buf_puts(b, "  end\n");
+  buf_puts(b, "  case name\n");
+  buf_puts(b, body.p);
+  buf_puts(b, "    else raise ArgumentError.new(sp_box_undefined(v, name))\n"
+              "  end\n"
+              "end\n\n");
+  free(body.p);
+}
+
 /* ---- entry point ---- */
 char *codegen_program_crystal(const NodeTable *nt) {
   Compiler *c = comp_new(nt);
@@ -4827,6 +4908,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
         if (ci >= 0) {
           cr_emit_class(&g, &c->classes[ci], &b, kk == NK_ModuleNode);
           cr_emit_sp_box_overload(&c->classes[ci], &b, kk == NK_ModuleNode);
+          cr_emit_sp_box_send_overload(c, &c->classes[ci], &b, kk == NK_ModuleNode);
         }
       } else if (kk == NK_DefNode) {
         Scope *s = cr_scope_for_def(c, tstmts[k]);
@@ -4836,6 +4918,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
         if (sci >= 0) {
           cr_emit_class(&g, &c->classes[sci], &b, 0);
           cr_emit_sp_box_overload(&c->classes[sci], &b, 0);
+          cr_emit_sp_box_send_overload(c, &c->classes[sci], &b, 0);
         }
       }
     }

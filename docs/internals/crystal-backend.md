@@ -330,18 +330,60 @@ invisible while subclasses were unrelated classes, which is a general caution: a
 previously-unrelated emission can hide a latent type error, and making the relation
 real can expose it.
 
-**Known hole in `SpBox` (do not dispatch a boxed object yet).** `SpBox` defines
-only `val`, `initialize`, `inspect` and `to_s`. It has **no `sp_send` override**, so
-`sp_box(some_object).sp_send(name, args)` inherits `SpObject#sp_send`, which
-raises. Any gate that routes a widened receiver through `sp_box(…).sp_send(…)` is
-therefore only valid when the receiver holds a *scalar*; the moment the union has a
-user-object arm it compiles and then raises at RUN time, converting a working
-program into a DIFF with no diagnostic. Closing this needs a per-class
-`sp_box_send(v : Foo, name, args)` overload set reached through
-`SpBox#sp_send` — that is the prerequisite for any widened-receiver dispatch, and
-it is measured, not hypothetical: the scalar-on-a-widened-parameter attempt (P22l)
-lost 3 PASS programs to exactly this hole and gained none. See
+**Known hole in `SpBox` — CLOSED by P22m.** (was: do not dispatch a boxed object yet)
+`SpBox` used to define only `val`, `initialize`, `inspect` and `to_s`. It had **no
+`sp_send` override**, so `sp_box(some_object).sp_send(name, args)` inherited
+`SpObject#sp_send`, which raises. Any gate that routed a widened receiver through
+`sp_box(…).sp_send(…)` was therefore only valid while the receiver held a *scalar*;
+the moment the union had a user-object arm it compiled and then raised at RUN time.
+That is not hypothetical: P22l lost 3 PASS programs to exactly this, and the
+`SpObject#sp_send` doc comment actively claimed per-class overrides that no class
+provided. See P22m below and
 `~/.opencode/plan/crystal-backend-p22-plan-v2.md` for the full post-mortem.
+
+**P22m — `SpBox#sp_send` and per-class `sp_box_send` (additive, corpus-neutral).**
+The box now has a real dispatch seam:
+
+```crystal
+class SpBox(T) < SpObject
+  def sp_send(name : String, args : Array(SpValue)) : SpValue
+    sp_box_send(self, name, args)   # emitter emits one overload per user class
+  end
+end
+def sp_box_send(v : SpBox(T), ...) : SpValue forall T   # generic fallback: refuses,
+  raise ArgumentError.new(sp_box_undefined(v, name))   # naming the concrete class
+end
+```
+
+Overload resolution picks the concrete `SpBox(Foo)` at each instantiation, which is
+the property that matters: it lets **two arms of one union spell the method
+differently and still both resolve**. That is the `(Tags | Array(String))#include?`
+shape no single renamed call could ever reach, and the reason P22k refuses it.
+
+`cr_emit_sp_box_send_overload` emits one arm per top-level user class carrying only
+**zero-argument public instance methods** — and it walks the **superclass chain**, so
+a `SpBox(Derived)` answers a method `Derived` only inherits from `Base`. (Collecting
+only the class's own scopes left a subclass with no arm at all: the same
+missing-relation trap P22n removed for the class header, on the dispatch path.)
+Methods with parameters, block-takers, operators, `initialize`, private methods and
+synthesized names get no arm and fall through to the refusal — boxing a method's
+arguments per-arm fails *silently* if done wrong, so the arm set is kept to the part
+that cannot.
+
+**Corpus-neutral: +0 PASS, 0 transitions.** No emitted program routes a receiver
+through `sp_send` (that gate needs `CR_POLY_DISPATCH` or a boxed local, both off),
+and a stdlib container in the union has no arm either. It is landed to close the
+footgun above and to make the seam real for whoever needs it, and it is verified by
+direct execution rather than left as untested dead code — see the plan file for the
+five measured behaviours (zero-arg dispatch, inherited dispatch, unknown name,
+arity refusal, param-method refusal).
+
+Re-running P22l's gate *on top of* this seam clears 2 of its 3 regressions
+(`poly_to_s_user_class`, `poly_recv_default_value_type` go DIFF → PASS); the third,
+`poly_dispatch_long_class_name`, now dispatches correctly to both user arms and fails
+only on `SpBox(Array(Int64))`, which has no arm because stdlib containers are out of
+scope. That makes the P22l design *safe* — and still worth **0**, since its 8
+affected programs convert none. Safety was never P22l's problem; demand was.
 
 **P22b — boxed locals (staged off; measured net-negative).** The next step was
 to box a widened local as `SpValue` and unbox its reads. Measured, it is
