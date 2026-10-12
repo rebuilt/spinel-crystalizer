@@ -73,7 +73,11 @@ typedef struct {
   char first_why[160];/* what that first construct was, in words for the diagnostic */
   int cur_class;      /* class_id of the method being emitted (-1 at top level);
                          lets a receiverless call resolve against the enclosing
-                         class's own methods, like Ruby's implicit self */  int nclasses;       /* classes emitted */
+                         class's own methods, like Ruby's implicit self */
+  Scope *cur_meth;    /* the method whose body is being emitted, NULL at top level
+                         and outside a def. `super` needs its name and arity to
+                         check the call against the superclass chain. */
+  int nclasses;       /* classes emitted */
   int nmethods;       /* methods emitted */
   int tail_value;     /* node id of the last statement of the method/block body
                          currently being emitted, or -1. That statement's value
@@ -187,6 +191,9 @@ static void cr_pop_scope(CrGen *g, ScopeMark m) {
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
 static TyKind cr_ivar_type(CrGen *g, const char *name);
 static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare);
+/* True when some visible call site of a scope omits positional param `pi`
+   (defined below, near the class-body scans). */
+static int cr_param_omitted_anywhere(CrGen *g, Scope *s, int pi);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_call(CrGen *g, int id, Buf *b);
@@ -1350,7 +1357,23 @@ static const char *cr_translate_name(CrGen *g, int id, int recv, const char *n) 
     }
     return "includes?";
   }
-  if (sp_streq(n, "length"))   return "size";        /* Array/Hash/String#length -> size */
+  if (sp_streq(n, "length")) {
+    /* A concrete user object that defines its own `length` keeps the Ruby name --
+       the rename is for Array/Hash/String, and Crystal has no `length` on a user
+       class (it would ship `undefined method 'size'` as a build error). */
+    TyKind rt = recv >= 0 ? comp_ntype(g->c, recv) : TY_UNKNOWN;
+    if (cr_user_method_ok(g, n, rt, recv < 0)) return n;
+    /* A receiver whose class is not statically known can be a user object that
+       defines its own `length`; the union's arms then spell the method two
+       different ways and no single rename resolves it, so refuse by name rather
+       than ship the build error. A widened ARRAY keeps the rename: Ruby's
+       Array#length is the container's, whatever the elements are. */
+    if (recv >= 0 && (rt == TY_POLY || rt == TY_UNKNOWN) && cr_any_method_named(g, n))
+      cr_mark_unsupported(g, id, "a call to `length` on a receiver whose class is "
+                                 "not statically known (the union's arms spell the "
+                                 "method differently)");
+    return "size";
+  }
   /* Ruby spells these predicate methods in the third person; Crystal does not. */
   if (sp_streq(n, "start_with?"))   return "starts_with?";
   if (sp_streq(n, "end_with?"))     return "ends_with?";
@@ -1675,15 +1698,56 @@ static int cr_builtin_ok(const char *n) {
   return 0;
 }
 
+/* The superclass index that cr_emit_class actually carries into the emitted
+   header, or -1 when the parent is not an emitted user class. Every
+   inheritance-aware lookup must use this SAME relation: the emitted Crystal
+   class only inherits from a parent it can name, so a method, reader or ivar
+   further up a chain that was never carried is not reachable in the emitted
+   program either. */
+static int cr_name_reopened(CrGen *g, const char *name);  /* defined below */
+static int cr_emitted_parent(CrGen *g, ClassInfo *ci) {
+  if (!ci || ci->parent < 0 || ci->parent >= g->c->nclasses) return -1;
+  ClassInfo *p = &g->c->classes[ci->parent];
+  if (p->is_native_class || !p->name || p->def_node < 0) return -1;
+  /* The header spells the parent by its bare name, which only resolves where
+     the child is emitted when the parent sits in the same nesting or at the
+     top level. A parent nested in a module cannot be named from a top-level
+     child: `class Child < M::Sub` would emit `class Child < Sub` and Crystal
+     fails with "undefined constant Sub". Decline the carry there -- the chain
+     lookups must decline with it, or they accept calls the emitted program
+     cannot resolve. */
+  if (p->enclosing_class != -1 && p->enclosing_class != ci->enclosing_class)
+    return -1;
+  /* A class written at more than one site is emitted from ONE body: the other
+     site's defs and nested classes are dropped, so a child that inherited from
+     it could call methods that were never emitted. Decline the carry. */
+  if (cr_name_reopened(g, p->name)) return -1;
+  return ci->parent;
+}
+
+/* True when `cls` is `target` or an ancestor of it through emitted superclasses
+   -- exactly the classes whose defs the emitted `target` inherits. P22n made
+   the relation real in the class header; the call path must consult it too, or
+   a method defined only on the superclass is refused as "not in the Crystal
+   subset" even though Crystal resolves it fine (P22o). */
+static int cr_class_in_chain(CrGen *g, int cls, int target) {
+  if (cls < 0 || target < 0) return 0;
+  for (int c = target; c >= 0 && c < g->c->nclasses;
+       c = cr_emitted_parent(g, &g->c->classes[c]))
+    if (c == cls) return 1;
+  return 0;
+}
+
 /* True when `name` is a method the program itself defines and the call can reach:
-   either a top-level def, a def on the receiver's user class, or (for a
-   receiverless call) a def on the enclosing class -- Ruby's implicit self. */
+   either a top-level def, a def on the receiver's user class or one of its
+   emitted ancestors, or (for a receiverless call) a def on the enclosing class
+   or its ancestors -- Ruby's implicit self. */
 static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare) {
   for (int s = 1; s < g->c->nscopes; s++) {
     Scope *sc = &g->c->scopes[s];
     if (!sc->name || !sp_streq(sc->name, name)) continue;
-    if (bare && (sc->class_id == -1 || sc->class_id == g->cur_class)) return 1;
-    if (!bare && ty_is_object(rt) && sc->class_id == ty_object_class(rt)) return 1;
+    if (bare && (sc->class_id == -1 || cr_class_in_chain(g, sc->class_id, g->cur_class))) return 1;
+    if (!bare && ty_is_object(rt) && cr_class_in_chain(g, sc->class_id, ty_object_class(rt))) return 1;
   }
   /* attr_accessor/reader/writer and the synthesized Struct methods are recorded in
      the class's readers[]/writers[] (not def scopes), so a call to them must be
@@ -1694,23 +1758,25 @@ static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare) {
   int tci = -1;
   if (!bare && ty_is_object(rt)) tci = ty_object_class(rt);
   else if (bare && g->cur_class >= 0) tci = g->cur_class;
-  if (tci >= 0 && tci < g->c->nclasses) {
-    ClassInfo *cl = &g->c->classes[tci];
-    for (int i = 0; i < cl->nreaders; i++)
-      if (sp_streq(cl->readers[i], name)) return 1;
-    size_t nl = strlen(name);
-    if (nl >= 2 && name[nl - 1] == '=') {   /* setter: "x=" -> base "x" */
-      for (int i = 0; i < cl->nwriters; i++) {
-        const char *w = cl->writers[i];
-        if (strlen(w) == nl - 1 && strncmp(w, name, nl - 1) == 0) return 1;
+  if (tci >= 0 && tci < g->c->nclasses)
+    for (int c = tci; c >= 0 && c < g->c->nclasses;
+         c = cr_emitted_parent(g, &g->c->classes[c])) {   /* the chain Crystal inherits (P22o) */
+      ClassInfo *cl = &g->c->classes[c];
+      for (int i = 0; i < cl->nreaders; i++)
+        if (sp_streq(cl->readers[i], name)) return 1;
+      size_t nl = strlen(name);
+      if (nl >= 2 && name[nl - 1] == '=') {   /* setter: "x=" -> base "x" */
+        for (int i = 0; i < cl->nwriters; i++) {
+          const char *w = cl->writers[i];
+          if (strlen(w) == nl - 1 && strncmp(w, name, nl - 1) == 0) return 1;
+        }
       }
+      /* to_h is a synthesized Struct method not in the name allowlist (which would
+         wrongly let it through on non-struct receivers). Accept it only on a struct
+         instance so the call reaches the generated method. (to_a/values are already
+         allowed; ==/[]/[]= bypass as operators.) */
+      if (cl->is_struct && !cl->is_data && sp_streq(name, "to_h")) return 1;
     }
-    /* to_h is a synthesized Struct method not in the name allowlist (which would
-       wrongly let it through on non-struct receivers). Accept it only on a struct
-       instance so the call reaches the generated method. (to_a/values are already
-       allowed; ==/[]/[]= bypass as operators.) */
-    if (cl->is_struct && !cl->is_data && sp_streq(name, "to_h")) return 1;
-  }
   return 0;
 }
 
@@ -1747,6 +1813,126 @@ static void cr_emit_const_path(CrGen *g, int id, Buf *b) {
   buf_puts(b, "::");
   const char *nm = nt_str(g->nt, id, "name");
   buf_puts(b, nm ? nm : "");
+}
+
+/* Parameter shape of a def as cr_emit_method would write it: requireds,
+   optionals, and `odd` when the shape is outside the emitted subset (rest,
+   keyword, posts). A method that reached emission has !odd; the check matters
+   for the SUPERCLASS side of a `super`, whose def may carry a shape the
+   subclass call cannot answer positionally. */
+static void cr_def_shape(CrGen *g, Scope *s, int *reqn, int *opn, int *odd) {
+  *reqn = *opn = 0; *odd = 0;
+  if (!s || s->def_node < 0) { *odd = 1; return; }
+  int params = nt_ref(g->nt, s->def_node, "parameters");
+  if (params < 0) return;
+  if (!sp_streq(nt_type(g->nt, params), "ParametersNode")) { *odd = 1; return; }
+  nt_arr(g->nt, params, "requireds", reqn);
+  nt_arr(g->nt, params, "optionals", opn);
+  int kn = 0, pn2 = 0;
+  nt_arr(g->nt, params, "keywords", &kn);
+  nt_arr(g->nt, params, "posts", &pn2);
+  if (kn || pn2 || nt_ref(g->nt, params, "rest") >= 0 ||
+      nt_ref(g->nt, params, "keyword_rest") >= 0)
+    *odd = 1;
+}
+
+/* Check that a `super` in the method being emitted has a Crystal equivalent.
+   P22n made the superclass real in the emitted header, so Crystal's own
+   `super` resolves the call and the translation is verbatim -- but only under
+   these guards, each of which is a case where Ruby raises at RUN time and
+   Crystal fails to COMPILE (the honesty discipline: name it, do not trade a
+   refusal for a build error):
+   - the enclosing method belongs to a class with an emitted superclass;
+   - the superclass chain defines the SAME name (Ruby: NoMethodError; probe:
+     "undefined method 'm' for Object");
+   - the arity lines up (Ruby: ArgumentError; Crystal: compile error);
+   - the block lines up: a bare `super` forwards the call's block, so a
+     yielding superclass method reached from a non-yielding method has no
+     block to forward (probe: "B#m is not expected to be invoked with a
+     block" / "expects a block").
+   `argc` is the explicit argument count, or -1 for the bare forwarding form,
+   which sends the enclosing method's own params. */
+static int cr_super_ok(CrGen *g, int id, int argc) {
+  if (!g->cur_meth || g->cur_class < 0 || g->cur_class >= g->c->nclasses) {
+    cr_mark_unsupported(g, id, "a `super` outside a class method body");
+    return 0;
+  }
+  Scope *me = g->cur_meth;
+  int par = cr_emitted_parent(g, &g->c->classes[g->cur_class]);
+  if (par < 0) {
+    cr_mark_unsupported(g, id, "a `super` in a class whose superclass is not an emitted user class");
+    return 0;
+  }
+  if (nt_ref(g->nt, id, "block") >= 0) {
+    cr_mark_unsupported(g, id, "a `super` with a block argument");
+    return 0;
+  }
+  int my_req = 0, my_opn = 0, my_odd = 0;
+  cr_def_shape(g, me, &my_req, &my_opn, &my_odd);   /* emitted, so !my_odd */
+  int fwd = argc < 0 ? my_req + my_opn : argc;
+  for (int c = par; c >= 0; c = cr_emitted_parent(g, &g->c->classes[c])) {
+    ClassInfo *pc = &g->c->classes[c];
+    Scope *ps = NULL;
+    for (int s = 1; s < g->c->nscopes; s++) {
+      Scope *sc = &g->c->scopes[s];
+      if (!sc->name || !sp_streq(sc->name, me->name)) continue;
+      if (sc->class_id != c || sc->is_cmethod != me->is_cmethod) continue;
+      if (sc->cs_synth) continue;   /* compiler-synthesized: no emitted Crystal def */
+      ps = sc; break;
+    }
+    if (!ps) {
+      /* attr reader/writer on the ancestor is emitted as a real def too:
+         a 0-arg getter / 1-arg setter for the arity check. */
+      int is_get = 0, is_set = 0;
+      for (int i = 0; i < pc->nreaders; i++)
+        if (sp_streq(pc->readers[i], me->name)) is_get = 1;
+      size_t nl = strlen(me->name);
+      if (nl >= 2 && me->name[nl - 1] == '=') {
+        for (int i = 0; i < pc->nwriters; i++) {
+          const char *w = pc->writers[i];
+          if (strlen(w) == nl - 1 && strncmp(w, me->name, nl - 1) == 0) is_set = 1;
+        }
+      }
+      if (is_get && fwd == 0) return 1;
+      if (is_set && fwd == 1) return 1;
+      continue;   /* this ancestor does not define it; Ruby keeps walking up */
+    }
+    int pr = 0, po = 0, odd = 0;
+    cr_def_shape(g, ps, &pr, &po, &odd);
+    if (odd) {
+      cr_mark_unsupported(g, id, "a `super` to a method with rest/keyword parameters");
+      return 0;
+    }
+    if (fwd < pr || fwd > pr + po) {
+      cr_mark_unsupported(g, id, "a `super` whose argument count does not match the superclass method");
+      return 0;
+    }
+    if (argc >= 0 && ps->yields) {
+      /* `super(args)` does NOT forward the block in Ruby either -- the parent's
+         yield would LocalJumpError -- and Crystal rejects the blockless call at
+         compile time. Refuse rather than emit either failure. */
+      cr_mark_unsupported(g, id, "a `super` with explicit arguments to a yielding superclass method");
+      return 0;
+    }
+    if (ps->yields && !me->yields) {
+      /* bare super forwards the CALL's block, but the emitter only gives this
+         method a block signature when its own body yields; a non-yielding
+         method has no guaranteed block to forward. */
+      cr_mark_unsupported(g, id, "a `super` to a yielding method from a method that takes no block");
+      return 0;
+    }
+    if (argc < 0 && me->yields && !ps->yields) {
+      cr_mark_unsupported(g, id, "a bare `super` forwarding a block to a method that takes none");
+      return 0;
+    }
+    return 1;
+  }
+  char why[176];
+  snprintf(why, sizeof why, "a `super` call: no superclass of '%s' defines '%s'",
+           g->c->classes[g->cur_class].name ? g->c->classes[g->cur_class].name : "?",
+           me->name ? me->name : "?");
+  cr_mark_unsupported(g, id, why);
+  return 0;
 }
 
 /* ---- expressions ---- */
@@ -2096,6 +2282,33 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
         cr_emit_expr(g, argv[i], b);
       }
       if (argc > 0) buf_puts(b, ")");
+      return;
+    }
+    case NK_SuperNode: {
+      /* `super` with explicit parens (possibly empty): Crystal's `super(args)`
+         is the same call against the same ancestor chain P22n put in the class
+         header, so the translation is verbatim once cr_super_ok vouches for it. */
+      int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+      if (!cr_super_ok(g, id, argc)) { buf_puts(b, "nil"); return; }
+      buf_puts(b, "super(");
+      for (int i = 0; i < argc; i++) {
+        if (i) buf_puts(b, ", ");
+        if (nt_kind(g->nt, argv[i]) == NK_SplatNode) {
+          cr_mark_unsupported(g, argv[i], "a splat argument to super");
+          buf_puts(b, "nil");
+          continue;
+        }
+        cr_emit_expr(g, argv[i], b);
+      }
+      buf_puts(b, ")");
+      return;
+    }
+    case NK_ForwardingSuperNode: {
+      /* Ruby's bare `super` forwards the enclosing method's params (and the
+         call's block); Crystal's bare `super` does the same, so it drops in
+         verbatim once cr_super_ok vouches for the name, arity and block. */
+      if (!cr_super_ok(g, id, -1)) { buf_puts(b, "nil"); return; }
+      buf_puts(b, "super");
       return;
     }
     default: {
@@ -3770,6 +3983,24 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
     int dflt = nt_ref(g->nt, opts[i], "value");
     LocalVar *lv = scope_local(s, pn);
     TyKind pt = lv ? lv->type : TY_UNKNOWN;
+    /* A `nil` default with a concrete inferred type emits `h : String = nil`.
+       Crystal only rejects that when the default is INSTANTIATED -- a call
+       that omits the argument -- so check for one: every program whose call
+       sites all supply the parameter keeps building (folded_ternary_arm_
+       takes_result_type), while a visible omitting call makes the build
+       error predictable, so refuse at the def. */
+    if (dflt >= 0 && nt_kind(g->nt, dflt) == NK_NilNode &&
+        cr_param_omitted_anywhere(g, s, reqn + i)) {
+      Buf probe; memset(&probe, 0, sizeof probe);
+      int concrete = cr_map_type(g, pt, &probe);
+      free(probe.p);
+      if (concrete) {
+        cr_mark_unsupported(g, s->def_node, "an optional parameter with a nil "
+                           "default that a call site omits, whose type is "
+                           "inferred non-nilable (Crystal cannot restrict the "
+                           "default to that type)");
+      }
+    }
     if (!first) buf_puts(b, ", "); first = 0;
     buf_printf(b, "%s", cr_local(pn));
     cr_emit_type_ann(g, pt, b);
@@ -3819,13 +4050,16 @@ static void cr_emit_method(CrGen *g, Scope *s, Buf *b) {
   for (int i = 0; i < reqn; i++) nameset_add(&g->locals, nt_str(g->nt, reqs[i], "name"));
   for (int i = 0; i < opn; i++) nameset_add(&g->locals, nt_str(g->nt, opts[i], "name"));
   int saved_class = g->cur_class;
+  Scope *saved_meth = g->cur_meth;
   g->cur_class = s->class_id;   /* receiverless calls resolve against this class */
+  g->cur_meth = s;              /* `super` checks itself against this method */
   int saved_uses = g->nil_uses.n;   /* pre-pass: which locals are only read nil-safely */
   cr_scan_nil_uses(g, s->body, &g->nil_uses, 0);
   int saved_tail = g->tail_value;
   g->tail_value = cr_tail_stmt(g, s->body);
   cr_emit_stmts(g, s->body, b, 1);
   g->tail_value = saved_tail;
+  g->cur_meth = saved_meth;
   g->cur_class = saved_class;
   g->nil_uses.n = saved_uses;
   cr_pop_scope(g, saved);
@@ -4088,12 +4322,29 @@ static int cr_has_unverified_poly_call(CrGen *g) {
    an unrelated class, so the re-declaration was harmless and the bug was invisible. */
 static int cr_class_inherits_ivar(CrGen *g, ClassInfo *ci, const char *name) {
   if (!ci || !name) return 0;
-  for (int p = ci->parent; p >= 0 && p < g->c->nclasses; ) {
+  for (int p = cr_emitted_parent(g, ci); p >= 0;
+       p = cr_emitted_parent(g, &g->c->classes[p])) {
     ClassInfo *pc = &g->c->classes[p];
     for (int i = 0; i < pc->nivars; i++)
       if (sp_streq(pc->ivars[i], name)) return 1;
-    p = pc->parent;
   }
+  return 0;
+}
+
+/* True when the class body itself defines `initialize` (the scan cr_emit_class
+   did inline, factored out so the inherited-constructor check can run it per
+   ancestor). */
+static int cr_class_init_in_body(CrGen *g, ClassInfo *ci) {
+  if (!ci || ci->def_node < 0) return 0;
+  const char *cty = nt_type(g->nt, ci->def_node);
+  if (!cty || !(sp_streq(cty, "ClassNode") || sp_streq(cty, "ModuleNode"))) return 0;
+  int cbody0 = nt_ref(g->nt, ci->def_node, "body");
+  if (cbody0 < 0) return 0;
+  int nn = 0; const int *aa = nt_arr(g->nt, cbody0, "body", &nn);
+  for (int i = 0; i < nn; i++)
+    if (nt_kind(g->nt, aa[i]) == NK_DefNode &&
+        sp_streq(nt_str(g->nt, aa[i], "name") ? nt_str(g->nt, aa[i], "name") : "", "initialize"))
+      return 1;
   return 0;
 }
 
@@ -4125,6 +4376,97 @@ static int cr_ivar_assigned_in_init(CrGen *g, ClassInfo *ci, const char *name) {
     if (w && sp_streq(w, name)) return 1;
   }
   return 0;
+}
+
+/* True when some visible call site of scope `s` OMITS positional parameter `pi`,
+   so a `= nil` default there is really instantiated. `initialize` is reached
+   through `K.new` on a constant naming the class or a subclass under it -- the
+   same reachability rule the analyzer's param-supplied scan uses; a `new` on a
+   dynamic receiver (a class value) is invisible here, which is the documented
+   class-value limitation, not a refusal this guard can see. Crystal only
+   rejects a nil default against a concrete restriction when the default is
+   instantiated, so a param every call site supplies stays emittable. */
+static int cr_param_omitted_anywhere(CrGen *g, Scope *s, int pi) {
+  const NodeTable *nt = g->nt;
+  if (!s->name) return 0;
+  int is_init = sp_streq(s->name, "initialize");
+  for (int id = 0; id < nt->count; id++) {
+    if (nt_kind(nt, id) != NK_CallNode) continue;
+    const char *nm = nt_str(nt, id, "name");
+    if (!nm) continue;
+    if (!sp_streq(nm, s->name) && !(is_init && sp_streq(nm, "new"))) continue;
+    if (is_init && sp_streq(nm, "new")) {
+      int recv = nt_ref(nt, id, "receiver");
+      NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : NK_CallNode;
+      if (rk != NK_ConstantReadNode && rk != NK_ConstantPathNode) continue;
+      const char *rn = nt_str(nt, recv, "name");
+      int rci = rn ? comp_class_index(g->c, rn) : -1;
+      if (rci < 0 || s->class_id < 0) continue;
+      int under = 0;
+      for (int k = rci; k >= 0 && k < g->c->nclasses; k = g->c->classes[k].parent)
+        if (k == s->class_id) { under = 1; break; }
+      if (!under) continue;
+    }
+    int args = nt_ref(nt, id, "arguments");
+    int n = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &n) : NULL;
+    int pos = 0, unknown = 0;
+    for (int k = 0; k < n; k++) {
+      NodeKind ak = nt_kind(nt, av[k]);
+      if (ak == NK_SplatNode) { unknown = 1; break; }
+      const char *aty = nt_type(nt, av[k]);
+      if (aty && sp_streq(aty, "ForwardingArgumentsNode")) { unknown = 1; break; }
+      if (ak == NK_BlockArgumentNode) continue;
+      pos++;
+    }
+    if (unknown) continue;   /* a spread could supply it -- do not claim omission */
+    if (pos <= pi) return 1;
+  }
+  return 0;
+}
+
+/* The index of the LAST statement in a class body that (re)defines method
+   `name` (writers spelled "x="): a DefNode with that name, or an
+   attr_reader/attr_writer/attr_accessor call declaring it. Ruby's rule is
+   last-definition-wins, but the emitter writes the body's defs first and the
+   attr defs after, so each side must check it is the winner before emitting:
+   `attr_reader :x` followed by a later `def x` must run the DEF, not the
+   reader (and the reverse order must run the reader). Returns -1 when this
+   body defines `name` nowhere (an inherited accessor copy the analyzer put in
+   readers[]/writers[] is not a body statement). */
+static int cr_body_last_defines(const NodeTable *nt, const int *arr, int n,
+                                const char *name) {
+  if (!name) return -1;
+  size_t nl = strlen(name);
+  int last = -1;
+  for (int i = 0; i < n; i++) {
+    NodeKind kk = nt_kind(nt, arr[i]);
+    if (kk == NK_DefNode) {
+      /* `def self.x` has a receiver: it defines a CLASS method, which no attr
+         call ever replaces, so it is not part of the instance-name contest. */
+      if (nt_ref(nt, arr[i], "receiver") >= 0) continue;
+      const char *dn = nt_str(nt, arr[i], "name");
+      if (dn && sp_streq(dn, name)) last = i;
+    } else if (kk == NK_CallNode) {
+      const char *cn = nt_str(nt, arr[i], "name");
+      if (!cn) continue;
+      int reader = sp_streq(cn, "attr_reader") || sp_streq(cn, "attr_accessor") ||
+                   sp_streq(cn, "attr") || sp_streq(cn, "attribute") ||
+                   sp_streq(cn, "attributes");
+      int writer = sp_streq(cn, "attr_writer") || sp_streq(cn, "attr_accessor");
+      if (!reader && !writer) continue;
+      int args = nt_ref(nt, arr[i], "arguments");
+      int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+      for (int a = 0; a < an; a++) {
+        if (nt_kind(nt, av[a]) != NK_SymbolNode) continue;
+        const char *base = nt_str(nt, av[a], "value");
+        if (!base) continue;
+        if (reader && sp_streq(base, name)) last = i;
+        if (writer && nl >= 2 && name[nl - 1] == '=' &&
+            strlen(base) == nl - 1 && strncmp(base, name, nl - 1) == 0) last = i;
+      }
+    }
+  }
+  return last;
 }
 
 /* ---- classes ---- */
@@ -4165,12 +4507,7 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      itself an emitted user class is carried: a builtin/native parent is left off,
      since `< Object` would drag in a superclass the emitter does not model. */
   {
-    int par = -1;
-    if (!is_module && ci->parent >= 0 && ci->parent < g->c->nclasses) {
-      ClassInfo *p = &g->c->classes[ci->parent];
-      if (!p->is_native_class && p->name && p->def_node >= 0)
-        par = ci->parent;
-    }
+    int par = is_module ? -1 : cr_emitted_parent(g, ci);
     if (par >= 0) buf_printf(b, "%s %s < %s\n", "class", ci->name,
                              g->c->classes[par].name);
     else         buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
@@ -4187,21 +4524,26 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      to nil and declare it nilable (`T?`). `uninitialized T` would compile but
      leave a reference ivar unreadable (a later read that Ruby answers nil
      segfaults), so nil is the only safe seed. */
-  int has_init = 0;
-  if (!is_module && ci->def_node >= 0) {
-    const char *cty = nt_type(g->nt, ci->def_node);
-    int cbody0 = -1;
-    if (cty && (sp_streq(cty, "ClassNode") || sp_streq(cty, "ModuleNode")))
-      cbody0 = nt_ref(g->nt, ci->def_node, "body");
-    if (cbody0 >= 0) {
-      int nn = 0; const int *aa = nt_arr(g->nt, cbody0, "body", &nn);
-      for (int i = 0; i < nn; i++)
-        if (nt_kind(g->nt, aa[i]) == NK_DefNode &&
-            sp_streq(nt_str(g->nt, aa[i], "name") ? nt_str(g->nt, aa[i], "name") : "", "initialize"))
-          has_init = 1;
-    }
+  int has_init = cr_class_init_in_body(g, ci);
+  /* A subclass with no `initialize` of its own INHERITS the superclass's -- the
+     emitted header carries it (P22n), so Crystal resolves `.new(args)` onto it.
+     Synthesizing a no-arg seed here would SHADOW that inherited constructor:
+     `Derived.new(9)` build-fails "given 1 argument, expected 0" (the P22m
+     follow-on, P22o). Only when no class in the emitted chain defines
+     `initialize` is the seed needed: Ruby's default constructor takes no args
+     and leaves every ivar nil. */
+  int inh_init = 0;
+  for (int p = cr_emitted_parent(g, ci); p >= 0;
+       p = cr_emitted_parent(g, &g->c->classes[p])) {
+    ClassInfo *pc = &g->c->classes[p];
+    /* a Struct ancestor gets the synthesized positional constructor emitted
+       below; its "body" is the Struct.new ConstantWriteNode, which the body
+       scan cannot see. (has_init for the struct ITSELF deliberately stays a
+       body-only scan: it gates the poly-member boxing path, which must not
+       change.) */
+    if (cr_class_init_in_body(g, pc) || (pc->is_struct && !pc->is_data)) { inh_init = 1; break; }
   }
-  int synth_init = !is_module && !ci->is_struct && !has_init && ci->nivars > 0;
+  int synth_init = !is_module && !ci->is_struct && !has_init && !inh_init && ci->nivars > 0;
 
   int all_ivars_typed = 1;
   if (!is_module)
@@ -4405,14 +4747,24 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
       }
     }
   }
+  int bn = 0; const int *barr = NULL;
   if (cbody >= 0) {
     int n = 0; const int *arr = nt_arr(g->nt, cbody, "body", &n);
+    bn = n; barr = arr;
     for (int i = 0; i < n; i++) {
       NodeKind kk = nt_kind(g->nt, arr[i]);
       if (kk == NK_DefNode) {
         Scope *s = cr_scope_for_def(g->c, arr[i]);
-        if (s) cr_emit_method(g, s, b);
-        if ((CR_POLY_DISPATCH || CR_POLY_LOCALS) && s && !s->is_cmethod && s->name && ndmeth < 256) dmeth[ndmeth++] = s;
+        /* Ruby: last definition wins. An attr declared LATER in this same body
+           replaces an earlier def of the same name, so the def is skipped (the
+           attr's def is emitted after the body and takes the win). A `def
+           self.x` cmethod is not in that contest -- attrs only ever define
+           instance methods -- so it always emits. */
+        int win = (s && s->name && !s->is_cmethod) ? cr_body_last_defines(g->nt, arr, n, s->name) : i;
+        if (s && win == i) {
+          cr_emit_method(g, s, b);
+          if ((CR_POLY_DISPATCH || CR_POLY_LOCALS) && !s->is_cmethod && s->name && ndmeth < 256) dmeth[ndmeth++] = s;
+        }
       } else if (kk == NK_ClassNode || kk == NK_ModuleNode) {
         /* nested class/module: emit recursively (Crystal is lenient about the
            indentation of nested type bodies). */
@@ -4462,11 +4814,19 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
     }
   }
 
-  /* attr readers / writers (resolved by the analyzer into ci->readers/writers) */
+  /* attr readers / writers (resolved by the analyzer into ci->readers/writers).
+     A same-named def LATER in this body wins in Ruby, so check which side is
+     the last definition before emitting the attr's def. */
   for (int i = 0; i < ci->nreaders; i++) {
+    int win = cr_body_last_defines(g->nt, barr, bn, ci->readers[i]);
+    if (win >= 0 && nt_kind(g->nt, barr[win]) == NK_DefNode) continue;
     buf_printf(b, "  def %s\n    @%s\n  end\n", ci->readers[i], ci->readers[i]);
   }
   for (int i = 0; i < ci->nwriters; i++) {
+    char wname[128];
+    snprintf(wname, sizeof wname, "%s=", ci->writers[i]);
+    int win = cr_body_last_defines(g->nt, barr, bn, wname);
+    if (win >= 0 && nt_kind(g->nt, barr[win]) == NK_DefNode) continue;
     buf_printf(b, "  def %s=(v)\n    @%s = v\n  end\n", ci->writers[i], ci->writers[i]);
   }
 

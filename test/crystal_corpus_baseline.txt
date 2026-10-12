@@ -1,4 +1,4 @@
-REFUSED   test_abstract_raise_override_return
+PASS     test_abstract_raise_override_return
 REFUSED   test_addrinfo_family_predicates
 REFUSED   test_alias_attr_reader_source
 REFUSED   test_alias_captures_earlier_def
@@ -180,7 +180,7 @@ REFUSED   test_at_exit_skipped_by_exit_bang
 REFUSED   test_attr_accessor_dead_writer_ptr_array_narrow
 REFUSED   test_attr_or_write_slot_kinds
 REFUSED   test_attr_or_write_unset_slot
-BUILDFAIL test_attr_override_dispatch
+PASS     test_attr_override_dispatch
 REFUSED   test_attr
 REFUSED   test_attr_reader_override_type
 REFUSED   test_attr_write_boxed_dispatch
@@ -492,7 +492,7 @@ REFUSED   test_bundle_class_23
 REFUSED   test_bundle_class_a
 REFUSED   test_bundle_classd_04
 REFUSED   test_bundle_classd_05
-BUILDFAIL test_bundle_classd_08
+PASS     test_bundle_classd_08
 REFUSED   test_bundle_classd_09
 REFUSED   test_bundle_classd_10
 REFUSED   test_bundle_classd_11
@@ -512,7 +512,7 @@ REFUSED   test_bundle_classd_36
 PASS     test_bundle_classd_38
 PASS     test_bundle_classd_39
 REFUSED   test_bundle_classd_43
-REFUSED   test_bundle_classd_45
+PASS     test_bundle_classd_45
 REFUSED   test_bundle_classd_46
 REFUSED   test_bundle_classd_48
 REFUSED   test_bundle_classd_49
@@ -734,7 +734,7 @@ REFUSED   test_class_value_new_kwsplat_default_reads_param
 REFUSED   test_class_value_new_kwsplat_other_ctor_default
 REFUSED   test_class_value_new_kwsplat_skips_other_ctors
 REFUSED   test_class_value_new_leading_optional
-REFUSED   test_class_value_new_optional_param
+BUILDFAIL test_class_value_new_optional_param
 REFUSED   test_class_value_new_positional_ctor_param
 REFUSED   test_class_value_new_rest_posts
 REFUSED   test_class_value_new_self_ctor_param
@@ -770,10 +770,10 @@ PASS     test_cmeth_name_collision_with_kernel
 REFUSED   test_cmethod_inline_yield_sibling_self_cls
 REFUSED   test_cmethod_override_without_super_leaves_ancestor_out
 REFUSED   test_cmethod_self_and_default
-REFUSED   test_cmethod_self_receiver
-BUILDFAIL test_cmethod_specialize_samename_unrelated
-REFUSED   test_cmethod_super_past_a_deep_chain
-REFUSED   test_cmethod_super
+PASS     test_cmethod_self_receiver
+PASS     test_cmethod_specialize_samename_unrelated
+PASS     test_cmethod_super_past_a_deep_chain
+PASS     test_cmethod_super
 REFUSED   test_cmethod_tail_class_ivar_write
 PASS     test_cmethod_transitive_specialization
 REFUSED   test_cmeth_return_nil_or_obj_via_intermediate
@@ -942,7 +942,7 @@ REFUSED   test_data_with
 REFUSED   test_data_with_unknown_kw
 REFUSED   test_dead_method_same_name_other_class
 REFUSED   test_default_arg_find_block
-REFUSED   test_default_arg_ivar_module_subclass
+PASS     test_default_arg_ivar_module_subclass
 PASS     test_default_arg_ivar_value_receiver
 REFUSED   test_default_args
 REFUSED   test_default_call_name_body_local
@@ -2758,7 +2758,7 @@ BUILDFAIL test_nilclass_bool_ops_conversions
 REFUSED   test_nil_collection_methods_raise
 REFUSED   test_nil_default_param_lsp_shape
 REFUSED   test_nil_default_param_unsupplied
-BUILDFAIL test_nil_default_param_widens_to_poly
+REFUSED   test_nil_default_param_widens_to_poly
 REFUSED   test_nil_from_int_container_arithmetic
 REFUSED   test_nil_guard_narrows_int_or_nil
 REFUSED   test_nil_guard_param_narrow
@@ -2909,7 +2909,7 @@ REFUSED   test_p_bignum
 REFUSED   test_pin_compares_by_value
 REFUSED   test_pointer_type_miscompiles
 PASS     test_poly2
-BUILDFAIL test_poly_all_class_root
+PASS     test_poly_all_class_root
 REFUSED   test_poly_any_builtin_fallback
 BUILDFAIL test_poly_aref_hash_default
 REFUSED   test_poly_aref_proc_and_class_method
@@ -2984,13 +2984,13 @@ REFUSED   test_poly_dispatch_block_arg
 REFUSED   test_poly_dispatch_block_capture
 REFUSED   test_poly_dispatch_blockless_blk_method
 REFUSED   test_poly_dispatch_builtin_all
-BUILDFAIL test_poly_dispatch_builtin_container_arm
+REFUSED   test_poly_dispatch_builtin_container_arm
 REFUSED   test_poly_dispatch_builtin_enum_arm
 PASS     test_poly_dispatch_builtin
 REFUSED   test_poly_dispatch_comparator_slot
 REFUSED   test_poly_dispatch_default_reads_param
 REFUSED   test_poly_dispatch_hash_param_variant
-BUILDFAIL test_poly_dispatch_inherited_attr_reader
+PASS     test_poly_dispatch_inherited_attr_reader
 PASS     test_poly_dispatch_inherited_method
 REFUSED   test_poly_dispatch_keyword_args
 REFUSED   test_poly_dispatch_kwargs_builtin_name
@@ -3000,7 +3000,7 @@ REFUSED   test_poly_dispatch_mutated_string
 REFUSED   test_poly_dispatch_narrow_return_type
 REFUSED   test_poly_dispatch_proc_form_reopened
 REFUSED   test_poly_dispatch_proc_form_untyped_param
-BUILDFAIL test_poly_dispatch_ptr_array
+REFUSED   test_poly_dispatch_ptr_array
 REFUSED   test_poly_dispatch_quo_modulo_div_collision
 REFUSED   test_poly_dispatch_reader_unbox
 REFUSED   test_poly_dispatch_recv_gc_root
@@ -3053,7 +3053,7 @@ REFUSED   test_poly_hash_index_dispatch
 REFUSED   test_poly_hash_inspect
 REFUSED   test_poly_hash_is_int_with_user_hash
 BUILDFAIL test_poly_hash_key_p_kinds
-BUILDFAIL test_poly_hash_slice_recv_from_dispatch
+REFUSED   test_poly_hash_slice_recv_from_dispatch
 REFUSED   test_poly_hash_slice_under_poly_user_slice
 REFUSED   test_poly_hash_surface
 PASS     test_poly_hash_with_range
@@ -3681,7 +3681,7 @@ REFUSED   test_self_class_divergent_returns
 REFUSED   test_self_class_new_construction
 REFUSED   test_self_class_new_in_superclass
 REFUSED   test_self_class_new_narrowed_arg
-BUILDFAIL test_self_new_with_args
+PASS     test_self_new_with_args
 PASS     test_self_operator_subclass_dispatch
 REFUSED   test_self_recursive_block_given_forward
 REFUSED   test_self_referential_ivar_reader
@@ -4044,7 +4044,7 @@ REFUSED   test_struct_valuesat_hash_set_init_wave10
 REFUSED   test_struct_yield_initialize
 REFUSED   test_str_unpack_gc_root
 REFUSED   test_subclasses_skip_singleton
-BUILDFAIL test_subclass_inherits_module_parent
+PASS     test_subclass_inherits_module_parent
 REFUSED   test_subclass_only_method_with_args
 REFUSED   test_subclass_ring_dispatch
 REFUSED   test_subclass_through_base_slot
@@ -4062,7 +4062,7 @@ REFUSED   test_super_anon_block_splice_variants
 REFUSED   test_super_attr_mid_redeclare
 REFUSED   test_super_block_arg_explicit
 REFUSED   test_super_forward_block_given
-REFUSED   test_super_in_non_initialize
+PASS     test_super_in_non_initialize
 REFUSED   test_super_in_selfnew_is_class_new
 REFUSED   test_super_into_attr
 REFUSED   test_super_into_included_module
@@ -4072,7 +4072,7 @@ REFUSED   test_super_missing_hash_slot
 REFUSED   test_super_object_initialize
 REFUSED   test_super_qualified_superclass
 REFUSED   test_super_splat_spreads_into_parent
-REFUSED   test_super_with_args
+PASS     test_super_with_args
 REFUSED   test_surplus_arg_refusal
 REFUSED   test_symbol_casecmp
 REFUSED   test_symbol_case_setbyte_chr_toc
@@ -4292,7 +4292,7 @@ REFUSED   test_user_enumerable_first_boxed
 REFUSED   test_user_enumerable_reach
 REFUSED   test_user_inject_forwarded_block
 REFUSED   test_user_join_on_block_param
-REFUSED   test_user_method_named_eval
+PASS     test_user_method_named_eval
 REFUSED   test_user_method_shared_builtin_name
 REFUSED   test_user_negation_methods
 REFUSED   test_user_operator_on_block_param
@@ -4323,8 +4323,8 @@ REFUSED   test_value_type_identity
 PASS     test_value_type_interp_to_s
 REFUSED   test_value_type_object_in_static_slot
 REFUSED   test_value_type_tuple_gc_scan
-REFUSED   test_virtual_dispatch_void_override_empty_base
-REFUSED   test_virtual_dispatch_void_override
+PASS     test_virtual_dispatch_void_override_empty_base
+PASS     test_virtual_dispatch_void_override
 REFUSED   test_visibility_explicit_receiver
 REFUSED   test_void_value_and_case
 PASS     test_void_value_begin_writer_tail

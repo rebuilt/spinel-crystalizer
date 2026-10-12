@@ -398,6 +398,71 @@ a << 1
 a[0] = "x"
 p a'
 
+# P22o: a subclass inherits the emitted superclass, so a call that resolves to a
+# superclass def (or an inherited attr reader) translates. P22p: `super` (bare
+# and with args) translates when the superclass really defines the method and
+# the arity matches; a `super` to a missing parent method or with a mismatched
+# argument count is refused (Ruby raises NoMethodError/ArgumentError, but the
+# emitted Crystal would be a build error, so the refusal names the line).
+expect_agree "super_bare_noargs" 'class Base
+  def initialize(x)
+    @x = x
+  end
+  def show
+    "b:#{@x}"
+  end
+end
+class Derived < Base
+  def initialize(x)
+    super
+    @y = x * 2
+  end
+end
+puts Derived.new(3).show'
+expect_agree "super_with_args" 'class Base
+  def initialize(x)
+    @x = x
+  end
+end
+class Derived < Base
+  def initialize(x, y)
+    super(y)
+    @z = x + y
+  end
+  def show
+    "d:#{@x}/#{@z}"
+  end
+end
+puts Derived.new(1, 2).show'
+expect_agree "inherited_reader" 'class Base
+  attr_reader :x
+  def initialize(v)
+    @x = v
+  end
+end
+class Child < Base
+end
+puts Child.new(7).x'
+expect_refuse "no superclass of 'Derived' defines 'm'" 'class Base
+end
+class Derived < Base
+  def m
+    super
+  end
+end
+puts Derived.new.m'
+expect_refuse "argument count does not match the superclass method" 'class Base
+  def m(a)
+    a
+  end
+end
+class Derived < Base
+  def m
+    super(1, 2)
+  end
+end
+puts Derived.new.m'
+
 # ---- DIVERGE: emitted, but differs from CRuby on a known edge ---------------
 
 # .each returns nil in Crystal (not the receiver), so it cannot be chained.
