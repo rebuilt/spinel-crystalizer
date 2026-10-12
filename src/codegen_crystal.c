@@ -2779,6 +2779,55 @@ static int cr_is_blockless_wi(CrGen *g, int id) {
   return ty_is_array(at) || at == TY_RANGE || at == TY_POLY_ARRAY;
 }
 
+/* P22r: a desugared Enumerable builtin call. A program that calls a method from
+   builtins/enumerable.rb (flat_map, each_with_object, minmax, ...) has the
+   analyzer rewrite `recv.m(args) { blk }` into a bare helper call
+   `__enum_m__<id>(recv, args) { blk }` -- the receiver becomes argument 0 and
+   the call carries no receiver of its own. Crystal's stdlib has almost all of
+   these under the same name, so the emitter reconstructs the original call.
+   Returns the Crystal method name and writes the Ruby method name into
+   ruby[0..ruby_sz) (the block emitter's yield oracle `ty_block_yield` is keyed
+   on Ruby names -- `drop_while`, not `skip_while`), or NULL to keep the
+   refusal. Only names whose Crystal answer is verified identical are listed:
+   filter_map (Crystal compact_map drops only nil, Ruby drops false too),
+   grep/grep_v and each_with_index (Crystal answers nil, Ruby the receiver) are
+   deliberately absent. */
+static const char *cr_enum_passthrough(const char *name, TyKind recv_ty, char *ruby, size_t ruby_sz) {
+  if (!name || strncmp(name, "__enum_", 7) != 0) return NULL;
+  const char *p = name + 7;
+  const char *sep = strrchr(p, '_');       /* the second '_' of "__<id>" */
+  if (!sep || sep <= p || sep[-1] != '_') return NULL;
+  for (const char *d = sep + 1; *d; d++)
+    if (*d < '0' || *d > '9') return NULL;
+  size_t n = (size_t)(sep - 1 - p);
+  if (n == 0 || n >= ruby_sz) return NULL;
+  memcpy(ruby, p, n); ruby[n] = 0;
+#define CR_ENUM_IS(s) (n == strlen(s) && strncmp(p, s, n) == 0)
+  /* Only the names whose Crystal stdlib form is verified identical for the
+     corpus call shapes are listed. The rest keep the named refusal: measured,
+     max_by/min_by reject the `(n)` argument form, Crystal's Hash has no
+     filter/partition/minmax_by of the shape Ruby uses, and blockless forms and
+     pair-yielding methods (min_by/find/minmax/...) answer Tuples or take a
+     different arity, so passing them through traded a refusal for a build
+     error or a silently different answer. `none?`/`drop_while` are
+     probe-verified but not yet exercised by the corpus. */
+  if (CR_ENUM_IS("inject"))     return "reduce";
+  if (CR_ENUM_IS("drop_while")) {
+    /* Crystal's Hash#skip_while answers an Array of Tuples where Ruby's
+       Hash#drop_while answers an Array of [k, v] Arrays. Only a receiver whose
+       element shape the method preserves (an Array or a Range) is safe; a Hash,
+       or a widened/uninferred receiver that could be one at run time, keeps the
+       refusal. */
+    if (!ty_is_array(recv_ty) && recv_ty != TY_RANGE) return NULL;
+    return "skip_while";
+  }
+  static const char *const same[] = { "each_with_object", "count", "none?" };
+  for (size_t i = 0; i < sizeof same / sizeof same[0]; i++)
+    if (CR_ENUM_IS(same[i])) return same[i];
+#undef CR_ENUM_IS
+  return NULL;
+}
+
 static void cr_emit_call(CrGen *g, int id, Buf *b) {
   const char *name = nt_str(g->nt, id, "name");
   int recv  = nt_ref(g->nt, id, "receiver");
@@ -3558,6 +3607,29 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
        (Crystal's stdlib answers them). We never emit those bodies, so a call to
        one would dangle -- refuse it rather than ship a reference to nothing. */
     if (name[0] == '_' && name[1] == '_') {
+      /* P22r: a desugared Enumerable call whose Crystal stdlib form is
+         identical. The helper is `__enum_m(recv, args)`, the receiver first;
+         reconstruct `recv.m(args) { blk }`. A `reduce`/`inject` op-symbol
+         argument (`arr.inject(:+)`) has no Crystal form, so it stays refused.
+         The block is emitted with the RUBY name (the yield oracle is keyed on
+         Ruby names), the call with the Crystal name. */
+      char ruby[32];
+      TyKind erty = argc >= 1 ? comp_ntype(g->c, argv[0]) : TY_UNKNOWN;
+      const char *real = cr_enum_passthrough(name, erty, ruby, sizeof ruby);
+      int sym_op = 0;
+      for (int i = 1; i < argc; i++)
+        if (nt_kind(g->nt, argv[i]) == NK_SymbolNode) sym_op = 1;
+      if (real && !(sym_op && sp_streq(real, "reduce")) && recv < 0 && argc >= 1) {
+        cr_emit_recv(g, argv[0], b);
+        buf_printf(b, ".%s(", real);
+        for (int i = 1; i < argc; i++) {
+          if (i > 1) buf_puts(b, ", ");
+          cr_emit_expr(g, argv[i], b);
+        }
+        buf_puts(b, ")");
+        if (block >= 0) cr_emit_block(b, g, block, 0, argv[0], ruby);
+        return;
+      }
       cr_mark_unsupportedf(g, id, "a compiler-synthesized helper call (`%s`)", name);
       buf_puts(b, "nil");
       return;

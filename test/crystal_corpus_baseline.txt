@@ -470,7 +470,7 @@ REFUSED   test_bundle_array_c
 REFUSED   test_bundle_array_d
 REFUSED   test_bundle_array_e
 REFUSED   test_bundle_array_f
-REFUSED   test_bundle_class_01
+PASS     test_bundle_class_01
 REFUSED   test_bundle_class_03
 REFUSED   test_bundle_class_05
 REFUSED   test_bundle_class_06
@@ -886,7 +886,7 @@ PASS     test_control_flow_while_modifier_method
 REFUSED   test_control
 REFUSED   test_conv_bridge_boxed_answer
 REFUSED   test_conv_typeerror_names_the_right_class
-REFUSED   test_count_block_poly_pred
+PASS     test_count_block_poly_pred
 DIFF     test_count_uses_equality
 REFUSED   test_crashers_536
 PASS     test_crystal_block_auto_splat
@@ -1617,7 +1617,7 @@ REFUSED   test_hash_user_key_eql
 REFUSED   test_hash_user_key
 REFUSED   test_hash_value_p
 REFUSED   test_hash_values_at_fetch_values
-REFUSED   test_hash_values_inject_sym
+PASS     test_hash_values_inject_sym
 PASS     test_hash_value_split_widen
 PASS     test_hash_variant_call_boundary_sym
 REFUSED   test_hash_variant_eq
@@ -2136,7 +2136,7 @@ REFUSED   test_issue_3098
 BUILDFAIL test_issue_3099
 REFUSED   test_issue_3100
 REFUSED   test_issue_3101
-REFUSED   test_issue_3102
+PASS     test_issue_3102
 REFUSED   test_issue_3103
 BUILDFAIL test_issue_3104
 REFUSED   test_issue_3105
