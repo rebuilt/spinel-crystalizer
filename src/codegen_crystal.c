@@ -117,6 +117,20 @@ static void cr_mark_unsupported(CrGen *g, int id, const char *why) {
   }
 }
 
+/* Same as cr_mark_unsupported, for a reason that has a name in it. Building the
+   message here keeps the call sites free of the `char msg[N]; snprintf(...)`
+   dance and centralises the truncation (a long name can never overflow). */
+static void cr_mark_unsupportedf(CrGen *g, int id, const char *fmt, ...)
+  __attribute__((format(printf, 3, 4)));
+static void cr_mark_unsupportedf(CrGen *g, int id, const char *fmt, ...) {
+  char msg[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  cr_mark_unsupported(g, id, msg);
+}
+
 static void cr_indent(Buf *b, int n) { for (int i = 0; i < n; i++) buf_puts(b, "  "); }
 
 /* ---- local-name set (per-scope declaration tracking) ---- */
@@ -1798,9 +1812,7 @@ static void cr_emit_const_path(CrGen *g, int id, Buf *b) {
       if (cr_const_remap(owner, leaf, b)) return;
       const char *why = user_class ? NULL : cr_missing_const(owner, leaf);
       if (why) {
-        char msg[176];
-        snprintf(msg, sizeof msg, "the constant '%s::%s' (%s)", owner, leaf, why);
-        cr_mark_unsupported(g, id, msg);
+        cr_mark_unsupportedf(g, id, "the constant '%s::%s' (%s)", owner, leaf, why);
         buf_puts(b, "nil");
         return;
       }
@@ -1871,12 +1883,10 @@ static int cr_super_ok(CrGen *g, int id, int argc) {
                      p->enclosing_class != self->enclosing_class)
                     ? "is nested where the header cannot name it"
                     : "is reopened at more than one site";
-    char whybuf[128];
-    snprintf(whybuf, sizeof whybuf,
-             "a `super` in a class whose superclass %s%s%s",
-             p && p->name ? "`" : "", p && p->name ? p->name : why,
-             p && p->name ? "`" : "");
-    cr_mark_unsupported(g, id, whybuf);
+    cr_mark_unsupportedf(g, id,
+        "a `super` in a class whose superclass %s%s%s",
+        p && p->name ? "`" : "", p && p->name ? p->name : why,
+        p && p->name ? "`" : "");
     return 0;
   }
   if (nt_ref(g->nt, id, "block") >= 0) {
@@ -2042,9 +2052,7 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
           if (sp_streq(g->c->classes[ci].name, n)) { user_class = 1; break; }
         const char *why = user_class ? NULL : cr_missing_const(NULL, n);
         if (why) {
-          char msg[176];
-          snprintf(msg, sizeof msg, "the constant '%s' (%s)", n, why);
-          cr_mark_unsupported(g, id, msg);
+          cr_mark_unsupportedf(g, id, "the constant '%s' (%s)", n, why);
           buf_puts(b, "nil");
           return;
         }
@@ -3457,9 +3465,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
        (Crystal's stdlib answers them). We never emit those bodies, so a call to
        one would dangle -- refuse it rather than ship a reference to nothing. */
     if (name[0] == '_' && name[1] == '_') {
-      char whybuf[128];
-      snprintf(whybuf, sizeof whybuf, "a compiler-synthesized helper call (`%s`)", name);
-      cr_mark_unsupported(g, id, whybuf);
+      cr_mark_unsupportedf(g, id, "a compiler-synthesized helper call (`%s`)", name);
       buf_puts(b, "nil");
       return;
     }
