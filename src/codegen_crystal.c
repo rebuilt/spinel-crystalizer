@@ -962,6 +962,29 @@ static int cr_needs_parens(CrGen *g, int id) {
   if (!n) return 0;
   return cr_is_binop(n) || sp_streq(n, "-@") || sp_streq(n, "+@") || sp_streq(n, "!");
 }
+
+/* A call that carries a `do ... end` block ends with `end`; where such a call
+   sits in operand or collection-element position, the `end` would swallow the
+   following operator, comma or bracket (`arr.map do ... end >= 0.0`,
+   `[f do ... end, g]`). Parenthesize it there. This is deliberately NOT folded
+   into cr_needs_parens: a receiver/`[i]` position is left alone, because
+   parenthesizing a block call used as the receiver of an index (`arr.map do ...
+   end[0]`) is the one shape that would newly BUILD a program whose answer then
+   diverges (Float#round's sign of zero, test_issue_3235) -- the honesty rule
+   prefers it stay a BUILDFAIL over a silently wrong DIFF. */
+static int cr_node_is_blockcall(CrGen *g, int id) {
+  return id >= 0 && nt_kind(g->nt, id) == NK_CallNode &&
+         nt_ref(g->nt, id, "block") >= 0;
+}
+
+/* Emit a subexpression in operand or element position: wrap the operator forms
+   cr_needs_parens already knew about, plus a block-bearing call. */
+static void cr_emit_operand(CrGen *g, int id, Buf *b) {
+  int paren = cr_needs_parens(g, id) || cr_node_is_blockcall(g, id);
+  if (paren) buf_puts(b, "(");
+  cr_emit_expr(g, id, b);
+  if (paren) buf_puts(b, ")");
+}
 /* Emit a subexpression that sits in receiver or operand position, adding the
    parentheses the operator form needs there. */
 static void cr_emit_recv(CrGen *g, int recv, Buf *b) {
@@ -1797,6 +1820,21 @@ static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare) {
 /* Emit a constant path (C::CONST, A::B::C) by walking the parent chain. */
 static void cr_emit_const_path(CrGen *g, int id, Buf *b) {
   int parent = nt_ref(g->nt, id, "parent");
+  /* Crystal resolves `::` only when the receiver is itself a constant path; a
+     runtime value (`k::CODE` where k is a local, an ivar or a call) has no
+     Crystal form -- `k::CODE` is a parse error, not a lookup. Refuse it by name
+     rather than ship the unparseable read. */
+  if (parent >= 0) {
+    NodeKind pk = nt_kind(g->nt, parent);
+    if (pk != NK_ConstantReadNode && pk != NK_ConstantPathNode &&
+        pk != NK_SelfNode) {
+      cr_mark_unsupported(g, id,
+          "a `::` constant read on a runtime value (Crystal resolves `::` only "
+          "on a constant path, not on a local, ivar or expression)");
+      buf_puts(b, "nil");
+      return;
+    }
+  }
   /* `Float::INFINITY` is a constant PATH whose leaf has no Crystal member, so
      the whole path is what decides: remap when the path has an exact Crystal
      spelling, refuse when it names something Crystal does not define. A nested
@@ -1848,6 +1886,21 @@ static void cr_def_shape(CrGen *g, Scope *s, int *reqn, int *opn, int *odd) {
     *odd = 1;
 }
 
+/* Does Crystal's *implicit* parent (Reference) define `name` with this arity, so
+   that a `super` in a class with no explicit superclass resolves? Probed against
+   Crystal 1.21: `initialize`/`to_s`/`inspect`/`hash` take no argument, `==`/`!=`/
+   `===` take one. Ruby's Object defines the same names, so the call means the
+   same thing in both languages. A name outside this set (`def hi; super; end`)
+   is a Ruby NoMethodError and a Crystal compile error -- refused. */
+static int cr_super_builtin_parent(const char *name, int fwd) {
+  if (!name) return 0;
+  if (sp_streq(name, "initialize") || sp_streq(name, "to_s") ||
+      sp_streq(name, "inspect") || sp_streq(name, "hash")) return fwd == 0;
+  if (sp_streq(name, "==") || sp_streq(name, "!=") ||
+      sp_streq(name, "===")) return fwd == 1;
+  return 0;
+}
+
 /* Check that a `super` in the method being emitted has a Crystal equivalent.
    P22n made the superclass real in the emitted header, so Crystal's own
    `super` resolves the call and the translation is verbatim -- but only under
@@ -1871,8 +1924,22 @@ static int cr_super_ok(CrGen *g, int id, int argc) {
   }
   Scope *me = g->cur_meth;
   ClassInfo *self = &g->c->classes[g->cur_class];
+  if (nt_ref(g->nt, id, "block") >= 0) {
+    cr_mark_unsupported(g, id, "a `super` with a block argument");
+    return 0;
+  }
+  int my_req = 0, my_opn = 0, my_odd = 0;
+  cr_def_shape(g, me, &my_req, &my_opn, &my_odd);   /* emitted, so !my_odd */
+  int fwd = argc < 0 ? my_req + my_opn : argc;
   int par = cr_emitted_parent(g, self);
   if (par < 0) {
+    /* A class with no explicit superclass still inherits Reference's builtins,
+       so a `super` to one of them resolves in Crystal. Probed: `def to_s;
+       super; end` and `def ==(o); super; end` build and match Ruby, while
+       `def initialize(x); super; end` is "wrong number of arguments for
+       Reference#initialize (given 1, expected 0)" -- so the arity must line up
+       with Reference's, not the subclass's. */
+    if (cr_super_builtin_parent(me->name, fwd)) return 1;
     /* Name WHY the parent is not carried, so the refusal says what to fix. */
     ClassInfo *p = (self->parent >= 0 && self->parent < g->c->nclasses)
                      ? &g->c->classes[self->parent] : NULL;
@@ -1889,13 +1956,6 @@ static int cr_super_ok(CrGen *g, int id, int argc) {
         p && p->name ? "`" : "");
     return 0;
   }
-  if (nt_ref(g->nt, id, "block") >= 0) {
-    cr_mark_unsupported(g, id, "a `super` with a block argument");
-    return 0;
-  }
-  int my_req = 0, my_opn = 0, my_odd = 0;
-  cr_def_shape(g, me, &my_req, &my_opn, &my_odd);   /* emitted, so !my_odd */
-  int fwd = argc < 0 ? my_req + my_opn : argc;
   for (int c = par; c >= 0; c = cr_emitted_parent(g, &g->c->classes[c])) {
     ClassInfo *pc = &g->c->classes[c];
     Scope *ps = NULL;
@@ -1953,12 +2013,39 @@ static int cr_super_ok(CrGen *g, int id, int argc) {
     }
     return 1;
   }
-  char why[176];
-  snprintf(why, sizeof why, "a `super` call: no superclass of '%s' defines '%s'",
-           g->c->classes[g->cur_class].name ? g->c->classes[g->cur_class].name : "?",
-           me->name ? me->name : "?");
-  cr_mark_unsupported(g, id, why);
+  cr_mark_unsupportedf(g, id, "a `super` call: no superclass of '%s' defines '%s'",
+                       g->c->classes[g->cur_class].name ? g->c->classes[g->cur_class].name : "?",
+                       me->name ? me->name : "?");
   return 0;
+}
+
+/* True when `s` (a Ruby symbol's text, no leading colon) can be written as a
+   bare Crystal symbol `:name`. Crystal allows a bare symbol only when it is an
+   identifier -- an optional trailing `?`/`!`/`=` over letters, digits and `_`,
+   not starting with a digit -- plus the operator forms (`:+`, `:[]`, `:<=>`).
+   Anything else (a space, a leading digit, most punctuation) has to be quoted:
+   `:"a b"`, `:"1a"`. Emitting one unquoted is a parse error, not a refusal. */
+static int cr_sym_is_bare(const char *s) {
+  if (!s || !s[0]) return 0;
+  size_t n = strlen(s);
+  /* An operator symbol is always bare in Crystal. */
+  static const char *ops[] = { "+", "-", "*", "/", "%", "**", "==", "===", "!=",
+    "<", ">", "<=", ">=", "<=>", "<<", ">>", "&", "|", "^", "~", "!", "=~",
+    "!~", "[]", "[]=", "+@", "-@" };
+  for (size_t i = 0; i < sizeof ops / sizeof ops[0]; i++)
+    if (sp_streq(s, ops[i])) return 1;
+  size_t end = n;
+  if (s[n - 1] == '?' || s[n - 1] == '!' || s[n - 1] == '=') end = n - 1;
+  if (end == 0) return 0;
+  for (size_t i = 0; i < end; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c >= 0x80) continue;              /* a UTF-8 continuation/lead byte: a letter */
+    if (c == '_') continue;
+    if (i == 0) { if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0; }
+    else if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9'))) return 0;
+  }
+  return 1;
 }
 
 /* ---- expressions ---- */
@@ -2003,7 +2090,13 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
     }
     case NK_SymbolNode: {
       const char *s = nt_str(g->nt, id, "value");
-      buf_printf(b, ":%s", s ? s : "");
+      /* `:"a b"` / `:"1a"` / `:"😀"` are not valid bare symbols; emitting them
+         unquoted is a Crystal parse error. Quote exactly the ones that need it,
+         so every symbol that already emits stays byte-identical. */
+      if (s && cr_sym_is_bare(s)) { buf_printf(b, ":%s", s); return; }
+      buf_puts(b, ":\"");
+      cr_emit_escaped(b, s ? s : "");
+      buf_puts(b, "\"");
       return;
     }
     case NK_TrueNode:  buf_puts(b, "true");  return;
@@ -2098,7 +2191,7 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
          needed. Only an empty `[]` that a later heterogeneous push widens is
          pinned to Array(SpValue) -- see the local-write path. */
       buf_puts(b, "[");
-      for (int i = 0; i < n; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, els[i], b); }
+      for (int i = 0; i < n; i++) { if (i) buf_puts(b, ", "); cr_emit_operand(g, els[i], b); }
       buf_puts(b, "]");
       return;
     }
@@ -2132,7 +2225,7 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
         if (i) buf_puts(b, ", ");
         cr_emit_expr(g, key, b);
         buf_puts(b, " => ");
-        cr_emit_expr(g, val, b);
+        cr_emit_operand(g, val, b);
       }
       buf_puts(b, " }");
       return;
@@ -3379,7 +3472,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       cr_emit_recv(g, recv, b);
       buf_puts(b, ")");
     } else {
-      cr_emit_recv(g, recv, b);
+      cr_emit_operand(g, recv, b);
     }
     g->nil_ok = savb;
     buf_printf(b, " %s ", op);
@@ -3388,7 +3481,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       cr_emit_recv(g, argv[0], b);
       buf_puts(b, ")");
     } else {
-      cr_emit_recv(g, argv[0], b);
+      cr_emit_operand(g, argv[0], b);
     }
     return;
   }

@@ -857,7 +857,7 @@ PASS     test_const_init_block_param_scan
 REFUSED   test_const_int_rows_destructure
 REFUSED   test_const_nil_and_poly_scan
 REFUSED   test_const_path_compound_assign
-BUILDFAIL test_const_path_constant_receiver
+REFUSED   test_const_path_constant_receiver
 PASS     test_const_path_deep_nesting
 REFUSED   test_const_path_dynamic_receiver
 REFUSED   test_const_path_message_is_written_path
@@ -1739,7 +1739,7 @@ REFUSED   test_inline_yield_splat_args
 REFUSED   test_inline_yield_splat_operand_inline
 REFUSED   test_inline_yield_splat_shapes
 REFUSED   test_inline_yield_string_param_alias
-BUILDFAIL test_inline_yield_value_type_result
+PASS     test_inline_yield_value_type_result
 REFUSED   test_inspect
 REFUSED   test_inspect_result_survives_gc
 REFUSED   test_instance_call_arity
