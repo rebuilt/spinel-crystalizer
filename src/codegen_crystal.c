@@ -1858,9 +1858,25 @@ static int cr_super_ok(CrGen *g, int id, int argc) {
     return 0;
   }
   Scope *me = g->cur_meth;
-  int par = cr_emitted_parent(g, &g->c->classes[g->cur_class]);
+  ClassInfo *self = &g->c->classes[g->cur_class];
+  int par = cr_emitted_parent(g, self);
   if (par < 0) {
-    cr_mark_unsupported(g, id, "a `super` in a class whose superclass is not an emitted user class");
+    /* Name WHY the parent is not carried, so the refusal says what to fix. */
+    ClassInfo *p = (self->parent >= 0 && self->parent < g->c->nclasses)
+                     ? &g->c->classes[self->parent] : NULL;
+    const char *why = !p ? "has no superclass"
+                  : p->is_native_class ? "is a builtin class"
+                  : !p->name || p->def_node < 0 ? "is not an emitted class"
+                  : (p->enclosing_class != -1 &&
+                     p->enclosing_class != self->enclosing_class)
+                    ? "is nested where the header cannot name it"
+                    : "is reopened at more than one site";
+    char whybuf[128];
+    snprintf(whybuf, sizeof whybuf,
+             "a `super` in a class whose superclass %s%s%s",
+             p && p->name ? "`" : "", p && p->name ? p->name : why,
+             p && p->name ? "`" : "");
+    cr_mark_unsupported(g, id, whybuf);
     return 0;
   }
   if (nt_ref(g->nt, id, "block") >= 0) {
@@ -3441,7 +3457,9 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
        (Crystal's stdlib answers them). We never emit those bodies, so a call to
        one would dangle -- refuse it rather than ship a reference to nothing. */
     if (name[0] == '_' && name[1] == '_') {
-      cr_mark_unsupported(g, id, "a compiler-synthesized helper call");
+      char whybuf[128];
+      snprintf(whybuf, sizeof whybuf, "a compiler-synthesized helper call (`%s`)", name);
+      cr_mark_unsupported(g, id, whybuf);
       buf_puts(b, "nil");
       return;
     }
