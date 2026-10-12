@@ -375,6 +375,57 @@ latent defects, all fixed rather than shipped:
 - The nested-parent and reopened-parent rules above turned two predictable
   BUILDFAILs back into named refusals.
 
+**P22q — parse-clean emission; implicit-parent `super` (landed).** Four emitter
+holes, three of which turned parse-error BUILDFAILs into valid Crystal:
+
+- **Symbol quoting.** A `SymbolNode` was emitted verbatim, so a symbol whose text
+  is not a bare Crystal identifier (`:"a b"`, `:"+="`) produced a parse error.
+  `cr_sym_is_bare` now quotes anything outside identifier/operator form.
+- **do/end-block calls in operand/element position.** `arr.map do … end[0]` parses
+  as `arr.map(do…end[0])`; `cr_emit_operand` now parenthesises a block call there.
+  Scoped to operand/element position only, **not** folded into `cr_needs_parens`:
+  parenthesising the receiver position would newly compile `issue_3235`, whose
+  answer then DIFFs on `Float#round`'s sign of zero — the honesty rule keeps the
+  BUILDFAIL over a silent wrong answer (see `docs/float-rounding.md`).
+- **`super` with an implicit parent.** `def initialize; super; end` in a class with
+  no explicit superclass. Crystal rejects a bare `super` with no superclass, but
+  the *default* superclass is `Object`/`Reference`, which does define those
+  methods; a probe-backed whitelist (`cr_super_builtin_parent`) allows the
+  `Object` arities (`initialize`/`to_s`/`inspect`/`hash` at 0, `==`/`!=`/`===`
+  at 1) and refuses anything else.
+- **`k::CODE` on a runtime value** is refused by name.
+
+Measured **+1 PASS, +0 DIFF, −2 BUILDFAIL, +1 REFUSED**: `test_inline_yield_value_type_result`
+BUILDFAIL→PASS, `test_const_path_constant_receiver` BUILDFAIL→REFUSED.
+
+**P22r — desugared-Enumerable passthrough (landed).** The analyzer rewrites
+`recv.m(args){blk}` for the 25 `builtins/enumerable.rb` methods into a bare
+`__enum_m__<id>(recv, args)` helper. The C backend emits those bodies; the Crystal
+backend has none to emit, so the call was refused. Where Crystal's stdlib answers
+the *same* call, the emitter now reconstructs `recv.m(args) { blk }` from the
+helper — the receiver is `argv[0]`, the block is preserved, and it is emitted with
+the **Ruby** method name because the yield oracle (`ty_block_yield`) is keyed on
+Ruby names (`drop_while`, not `skip_while`).
+
+The scope is deliberately tiny. The full candidate set measured **21 PASS / 5 DIFF
+/ 25 REFUSED→BUILDFAIL** — dishonest in both directions — so only the methods whose
+Crystal stdlib form is verified identical are mapped:
+
+- `inject`→`reduce`, `each_with_object`, `count`, `none?`;
+- `drop_while`→`skip_while`, gated to Array/Range receivers: Crystal's
+  `Hash#skip_while` answers an Array of **Tuples** where Ruby's `Hash#drop_while`
+  answers `[k, v]` **Arrays**, so a Hash (or a widened/uninferred receiver that
+  could be one at run time) keeps the refusal.
+
+Excluded, and why: `max_by`/`min_by` reject the `(n)` argument form; `find`,
+`minmax`, `max_by`/`min_by` and `partition` answer Tuples or take a different
+arity; blockless forms differ; and a `reduce`/`inject` symbol op (`arr.inject(:+)`)
+has no Crystal form. `none?`/`drop_while` are probe-verified but not yet exercised
+by the corpus.
+
+Measured **+4 PASS, +0 DIFF, +0 BUILDFAIL, −4 REFUSED**: `bundle_class_01`,
+`count_block_poly_pred`, `hash_values_inject_sym`, `issue_3102`.
+
 **Known hole in `SpBox` — CLOSED by P22m.** (was: do not dispatch a boxed object yet)
 `SpBox` used to define only `val`, `initialize`, `inspect` and `to_s`. It had **no
 `sp_send` override**, so `sp_box(some_object).sp_send(name, args)` inherited
@@ -873,14 +924,14 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | P22e | P22f | P22g | P22h | P22i | P22j | P22k | P22n | **P22o+p (current)** | meaning |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
-| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | 646 | 648 | 656 | 671 | 678 | 681 | 681 | 680 | 680 | **688** | emits Crystal at all (the rest refuse) ‡ |
-| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | 333 | 340 | 348 | 364 | 365 | 366 | 369 | 369 | 378 | **396** | builds and output is byte-identical to CRuby |
-| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | 51 | 53 | 53 | 56 | 56 | 56 | 57 | 57 | 55 | **55** | builds, but disagrees with CRuby |
-| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | 262 | 260 | 252 | 258 | 257 | 259 | 255 | 254 | 247 | **237** | the emitted Crystal does not compile |
-| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | 3752 | 3745 | 3745 | 3720 | 3720 | 3717 | 3717 | 3718 | 3718 | **3710** | refused at the Ruby line, with a reason |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | P22e | P22f | P22g | P22h | P22i | P22j | P22k | P22n | P22o+p | P22q | **P22r (current)** | meaning |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
+| emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | 646 | 648 | 656 | 671 | 678 | 681 | 681 | 680 | 680 | 688 | 687 | **691** | emits Crystal at all (the rest refuse) ‡ |
+| PASS | 196 | 256 | 257 | 264 | 268 | 278 | 289 | 294 | 297 | 300 | 303 | 305 | 307 | 307 | 308 | 315 | 321 | 325 | 325 | 327 | 327 | 328 | 333 | 340 | 348 | 364 | 365 | 366 | 369 | 369 | 378 | 396 | 397 | **401** | builds and output is byte-identical to CRuby |
+| DIFF | 70 | 102 | 102 | 89 | 88 | 78 | 67 | 61 | 58 | 55 | 52 | 50 | 49 | 49 | 50 | 50 | 50 | 50 | 50 | 49 | 49 | 50 | 51 | 53 | 53 | 56 | 56 | 56 | 57 | 57 | 55 | 55 | 55 | **55** | builds, but disagrees with CRuby |
+| BUILDFAIL | 491 | 428 | 428 | 425 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 422 | 378 | 317 | 305 | 299 | 293 | 288 | 281 | 268 | 266 | 267 | 262 | 260 | 252 | 258 | 257 | 259 | 255 | 254 | 247 | 237 | 235 | **235** | the emitted Crystal does not compile |
+| REFUSED | 3659 | 3631 | 3631 | 3620 | 3620 | 3620 | 3620 | 3621 | 3621 | 3621 | 3621 | 3621 | 3664 | 3725 | 3735 | 3734 | 3734 | 3735 | 3742 | 3754 | 3756 | 3753 | 3752 | 3745 | 3745 | 3720 | 3720 | 3717 | 3717 | 3718 | 3718 | 3710 | 3711 | **3707** | refused at the Ruby line, with a reason |
 
 ‡ From P22h on, `emit-clean` is exactly PASS+DIFF+BUILDFAIL; earlier columns were
 counted independently and can drift by a few programs (P22g shows 671 against 678).
@@ -934,7 +985,7 @@ touches a pre-existing auto-splat / `with_index` gap (now visible). P22d is
 **+5 PASS, +1 DIFF, −5 BUILDFAIL, −1 REFUSED** — the `with_index` chain
 translation (see [P22](#p22-object-boxing-via-spbox)) closes the larger of those
 two gaps. P22e is **+7 PASS, +2 DIFF, −2 BUILDFAIL, −7 REFUSED** — boxed
-instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section. P22j is **+3 PASS, +1 DIFF, −4 BUILDFAIL, +0 REFUSED** — a conditionally-assigned ivar declared nilable, plus the `&.` → `try` rewrite that fix exposed (see [P22](#p22-object-boxing-via-spbox)); it clears one of P22i's two trades and adds no new ones. P22k is **+0 PASS, +0 DIFF, −1 BUILDFAIL, +1 REFUSED** — a call to a user-defined method on a statically unknown receiver is refused by name rather than emitted as a build error, closing P22i's second trade (see [P22](#p22-object-boxing-via-spbox)). P22l was tried — receiver dispatch on a widened parameter — measured at **−3 PASS / 0 gained**, and reverted (see its post-mortem in the P22 section). P22m is **metrics-neutral** (+0 everywhere) — the `SpBox#sp_send` seam, landed additive and verified by direct execution. P22n is **+9 PASS, −2 DIFF, −7 BUILDFAIL, +0 REFUSED** — the superclass carried into the class header. P22o+p is **+18 PASS, +0 DIFF, −10 BUILDFAIL, −8 REFUSED** — the inheritance call path completed and `super` translated (see [P22](#p22-object-boxing-via-spbox)); four latent build errors the newly-real relation exposed became named refusals, one DIFF became a PASS, and the single remaining REFUSED→BUILDFAIL (`class_value_new_optional_param`) is the documented class-value-constructor limitation.
+instance variables, gated so every trade is an improvement (see [P22](#p22-object-boxing-via-spbox)). P22f is **+8 PASS, +0 DIFF, −8 BUILDFAIL, +0 REFUSED** — class/module-body declarations, again with no REFUSED→BUILDFAIL trade (8 REFUSED → PASS and 8 BUILDFAIL → REFUSED). P22g is **+16 PASS, +3 DIFF, +6 BUILDFAIL, −25 REFUSED** — `yield` methods (see [P22](#p22-object-boxing-via-spbox)); it exposes 7 separate pre-existing gaps as REFUSED → BUILDFAIL, documented in its section. P22h is **+1 PASS, +0 DIFF, −1 BUILDFAIL, +0 REFUSED** — a comparison at a widened parameter boundary, the first step of the boundary-boxing direction P22b pointed at (see [P22](#p22-object-boxing-via-spbox)). P22i is **+1 PASS, +0 DIFF, +2 BUILDFAIL, −3 REFUSED** — compound assignment to a scalar instance variable, a weak trade whose two build errors are pre-existing gaps documented in its section. P22j is **+3 PASS, +1 DIFF, −4 BUILDFAIL, +0 REFUSED** — a conditionally-assigned ivar declared nilable, plus the `&.` → `try` rewrite that fix exposed (see [P22](#p22-object-boxing-via-spbox)); it clears one of P22i's two trades and adds no new ones. P22k is **+0 PASS, +0 DIFF, −1 BUILDFAIL, +1 REFUSED** — a call to a user-defined method on a statically unknown receiver is refused by name rather than emitted as a build error, closing P22i's second trade (see [P22](#p22-object-boxing-via-spbox)). P22l was tried — receiver dispatch on a widened parameter — measured at **−3 PASS / 0 gained**, and reverted (see its post-mortem in the P22 section). P22m is **metrics-neutral** (+0 everywhere) — the `SpBox#sp_send` seam, landed additive and verified by direct execution. P22n is **+9 PASS, −2 DIFF, −7 BUILDFAIL, +0 REFUSED** — the superclass carried into the class header. P22o+p is **+18 PASS, +0 DIFF, −10 BUILDFAIL, −8 REFUSED** — the inheritance call path completed and `super` translated (see [P22](#p22-object-boxing-via-spbox)); four latent build errors the newly-real relation exposed became named refusals, one DIFF became a PASS, and the single remaining REFUSED→BUILDFAIL (`class_value_new_optional_param`) is the documented class-value-constructor limitation. P22q is **+1 PASS, +0 DIFF, −2 BUILDFAIL, +1 REFUSED** — parse-clean emission (symbol quoting, do/end-block calls in operand position) plus the implicit-parent `super` whitelist, landed with one BUILDFAIL→PASS and one BUILDFAIL→REFUSED (see [P22](#p22-object-boxing-via-spbox)). P22r is **+4 PASS, +0 DIFF, +0 BUILDFAIL, −4 REFUSED** — the first desugared-Enumerable passthrough, scoped to the methods whose Crystal stdlib form is byte-identical; the broader candidate set was measured at 21 PASS / 5 DIFF / 25 BUILDFAIL and rejected as dishonest (see [P22](#p22-object-boxing-via-spbox)).
 
 Phases 1–2 together are **+60 PASS over the baseline with zero PASS regressions**
 (every program that passed on the baseline still passes), and Phase 3 adds a further
