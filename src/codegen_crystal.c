@@ -101,6 +101,15 @@ typedef struct {
                              needs the binding the enclosing clause introduced.
                              Set around the emission of a clause body, which may
                              itself contain nested begin/rescue. */
+  int value_ctx;        /* 1 when the expression about to be emitted has its
+                           value used (an argument, an RHS, a condition); 0 when
+                           it is a discarded statement. cr_emit_expr moves it into
+                           cur_value and resets it to 1 for the node's own
+                           children, which are always value positions. */
+  int cur_value;        /* the value_ctx of the node currently being emitted,
+                           read by cr_emit_call to tell a used call (a
+                           self-returning iterator, a setter) from a discarded
+                           one. */
   int tmp_seq;          /* counter for synthetic emitter-local names, so two
                            desugarings in one method never collide */
 } CrGen;
@@ -2135,6 +2144,11 @@ static void cr_emit_hash_splat_chain(CrGen *g, const int *els, int n, Buf *b) {
 
 static void cr_emit_expr(CrGen *g, int id, Buf *b) {
   if (id < 0) { buf_puts(b, "nil"); return; }
+  /* Record whether THIS node's value is used (read by a call handler: a
+     self-returning iterator, a setter), then reset the ambient flag so the
+     node's own children -- always value positions -- see 1. */
+  g->cur_value = g->value_ctx;
+  g->value_ctx = 1;
   /* nil_ok describes the node being emitted, never a subtree: only an index read
      consults it, and a parent sets it for that one child. Clearing it here means
      `p(h[k] + 1)` cannot reach through the `+` and make its operand a nilable
@@ -3168,6 +3182,66 @@ static int cr_emit_kernel_call(CrGen *g, int id, const char *name, int recv,
   return 0;
 }
 
+/* Does the subtree rooted at `id` contain a node of kind `k`? A generic
+   structural walk: ref fields and array-field elements are the children. */
+static int cr_subtree_has_kind(CrGen *g, int id, NodeKind k) {
+  if (id < 0) return 0;
+  if (nt_kind(g->nt, id) == k) return 1;
+  for (int i = 0; i < nt_num_refs(g->nt, id); i++)
+    if (cr_subtree_has_kind(g, nt_ref_at(g->nt, id, i), k)) return 1;
+  for (int i = 0; i < nt_num_arrs(g->nt, id); i++) {
+    int n = 0; const int *a = nt_arr_at(g->nt, id, i, &n);
+    for (int j = 0; j < n; j++)
+      if (cr_subtree_has_kind(g, a[j], k)) return 1;
+  }
+  return 0;
+}
+
+/* Ruby's element iterators answer the receiver from a block call; Crystal's
+   answer nil. `each_with_object` (the memo) and `cycle` (nil) are not here, and
+   `step` is owned by the Numeric#step rewrite. */
+static int cr_iter_returns_self(const char *n) {
+  return sp_streq(n, "each") || sp_streq(n, "each_with_index") ||
+         sp_streq(n, "each_slice") || sp_streq(n, "each_cons") ||
+         sp_streq(n, "each_entry") || sp_streq(n, "each_index") ||
+         sp_streq(n, "each_char") || sp_streq(n, "each_byte") ||
+         sp_streq(n, "each_line") || sp_streq(n, "each_key") ||
+         sp_streq(n, "each_value") || sp_streq(n, "each_pair") ||
+         sp_streq(n, "reverse_each") || sp_streq(n, "upto") ||
+         sp_streq(n, "downto") || sp_streq(n, "times");
+}
+
+/* A self-returning iterator whose value is used: wrap it as
+   `recv.tap { |r| r.m(args) { blk } }`, which answers the receiver after one
+   evaluation of it. A `break` in the block makes the iterator answer the break
+   value (nil or the value) in BOTH languages, so such a call is left alone.
+   Returns 1 when it emitted the call. */
+static int cr_emit_self_return_wrap(CrGen *g, int id, const char *name, int recv,
+                                    int argc, const int *argv, int block, Buf *b) {
+  if (g->cur_value == 0 || recv < 0 || block < 0) return 0;
+  if (!cr_iter_returns_self(name)) return 0;
+  TyKind rt = comp_ntype(g->c, recv);
+  /* Only a receiver emitted verbatim (an Array or Hash): a Range or String
+     receiver is rewritten to a materialized Array by the emitter, so `tap`
+     would answer the Array rather than Ruby's receiver. */
+  if (!ty_is_array(rt) && !ty_is_hash(rt)) return 0;
+  if (cr_is_poly(rt)) return 0;
+  if (cr_user_method_ok(g, name, rt, 0)) return 0;
+  const char *cop = nt_str(g->nt, id, "call_operator");
+  if (cop && sp_streq(cop, "&.")) return 0;   /* safe-nav has its own path */
+  if (cr_subtree_has_kind(g, block, NK_BreakNode)) return 0;
+  const char *mname = cr_translate_name(g, id, recv, name);
+  char tmp[48];
+  snprintf(tmp, sizeof tmp, "__cr_ret%d", g->tmp_seq++);
+  cr_emit_recv(g, recv, b);
+  buf_printf(b, ".tap { |%s| %s.%s(", tmp, tmp, mname);
+  for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+  buf_puts(b, ")");
+  cr_emit_block(b, g, block, 0, recv, name);
+  buf_puts(b, " }");
+  return 1;
+}
+
 static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
                                 int argc, const int *argv, int block, Buf *b) {
   /* unary - / + : no receiver, one argument */
@@ -3698,6 +3772,9 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   int block = nt_ref(g->nt, id, "block");
   if (!name) { g->unsupported++; buf_puts(b, "nil"); return; }
   if (cr_emit_call_special(g, id, name, recv, argc, argv, block, b)) return;
+  /* Ruby's self-returning element iterators (each, times, upto, ...) answer the
+     receiver; Crystal's answer nil. When the value is used, wrap in `tap`. */
+  if (cr_emit_self_return_wrap(g, id, name, recv, argc, argv, block, b)) return;
   /* method call: refuse a name we cannot verify, so an unknown method never
      ships as a silent build error. A nil placeholder keeps emission going; the
      run is refused at the end (codegen_program_crystal). */
@@ -4209,6 +4286,9 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
       if (snm && sp_streq(snm, "[]") && nt_ref(g->nt, id, "receiver") >= 0 &&
           id != g->tail_value)
         g->nil_ok = 1;
+      /* A discarded expression statement's value is unused -- unless it is the
+         body's tail, whose value is the method/block return. */
+      g->value_ctx = (id == g->tail_value) ? 1 : 0;
       cr_emit_expr(g, id, b);
       g->nil_ok = savs;
       buf_puts(b, "\n");
@@ -5294,6 +5374,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
   CrGen g; memset(&g, 0, sizeof g);
   g.c = c; g.nt = nt;
   g.first_unsup = -1;
+  g.value_ctx = 1;
   g.cur_class = -1;
 
   Buf b; memset(&b, 0, sizeof b);

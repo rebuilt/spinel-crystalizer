@@ -270,7 +270,7 @@ REFUSED   test_block_arg_poly_value
 REFUSED   test_block_autosplat_collectors
 REFUSED   test_block_autosplat_minmax_group
 DIFF     test_block_autosplat
-DIFF     test_block_body_rescue
+PASS     test_block_body_rescue
 REFUSED   test_block_call_arity
 REFUSED   test_block_call_multi_arg_first
 REFUSED   test_block_call_multi_arg_pack
