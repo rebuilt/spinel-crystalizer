@@ -2088,6 +2088,51 @@ static void cr_emit_interp_parts(CrGen *g, int id, Buf *b) {
   }
 }
 
+/* Emit the `k => v, ...` entries of a hash literal for elements [from, to),
+   comma-separated and without the surrounding braces. Shared by the plain
+   literal and by the plain runs inside a double-splat merge chain. */
+static void cr_emit_hash_entries(CrGen *g, const int *els, int from, int to, Buf *b) {
+  for (int i = from; i < to; i++) {
+    int key = nt_ref(g->nt, els[i], "key");
+    int val = nt_ref(g->nt, els[i], "value");
+    if (i > from) buf_puts(b, ", ");
+    cr_emit_expr(g, key, b);
+    buf_puts(b, " => ");
+    cr_emit_operand(g, val, b);
+  }
+}
+
+/* Emit a hash literal that has at least one double-splat element
+   (`{ **h, x: v }`). Crystal has no hash-literal double-splat (`**` inside `{}`
+   is a parse error), so each run of plain assocs becomes one `{ k => v }`
+   literal and every splat merges in, preserving Ruby's left-to-right override
+   order. A lone `{ **h }` copies in Ruby, so it gets `.dup`. */
+static void cr_emit_hash_splat_chain(CrGen *g, const int *els, int n, Buf *b) {
+  int started = 0, nsplat = 0;
+  for (int i = 0; i < n; ) {
+    if (nt_kind(g->nt, els[i]) == NK_AssocSplatNode) {
+      int v = nt_ref(g->nt, els[i], "value");
+      if (started) buf_puts(b, ".merge(");
+      cr_emit_operand(g, v, b);
+      if (started) buf_puts(b, ")");
+      started = 1;
+      nsplat++;
+      i++;
+    } else {
+      int end = i;
+      while (end < n && nt_kind(g->nt, els[end]) != NK_AssocSplatNode) end++;
+      if (started) buf_puts(b, ".merge(");
+      buf_puts(b, "{ ");
+      cr_emit_hash_entries(g, els, i, end, b);
+      buf_puts(b, " }");
+      if (started) buf_puts(b, ")");
+      started = 1;
+      i = end;
+    }
+  }
+  if (n == 1 && nsplat == 1) buf_puts(b, ".dup");
+}
+
 static void cr_emit_expr(CrGen *g, int id, Buf *b) {
   if (id < 0) { buf_puts(b, "nil"); return; }
   /* nil_ok describes the node being emitted, never a subtree: only an index read
@@ -2255,55 +2300,17 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       /* A non-empty hash literal also keeps its own key/value types (Crystal
          types it as a concrete Hash, union-valued if heterogeneous), so reads
          work and no boxing is needed. The boxed Hash(SpValue, SpValue) form is
-         reserved for a later phase. */
-      /* A double-splat element (`{ **h, x: v }`) has no Crystal literal form
-         (Crystal rejects `**` inside `{}`), so emit a `.merge` chain instead:
-         runs of plain assocs become one `{ k => v }` literal and each splat
-         merges in, preserving Ruby's left-to-right override order. Without this
-         the splat was emitted as an assoc with no key (`nil => h`). */
+         reserved for a later phase. A double-splat element has no Crystal
+         literal form, so it is emitted through the merge-chain helper. */
       int has_splat = 0;
       for (int i = 0; i < n; i++)
         if (nt_kind(g->nt, els[i]) == NK_AssocSplatNode) { has_splat = 1; break; }
       if (has_splat) {
-        int started = 0, nsplat = 0;
-        for (int i = 0; i < n; ) {
-          if (nt_kind(g->nt, els[i]) == NK_AssocSplatNode) {
-            int v = nt_ref(g->nt, els[i], "value");
-            if (!started) { cr_emit_operand(g, v, b); started = 1; }
-            else { buf_puts(b, ".merge("); cr_emit_operand(g, v, b); buf_puts(b, ")"); }
-            nsplat++;
-            i++;
-          } else {
-            if (started) buf_puts(b, ".merge(");
-            buf_puts(b, "{ ");
-            for (int first = 1; i < n && nt_kind(g->nt, els[i]) != NK_AssocSplatNode; i++) {
-              int key = nt_ref(g->nt, els[i], "key");
-              int val = nt_ref(g->nt, els[i], "value");
-              if (!first) buf_puts(b, ", ");
-              first = 0;
-              cr_emit_expr(g, key, b);
-              buf_puts(b, " => ");
-              cr_emit_operand(g, val, b);
-            }
-            buf_puts(b, " }");
-            if (started) buf_puts(b, ")");
-            started = 1;
-          }
-        }
-        /* `{ **h }` alone is a copy in Ruby, not an alias. */
-        if (n == 1 && nsplat == 1) buf_puts(b, ".dup");
+        cr_emit_hash_splat_chain(g, els, n, b);
         return;
       }
       buf_puts(b, "{ ");
-      for (int i = 0; i < n; i++) {
-        int assoc = els[i];
-        int key = nt_ref(g->nt, assoc, "key");
-        int val = nt_ref(g->nt, assoc, "value");
-        if (i) buf_puts(b, ", ");
-        cr_emit_expr(g, key, b);
-        buf_puts(b, " => ");
-        cr_emit_operand(g, val, b);
-      }
+      cr_emit_hash_entries(g, els, 0, n, b);
       buf_puts(b, " }");
       return;
     }
