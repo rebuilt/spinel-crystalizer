@@ -1501,7 +1501,7 @@ REFUSED   test_hash_dig_and_hash_key
 BUILDFAIL test_hash_dig_into_array
 REFUSED   test_hash_dig
 REFUSED   test_hash_dispatch_missing_cells
-DIFF     test_hash_double_splat
+PASS     test_hash_double_splat
 REFUSED   test_hash_double_splat_update_kinds
 REFUSED   test_hash_dup_recursive_poly_param
 REFUSED   test_hash_each_entry_literal

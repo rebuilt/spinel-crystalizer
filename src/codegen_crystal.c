@@ -2078,6 +2078,12 @@ static void cr_emit_interp_parts(CrGen *g, int id, Buf *b) {
         buf_puts(b, "end");
       }
       buf_puts(b, "}");
+    } else {
+      /* A part kind we do not model (an embedded-variable form, say): record it
+         and refuse the run rather than silently drop the fragment and emit a
+         wrong string. */
+      const char *ty = nt_type(g->nt, parts[i]);
+      cr_mark_unsupported(g, parts[i], ty ? ty : "interpolated-string part");
     }
   }
 }
@@ -2250,6 +2256,44 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
          types it as a concrete Hash, union-valued if heterogeneous), so reads
          work and no boxing is needed. The boxed Hash(SpValue, SpValue) form is
          reserved for a later phase. */
+      /* A double-splat element (`{ **h, x: v }`) has no Crystal literal form
+         (Crystal rejects `**` inside `{}`), so emit a `.merge` chain instead:
+         runs of plain assocs become one `{ k => v }` literal and each splat
+         merges in, preserving Ruby's left-to-right override order. Without this
+         the splat was emitted as an assoc with no key (`nil => h`). */
+      int has_splat = 0;
+      for (int i = 0; i < n; i++)
+        if (nt_kind(g->nt, els[i]) == NK_AssocSplatNode) { has_splat = 1; break; }
+      if (has_splat) {
+        int started = 0, nsplat = 0;
+        for (int i = 0; i < n; ) {
+          if (nt_kind(g->nt, els[i]) == NK_AssocSplatNode) {
+            int v = nt_ref(g->nt, els[i], "value");
+            if (!started) { cr_emit_operand(g, v, b); started = 1; }
+            else { buf_puts(b, ".merge("); cr_emit_operand(g, v, b); buf_puts(b, ")"); }
+            nsplat++;
+            i++;
+          } else {
+            if (started) buf_puts(b, ".merge(");
+            buf_puts(b, "{ ");
+            for (int first = 1; i < n && nt_kind(g->nt, els[i]) != NK_AssocSplatNode; i++) {
+              int key = nt_ref(g->nt, els[i], "key");
+              int val = nt_ref(g->nt, els[i], "value");
+              if (!first) buf_puts(b, ", ");
+              first = 0;
+              cr_emit_expr(g, key, b);
+              buf_puts(b, " => ");
+              cr_emit_operand(g, val, b);
+            }
+            buf_puts(b, " }");
+            if (started) buf_puts(b, ")");
+            started = 1;
+          }
+        }
+        /* `{ **h }` alone is a copy in Ruby, not an alias. */
+        if (n == 1 && nsplat == 1) buf_puts(b, ".dup");
+        return;
+      }
       buf_puts(b, "{ ");
       for (int i = 0; i < n; i++) {
         int assoc = els[i];
@@ -2821,7 +2865,10 @@ static const char *cr_enum_passthrough(const char *name, TyKind recv_ty, char *r
      pair-yielding methods (min_by/find/minmax/...) answer Tuples or take a
      different arity, so passing them through traded a refusal for a build
      error or a silently different answer. `none?`/`drop_while` are
-     probe-verified but not yet exercised by the corpus. */
+     probe-verified but not yet exercised by the corpus. `count`/`none?` with a
+     PATTERN argument inherit Crystal's native `==` predicate (Ruby uses `===`),
+     which is already a documented DIFF on the native path, so it is not gated
+     here -- the mapping is exactly as safe as the native call it mirrors. */
   if (CR_ENUM_IS("inject"))     return "reduce";
   if (CR_ENUM_IS("drop_while")) {
     /* Crystal's Hash#skip_while answers an Array of Tuples where Ruby's
