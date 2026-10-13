@@ -75,3 +75,66 @@ end
 fn = FcNamed.new
 fn.go
 p fn.out
+
+# A *rest parameter the body reassigns from itself (`args = args.first`, the
+# background job's perform(*args)), as a statement of the body and inside a
+# branch: the desugared copy must not keep the fold alternating (#6491)
+def fp_perform(*args)
+  args = args.first
+  args
+end
+def fp_maybe_first(*a)
+  if a.size > 0
+    a = a.first
+  end
+  a
+end
+p fp_perform(7), fp_maybe_first(7), fp_maybe_first
+
+# A Hash parameter its body reassigns from a boxed value and then writes
+# String keys into (ActionView's `html_options = (html_options || {})
+# .stringify_keys; html_options["href"] = ...`): the String-keyed writes
+# narrowed the poly parameter to the StrStr hash, and the body's own write
+# widened it back to poly, every round. A multiple assignment the same.
+def fp_norm(h)
+  return h if h.is_a?(Hash)
+  "x"
+end
+def fp_link(addr, opts = {})
+  opts = fp_norm(opts)
+  opts["href"] = "mailto:#{addr}"
+  opts
+end
+def fp_link2(addr, opts = {})
+  opts, n = fp_norm(opts), 1
+  opts["href"] = "tel:#{addr}#{n}"
+  opts
+end
+p fp_link("a@b"), fp_link2("5")
+
+# A send whose name is interpolated around a fixed part, where the only
+# methods of that shape cannot take the call's arguments (activerecord's
+# `public_send(:"clear_#{attribute}_change")` beside activemodel's
+# clear_attribute_change(attr_name)): the lowering found no arm for it and
+# reported a change all the same, every round. (Nothing calls it here: a
+# call reaching it is refused, as a send no method can serve.)
+class FpDirty
+  def clear_attribute_change(n) = n
+  def clear(a) = public_send(:"clear_#{a}_change")
+end
+p FpDirty.new.clear_attribute_change(1)
+
+# A block parameter nothing types, reassigned from a call on itself and then
+# read with a String key (activerecord's nested attributes: `attributes =
+# attributes.with_indifferent_access; attributes["id"]`): with every write
+# still unknown, the key read promoted it to a String-keyed hash; the next
+# round its own call read that hash and typed it an Array, which the key
+# read does not promote, and the round after it was unknown again. (Nothing
+# calls it here: a caller would type the parameter.)
+def fp_ids(coll)
+  coll.each do |a|
+    a = a.keys
+    a["id"]
+  end
+end
+p 1

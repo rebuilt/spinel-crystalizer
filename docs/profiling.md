@@ -172,3 +172,74 @@ Reach for `SPINEL_ALLOC_REPORT` when the profile points at the collector
 (`sp_gc_collect`, `sp_gc_mark_all`) or at `malloc` -- then the question is not
 which code is slow but which code allocates, and the counters answer that
 exactly rather than statistically.
+
+## Compiler phase timing
+
+`--timing` (or `SP_TIMING=1` in the environment) makes the compiler report how
+long its own phases took. It is about the compiler, not the compiled program
+(`--profile` above is the program's). The compiled output is the same with
+and without it; with it off nothing is measured.
+
+Each phase is one line on stderr, `key=value` fields after the name:
+
+```
+spinel-timing: phase=frontend ms=4.4
+spinel-timing: phase=analysis_fixpoint ms=3.2 rounds=4
+```
+
+`ms` is wall time on a monotonic clock. Phases, in the order they finish:
+
+| phase | covers |
+|---|---|
+| `frontend` | parse, require resolution, loading the AST |
+| `an_desugar_register`, `an_class_structure`, `an_block_inline`, `an_pre_fixpoint` | the analysis phases ahead of the fixpoint |
+| `analysis_fixpoint` | the inference fixpoint (`rounds=N`, plus `capped=1` if it hit the cap) |
+| `analysis_renarrow` | the loop that re-narrows poly slots once the fixpoint has settled (`rounds=N`); inside `analysis_fixpoint` |
+| `an_post_fixpoint`, `an_procs`, `an_method_backstops`, `an_late_widen`, `an_proc_returns`, `an_storage`, `an_value_types`, `an_reconcile_check` | the analysis phases after it |
+| `analysis` | all of `analyze_program`; includes the phases above |
+| `codegen_program` | analysis and C generation; includes `analysis` |
+| `write_c` | writing the C file |
+| `cc_preprocess`, `cc_split` | a split build (`--jobs=N`, or a large unit): the preprocess and the split into parts |
+| `cc_compile` | a split build: the wall span of the parallel object compiles (`jobs=N`), not the sum of the workers |
+| `cc_link` | a split build: the link |
+| `cc_total` | the whole native step, single unit or split |
+
+A phase nested in another is counted in both, so the lines do not add up to the
+total.
+
+Each pass of the inference fixpoint also gets a line, its wall time summed over
+the rounds, longest first, right after `analysis_fixpoint`:
+
+```
+spinel-timing: pass=infer_write_types ms=47.2 calls=15 changed=12
+```
+
+`calls` is how often it ran, `changed` how many of those calls reported a
+change to the fixpoint (a pass the fixpoint calls only for its effect counts
+none). The name is the C function's. The passes are a part of
+`analysis_fixpoint` (and of `analysis_renarrow` for the ones its loop runs);
+the remainder is the fixpoint's own bookkeeping. With the flag off a pass call
+costs a flag test. A phase that did not run (a `-c` build has no `cc_*`) or failed prints
+nothing, so a failed build is not a sample. Record the compiler, the input,
+the flags, the host and the cache state beside the lines; they are not in them.
+
+## Source positions of a generated .rb
+
+A Ruby file that a tool generated (a template compiler, a transpiler) can say
+where its lines came from. A whole line
+
+```ruby
+#<SPINEL_SOURCE>greeting.html.erb:12
+```
+
+makes the lines after it report as `greeting.html.erb`, line 12, in `#line`
+directives, `-g` / `--debug` stepping, `perf` / `addr2line`, `--warn-widen` and
+`--check-stores`. The position is held (every following line reports line 12,
+not 13, 14, ...) until the next marker or the end of the file it is in. The
+text after `>` splits at its last colon, so the path may hold one; a line with
+no `:<positive number>` is an ordinary comment. CRuby treats the marker as a
+comment too.
+
+Only the reported position moves. `__FILE__`, `__dir__`, `__LINE__` and
+`require_relative` still answer from the `.rb` the code is in, and a syntax
+error is reported at the generated file.

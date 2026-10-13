@@ -12,7 +12,7 @@
 #   and does nothing else. Both are per call; there is no FileUtils::Verbose
 #   / ::NoWrite / ::DryRun module to include.
 # * no `preserve:` on cp/mv, no `dereference_root:`, no `secure:` on rm_r
-# * no ln_sf, no install, no chown, no cp_lr
+# * no ln_sf, no chown, no cp_lr, and no owner: or group: on install
 #
 # Every method takes a single path or a list of them, as CRuby's do, and
 # returns what CRuby's return (mkdir_p and friends answer the list they were
@@ -199,6 +199,21 @@ module FileUtils
     nil
   end
 
+  # copy_file copies one file's contents to dest, which takes the source's
+  # mode when it is created; preserve also copies the times and the mode.
+  # Symbolic links are always followed.
+  def copy_file(src, dest, preserve = false, dereference = true)
+    st = File.stat(src.to_s)
+    File.open(src.to_s, "rb") do |s|
+      File.open(dest.to_s, "wb", st.mode) { |f| IO.copy_stream(s, f) }
+    end
+    if preserve
+      File.utime(st.atime, st.mtime, dest.to_s)
+      File.chmod(st.mode & 0o7777, dest.to_s)
+    end
+    nil
+  end
+
   def fu_dest_path(src, dest)
     Dir.exist?(dest) ? "#{dest}/#{File.basename(src)}" : dest
   end
@@ -241,6 +256,39 @@ module FileUtils
 
   def move(src, dest, force: nil, verbose: nil, noop: nil, secure: nil)
     mv(src, dest, force: force, verbose: verbose, noop: noop)
+  end
+
+  # install copies each source unless the destination already holds the same
+  # contents, making the destination's directory first, then gives the copy
+  # mode (an Integer, as chmod takes here) and, with preserve, the source's
+  # times. A list of sources, or a destination that is a directory, takes
+  # each source's basename inside it. There is no owner: or group:, which
+  # would be chown.
+  def install(src, dest, mode: nil, preserve: nil, noop: nil, verbose: nil)
+    if verbose
+      flags = "#{preserve ? ' -p' : ''}#{mode ? " -m #{fu_mode_to_s(mode)}" : ''}"
+      fu_output_message("install -c#{flags} #{(fu_list(src) + [dest.to_s]).join(' ')}")
+    end
+    return nil if noop
+    into = src.is_a?(Array) || File.directory?(dest.to_s)
+    fu_list(src).each do |s|
+      d = into ? File.join(dest.to_s, File.basename(s)) : dest.to_s
+      raise ArgumentError, "same file: #{s} and #{d}" if File.identical?(s, d)
+      st = File.stat(s)
+      next if File.exist?(d) && compare_file(s, d)
+      remove_file(d, true)
+      # a destination spelled with a trailing slash is a directory to make
+      if d.end_with?("/")
+        mkdir_p(d)
+        copy_file(s, d + File.basename(s))
+      else
+        mkdir_p(File.expand_path("..", d))
+        copy_file(s, d)
+      end
+      File.utime(st.atime, st.mtime, d) if preserve
+      File.chmod(mode, d) if mode
+    end
+    nil
   end
 
   # touch creates what is missing and updates the times of what is not.

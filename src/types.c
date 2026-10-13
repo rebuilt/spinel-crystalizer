@@ -1,9 +1,16 @@
 #include "types.h"
+#include "builtin_ops.h"
 #include <stddef.h>
 #include <string.h>
 
 /* ---- The boxed-receiver face table (see types.h) ---- */
 static const PolyFace ty_poly_face_tbl[] = {
+  /* Random stored in a mixed container keeps its instance surface. The
+     typed call also checks invalid counts; bytes without arguments belongs
+     to String and keeps its existing dispatch. */
+  {"rand", PF_RANDOM, 0, -1, -1},
+  {"bytes", PF_RANDOM, 1, -1, -1},
+  {"seed", PF_RANDOM, 0, -1, -1},
   /* String value-form mutators: the non-bang transform runs against the
      unboxed contents and the result is written back through the box. */
   {"gsub!", PF_STRING | PF_STR_BANG, 0, -1, -1}, {"sub!", PF_STRING | PF_STR_BANG, 0, -1, -1},
@@ -34,9 +41,26 @@ static const PolyFace ty_poly_face_tbl[] = {
   {"times", PF_INT, 0, 0, 1}, {"upto", PF_INT, 1, 1, 1}, {"downto", PF_INT, 1, 1, 1},
   {"step", PF_INT | PF_FLOAT, 0, 2, 1},   /* no limit: the endless Integer walk (the Float arm declines it) */
   /* the blockless form materializes the sequence the way the typed
-     emitters do (an Integer or a Float array), boxed since the two arms
-     disagree, so `.to_a` / `.map` read it as the Enumerator's answer (#4779) */
-  {"step", PF_INT | PF_FLOAT, 1, 2, 0},
+     emitters do (an Integer or a Float array), boxed since the arms
+     disagree, so `.to_a` / `.map` read it as the Enumerator's answer (#4779);
+     an Integer or Float Range's step(n) materializes the same way */
+  {"step", PF_INT | PF_FLOAT | PF_RANGE | PF_FRANGE, 1, 2, 0},
+  /* with no argument at all, a number's endless walk by 1 */
+  {"step", PF_INT | PF_FLOAT, 0, 0, 0},
+  /* A Range of each kind owns step and bsearch with a block: unboxed to its
+     own by-value struct, the typed emitter walks it. A blockless step(n)
+     takes the row above; blockless bsearch answers an Enumerator no typed
+     emitter builds.
+     An Array owns bsearch too: a row for the name decides every receiver
+     kind, so leaving it out made a boxed Array's bsearch a NoMethodError.
+     A String Range's bsearch is its TypeError, raised by its own row. */
+  {"step", PF_RANGE | PF_FRANGE | PF_SRANGE, 0, 1, 1},
+  {"bsearch", PF_ARRAY | PF_RANGE | PF_FRANGE | PF_SRANGE, 0, 0, 1},
+  /* bsearch_index with a block is Array's alone (a Range has none) */
+  {"bsearch_index", PF_ARRAY, 0, 0, 1},
+  /* minmax is Range's own, read off the endpoints (a Float Range cannot be
+     walked), beside the Enumerable row below that walks a collection */
+  {"minmax", PF_RANGE | PF_FRANGE | PF_SRANGE, 0, 0, -1},
   /* The Enumerable names a boxed receiver shares with Array: its elements
      (a hash's [key, value] pairs) materialize into a poly array once. */
   {"minmax", PF_ENUM, 0, -1, -1}, {"tally", PF_ENUM, 0, -1, -1}, {"product", PF_ENUM, 0, -1, -1},
@@ -46,10 +70,11 @@ static const PolyFace ty_poly_face_tbl[] = {
   {"slice_when", PF_ENUM, 0, -1, 1},
   /* Names served by unboxing to an Array, on an Array at run time; a mutator
      writes its result back into a typed original. */
-  {"sort!", PF_ARRAY | PF_MUT, 0, 0, -1}, {"sort_by!", PF_ARRAY | PF_MUT, 0, 0, 1},
-  {"rotate!", PF_ARRAY | PF_MUT, 0, 1, 0}, {"uniq!", PF_ARRAY | PF_MUT, 0, 0, -1},
-  {"shuffle!", PF_ARRAY | PF_MUT, 0, 0, 0},
-  {"flatten!", PF_ARRAY | PF_MUT, 0, 1, 0}, {"fill", PF_ARRAY | PF_MUT, 1, 3, 0},
+  {"sort!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, -1}, {"sort_by!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 1},
+  {"rotate!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 1, 0}, {"uniq!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, -1},
+  {"shuffle!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 0},
+  {"flatten!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 1, 0}, {"fill", PF_ARRAY | PF_MUT | PF_VAL_SELF, 1, 3, 0},
+  {"fill", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 2, 1},
   {"to_ary", PF_ARRAY, 0, 0, 0}, {"transpose", PF_ARRAY, 0, 0, 0},
   /* and the Enumerable names that had no arm at all */
   {"grep", PF_ENUM, 1, 1, -1}, {"minmax_by", PF_ENUM, 0, 0, 1},
@@ -60,25 +85,27 @@ static const PolyFace ty_poly_face_tbl[] = {
      the arm. concat's arguments are of the receiver's own kind in CRuby
      (a String concatenates Strings, an Array Arrays), so an argument the
      inference has typed as the other kind rules that arm out. */
-  {"concat", PF_STRING | PF_MUT | PF_ARGS_OWN | PF_VAL_SELF, 0, -1, 0}, {"concat", PF_ARRAY | PF_MUT | PF_ARGS_OWN, 0, -1, 0},
-  {"prepend", PF_STRING | PF_MUT | PF_ARGS_OWN | PF_VAL_SELF, 0, -1, 0}, {"prepend", PF_ARRAY | PF_MUT, 0, -1, 0},
-  {"reverse!", PF_STRING | PF_MUT | PF_VAL_SELF, 0, 0, 0}, {"reverse!", PF_ARRAY | PF_MUT, 0, 0, 0},
+  {"concat", PF_STRING | PF_MUT | PF_ARGS_OWN | PF_VAL_SELF, 0, -1, 0}, {"concat", PF_ARRAY | PF_MUT | PF_VAL_SELF | PF_ARGS_OWN, 0, -1, 0},
+  {"prepend", PF_STRING | PF_MUT | PF_ARGS_OWN | PF_VAL_SELF, 0, -1, 0}, {"prepend", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, -1, 0},
+  {"reverse!", PF_STRING | PF_MUT | PF_VAL_SELF, 0, 0, 0}, {"reverse!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 0},
   {"slice!", PF_STRING | PF_MUT, 1, 2, 0}, {"slice!", PF_ARRAY | PF_MUT, 1, 2, 0},
   /* The Hash mutators, on a Hash at run time; a typed variant takes the
      result back from the general copy it was normalized to, and the value is
-     the box, since the copy is detached once written back. */
-  {"merge!", PF_HASH | PF_MUT | PF_VAL_SELF, 1, -1, 0}, {"update", PF_HASH | PF_MUT | PF_VAL_SELF, 1, -1, 0},
+     the box, since the copy is detached once written back. Their arguments
+     are Hashes. */
+  {"merge!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, -1}, {"merge!", PF_HASH | PF_MUT | PF_VAL_SELF | PF_ARGS_OWN, 1, -1, 0},
+  {"update", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, -1}, {"update", PF_HASH | PF_MUT | PF_VAL_SELF | PF_ARGS_OWN, 1, -1, 0},
   /* The names Array and Hash share: the receiver's run-time kind picks the
      arm. The in-place filters take their block; of the blockless names,
      assoc, rassoc and fetch_values keep their last-resort Hash rows below, so
      a splat or a block still reaches the read-only face; compact! never had
      one. */
-  {"select!", PF_ARRAY | PF_MUT, 0, 0, 1}, {"select!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
-  {"filter!", PF_ARRAY | PF_MUT, 0, 0, 1}, {"filter!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
-  {"reject!", PF_ARRAY | PF_MUT, 0, 0, 1}, {"reject!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
-  {"keep_if", PF_ARRAY | PF_MUT, 0, 0, 1}, {"keep_if", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
-  {"delete_if", PF_ARRAY | PF_MUT, 0, 0, 1}, {"delete_if", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
-  {"compact!", PF_ARRAY | PF_MUT, 0, 0, 0}, {"compact!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 0},
+  {"select!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 1}, {"select!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
+  {"filter!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 1}, {"filter!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
+  {"reject!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 1}, {"reject!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
+  {"keep_if", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 1}, {"keep_if", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
+  {"delete_if", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 1}, {"delete_if", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 1},
+  {"compact!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 0}, {"compact!", PF_HASH | PF_MUT | PF_VAL_SELF, 0, 0, 0},
   /* The Hash mutators that were not rows and raised NoMethodError through
      a box. The setters answer their argument the way the typed emitter
      renders them, `default_proc=` the receiver. `shift` and `replace` are
@@ -90,7 +117,11 @@ static const PolyFace ty_poly_face_tbl[] = {
   {"default=", PF_HASH | PF_MUT, 1, 1, 0}, {"default_proc=", PF_HASH | PF_MUT | PF_VAL_SELF, 1, 1, 0},
   {"assoc", PF_ARRAY, 1, 1, 0}, {"assoc", PF_HASH, 1, 1, 0},
   {"rassoc", PF_ARRAY, 1, 1, 0}, {"rassoc", PF_HASH, 1, 1, 0},
-  {"fetch_values", PF_ARRAY, 1, -1, 0}, {"fetch_values", PF_HASH, 1, -1, 0},
+  {"fetch_values", PF_ARRAY, 0, 0, -1}, {"fetch_values", PF_ARRAY, 1, -1, 0},
+  {"fetch_values", PF_HASH, 0, 0, -1}, {"fetch_values", PF_HASH, 1, -1, 0},
+  /* fetch's block form: the dispatch that serves the argument forms has no
+     block to call on a miss */
+  {"fetch", PF_ARRAY, 1, 2, 1}, {"fetch", PF_HASH, 1, 2, 1},
   /* The read-only Hash/Enumerable face. */
   {"dig", PF_HASH | PF_LAST, 0, -1, -1}, {"value?", PF_HASH | PF_LAST, 0, -1, -1}, {"has_value?", PF_HASH | PF_LAST, 0, -1, -1},
   {"invert", PF_HASH | PF_LAST, 0, -1, -1}, {"assoc", PF_HASH | PF_LAST, 0, -1, -1}, {"rassoc", PF_HASH | PF_LAST, 0, -1, -1}, {"key", PF_HASH | PF_LAST, 0, -1, -1},
@@ -137,6 +168,29 @@ unsigned ty_poly_face_owner_flags(const char *name, int argc, int has_blk, int p
   }
   return fl;
 }
+unsigned ty_str_bang_flags(const char *name) {
+  if (!name) return 0;
+  for (const PolyFace *r = ty_poly_face_tbl; r->name; r++)
+    if ((r->flags & PF_STR_BANG) && sp_streq(name, r->name))
+      return r->flags & (PF_STR_BANG | PF_STR_SELF);
+  return 0;
+}
+unsigned ty_str_typed_bang_flags(const char *name) {
+  unsigned fl = ty_str_bang_flags(name);
+  /* reverse! is a String bang too, answering self, but its face rows are
+     the mutator kind's (PF_MUT | PF_VAL_SELF): Array has it as well, so a
+     boxed receiver's reverse! is either, and answers poly */
+  if (!fl && name && sp_streq(name, "reverse!")) fl = PF_STR_BANG | PF_STR_SELF;
+  return fl;
+}
+void str_bang_plain(const char *bang, char *out, int n) {
+  size_t len = bang ? strlen(bang) : 0;
+  if (len && bang[len - 1] == '!') len--;
+  if (n <= 0) return;
+  if (len >= (size_t)n) len = (size_t)n - 1;
+  if (len) memcpy(out, bang, len);
+  out[len] = 0;
+}
 int ty_poly_hash_face_name(const char *nm) {
   if (!nm) return 0;
   for (const PolyFace *r = ty_poly_face_tbl; r->name; r++)
@@ -157,6 +211,7 @@ const char *ty_name(TyKind t) {
     case TY_SYMBOL:  return "symbol";
     case TY_BOOL:    return "bool";
     case TY_RANGE:   return "range";
+    case TY_FLOAT_RANGE: return "float_range";
     case TY_TIME:    return "time";
     case TY_COMPLEX: return "complex";
     case TY_RATIONAL: return "rational";
@@ -193,6 +248,7 @@ const char *ty_name(TyKind t) {
     case TY_OPENSTRUCT: return "openstruct";
     case TY_METHOD:  return "method";
     case TY_IO:      return "io";
+    case TY_ARGF:    return "argf";
     case TY_ENUMERATOR: return "enumerator";
     case TY_CLASS:   return "class";
     case TY_POLY:    return "poly";
@@ -256,6 +312,9 @@ int ty_is_array(TyKind t) {
          t == TY_STR_ARRAY || t == TY_POLY_ARRAY || t == TY_INT_ARRAY_ARRAY ||
          t == TY_FLOAT_ARRAY_ARRAY;
 }
+int array_new_copies(TyKind t) {
+  return t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY || t == TY_POLY_ARRAY;
+}
 TyKind ty_array_of(TyKind elem) {
   switch (elem) {
     case TY_INT:    return TY_INT_ARRAY;
@@ -284,6 +343,65 @@ TyKind ty_array_elem(TyKind arr) {
       if (ty_is_obj_array(arr)) return ty_object(ty_obj_array_class(arr));
       return TY_POLY;
   }
+}
+
+/* A builtin whose result follows its receiver's kind, called on a yield
+   whose block answers different kinds at different call sites
+   (`def w = yield.first` with an Integer Array block at one site and a
+   String Array one at another). The inlined call is lowered per site from
+   that site's receiver, so it emits an sp_int at one and a const char * at
+   the other, while the slot it lands in was typed from one site only: the C
+   did not compile, or a Float site's 1.5 was stored into an sp_int as 1.
+   This names, per receiver kind, what that lowering produces -- the same
+   type the analyzer answers for the call on a receiver of that kind alone
+   (`[1.5].first` is a Float, `["a"].sort` a String Array) -- for the kinds
+   whose lowering is a plain value of one kind. Two families: the element
+   readers answer the array's element, and the copies and reorderings answer
+   the receiver's own kind. A pair left out here keeps the yield's single
+   typing, as before. Some builtins look like they belong and do not: an
+   Integer's succ and an Integer Array's sum answer a Bignum under
+   --int-overflow=promote, so their type is the mode's and not the
+   receiver's, and a String Array's sum raises CRuby's TypeError through a
+   boxed path. dig's answer depends on how many indices it is given, and
+   under promote even an Integer Array's dig(0) is boxed. */
+static int ty_recv_is_plain_array(TyKind t) {
+  return t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY;
+}
+int ty_recv_builtin_result(const char *name, int argc, TyKind arg0, TyKind recv, TyKind *out) {
+  if (!name) return 0;
+  if (argc == 0) {
+    if (!strcmp(name, "abs") || !strcmp(name, "magnitude")) {
+      if (recv != TY_INT && recv != TY_FLOAT) return 0;
+      *out = recv; return 1;
+    }
+    /* String#-@ is the deduplicated frozen String, so a String site belongs
+       here too; a String has no abs or magnitude. */
+    if (!strcmp(name, "-@")) {
+      if (recv != TY_INT && recv != TY_FLOAT && recv != TY_STRING) return 0;
+      *out = recv; return 1;
+    }
+    if (!strcmp(name, "itself") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
+        !strcmp(name, "freeze")) {
+      if (recv != TY_INT && recv != TY_FLOAT && recv != TY_STRING && recv != TY_SYMBOL &&
+          !ty_recv_is_plain_array(recv)) return 0;
+      *out = recv; return 1;
+    }
+    if (!strcmp(name, "sort") || !strcmp(name, "reverse") || !strcmp(name, "uniq") ||
+        !strcmp(name, "compact") || !strcmp(name, "to_a")) {
+      if (!ty_recv_is_plain_array(recv)) return 0;
+      *out = recv; return 1;
+    }
+    if (!strcmp(name, "first") || !strcmp(name, "last") || !strcmp(name, "min") ||
+        !strcmp(name, "max") || !strcmp(name, "pop") || !strcmp(name, "shift")) {
+      if (!ty_recv_is_plain_array(recv)) return 0;
+      *out = ty_array_elem(recv); return 1;
+    }
+    return 0;
+  }
+  if (argc == 1 && !strcmp(name, "[]") && arg0 == TY_INT && ty_recv_is_plain_array(recv)) {
+    *out = ty_array_elem(recv); return 1;
+  }
+  return 0;
 }
 /* ty_array_of deliberately does NOT map TY_INT_ARRAY -> TY_INT_ARRAY_ARRAY, nor
    TY_FLOAT_ARRAY -> TY_FLOAT_ARRAY_ARRAY: like TY_OBJ_ARRAY, the nested types are
@@ -314,12 +432,13 @@ TyKind ty_unify(TyKind a, TyKind b) {
      widen to poly, so `v.nil? ? nil : v.upcase`, `return nil if v.nil?` and
      `t = nil; t = "y" if ...` all took the boxed slow path where `v&.upcase`
      did not, and that one rule was the largest single source of untyped
-     slots in a real tree (#4567). Integer and Float have sentinels too and
-     may follow; bool and Symbol have no spare inhabitant and stay poly. */
+     slots in a real tree (#4567). Integer and Float hold their nil beside
+     the value and follow below; bool and Symbol have no spare inhabitant and
+     stay poly. */
   if (a == TY_NIL && b == TY_STRING) return b;
   if (b == TY_NIL && a == TY_STRING) return a;
   /* An Integer or a Float that also sees nil stays a (nullable) scalar: the
-     slot's nil is the sentinel (SP_INT_NIL, the NaN payload), which the
+     slot's nil rides beside the value (sp_oint / sp_ofloat), which the
      search misses already leave there, and every consumer that can carry
      it is guarded by the #3505 marking (nullable_int on the local, the
      ivar, the return). `best = nil` followed by `best = x` in a search
@@ -379,73 +498,54 @@ int fold_seed_typed(TyKind seed, TyKind elem) {
   return elem == TY_FLOAT && seed == TY_INT;
 }
 
-/* The single-element-arg array iterators: a block bound to one of these
-   receives exactly one param = the array element. Enumerated once here so the
-   knowledge is not re-encoded as scattered method-name lists. */
-static int ty_is_array_elem_iter(const char *n) {
-  return sp_streq(n, "each") || sp_streq(n, "map") || sp_streq(n, "collect") ||
-         sp_streq(n, "select") || sp_streq(n, "reject") || sp_streq(n, "filter") ||
-         sp_streq(n, "find") || sp_streq(n, "detect") || sp_streq(n, "find_all") ||
-         sp_streq(n, "sort_by") || sp_streq(n, "min_by") || sp_streq(n, "max_by") ||
-         sp_streq(n, "count") || sp_streq(n, "sum") || sp_streq(n, "flat_map") ||
-         sp_streq(n, "collect_concat") ||
-         sp_streq(n, "filter_map") || sp_streq(n, "partition") || sp_streq(n, "group_by") ||
-         sp_streq(n, "any?") || sp_streq(n, "all?") || sp_streq(n, "none?") ||
-         sp_streq(n, "one?") || sp_streq(n, "take_while") || sp_streq(n, "drop_while") ||
-         sp_streq(n, "reverse_each") || sp_streq(n, "each_entry") || sp_streq(n, "find_index");
+/* A sum can return the untouched seed when empty. Keep that class as well as
+   the block's values; nonnumeric accumulators use the boxed Ruby operator. */
+TyKind fold_sum_type(TyKind seed, TyKind elem, int promote) {
+  if (elem != TY_INT && elem != TY_FLOAT) return TY_POLY;
+  if (seed == TY_POLY || seed == TY_STRING ||
+      (seed != TY_INT && seed != TY_FLOAT && seed != TY_UNKNOWN &&
+       !fold_seed_typed(seed, elem))) return TY_POLY;
+  if (elem == TY_FLOAT && seed != TY_FLOAT) return TY_POLY;
+  if (promote && elem == TY_INT && seed != TY_FLOAT) return TY_POLY;
+  return seed == TY_FLOAT ? TY_FLOAT : elem;
 }
 
 TyIterShape ty_iter_shape(const char *name) {
   if (!name) return TY_ITER_NONE;
-  if (sp_streq(name, "map") || sp_streq(name, "collect")) return TY_ITER_MAP;
-  if (sp_streq(name, "select") || sp_streq(name, "filter")) return TY_ITER_SELECT;
+  if (is_map_alias(name)) return TY_ITER_MAP;
+  if (is_select_alias(name)) return TY_ITER_SELECT;
   if (sp_streq(name, "reject")) return TY_ITER_REJECT;
   return TY_ITER_NONE;
 }
 
+/* Read off the iterator rows (builtin_ops.c iter_rows). A Hash's pair is
+   handed on as its key and its value: reporting 0 for the Hash iterators
+   that yield it did not mean "no block". The forwarded-callable desugar
+   reads 0 as "not a context-free iterator" and declines, and declining
+   left `h.map(&f)` in its &-form with no emitter to claim it: a
+   NoMethodError at run time from a program that compiled. The 1-param and
+   2-param callable cases are separated by the wrap_pair rule at the call
+   site. The boxed-element widening (analyze_pass.c
+   widen_boxed_elem_sources) asks it too, whether an Array iterator's
+   first parameter is an element. A run (each_slice, each_cons) is left
+   untyped: the block's parameter is typed from it as a literal block's
+   is. */
 int ty_block_yield(TyKind recv, const char *name, TyKind *out, int max) {
   if (!name || max < 1) return 0;
-#define BY_PUT(i, t) do { if ((i) < max) out[i] = (t); } while (0)
-  if (ty_is_array(recv)) {
-    TyKind e = ty_array_elem(recv);
-    if (ty_is_array_elem_iter(name)) { BY_PUT(0, e); return 1; }
-    if (sp_streq(name, "each_with_index")) { BY_PUT(0, e); BY_PUT(1, TY_INT); return 2; }
-    return 0;
+  TyKind fam = ty_is_array(recv) ? BOP_ANY_ARRAY
+             : ty_is_hash(recv) ? BOP_ANY_HASH
+             : recv == TY_RANGE || recv == TY_INT || recv == TY_STRING ? recv
+             : TY_UNKNOWN;
+  const IterRow *r = fam == TY_UNKNOWN ? NULL : iter_row(fam, name, -1, IRF_GAP_FWD);
+  if (!r) return 0;
+  if (r->nyield == 1 && r->yield[0] == YS_PAIR) {
+    out[0] = ty_hash_key(recv);
+    if (max > 1) out[1] = ty_hash_val(recv);
+    return 2;
   }
-  if (ty_is_hash(recv)) {
-    if (sp_streq(name, "each") || sp_streq(name, "each_pair")) {
-      BY_PUT(0, ty_hash_key(recv)); BY_PUT(1, ty_hash_val(recv)); return 2;
-    }
-    if (sp_streq(name, "each_key")) { BY_PUT(0, ty_hash_key(recv)); return 1; }
-    if (sp_streq(name, "each_value")) { BY_PUT(0, ty_hash_val(recv)); return 1; }
-    /* Every other element iterator hands a Hash's block the same [k, v] pair
-       `each` does -- that is what Enumerable is, and Hash gets these names from
-       it. Reporting 0 for them did not mean "no block": this oracle's one
-       caller is the forwarded-callable desugar, which reads 0 as "not a
-       context-free iterator" and declines. Declining left `h.map(&f)` in its
-       &-form with no emitter to claim it, and the call became a NoMethodError
-       raised at run time by a program that compiled. The 1-param and 2-param
-       callable cases are then separated by the wrap_pair rule at the call site,
-       which already existed for `each` and needs nothing new. */
-    if (ty_is_array_elem_iter(name)) {
-      BY_PUT(0, ty_hash_key(recv)); BY_PUT(1, ty_hash_val(recv)); return 2;
-    }
-    return 0;
-  }
-  if (recv == TY_RANGE) {
-    /* a range yields ints to its element iterators */
-    if (sp_streq(name, "each_with_index")) { BY_PUT(0, TY_INT); BY_PUT(1, TY_INT); return 2; }
-    if (ty_is_array_elem_iter(name)) { BY_PUT(0, TY_INT); return 1; }
-    return 0;
-  }
-  if (recv == TY_INT) {
-    if (sp_streq(name, "times") || sp_streq(name, "upto") || sp_streq(name, "downto")) {
-      BY_PUT(0, TY_INT); return 1;
-    }
-    return 0;
-  }
-  return 0;
-#undef BY_PUT
+  for (int k = 0; k < r->nyield && k < max; k++)
+    out[k] = r->yield[k] == YS_SUB ? TY_UNKNOWN : iter_yield_kind(r, k, recv);
+  return r->nyield;
 }
 
 int ty_object_protocol_kind(TyKind t) {
@@ -491,7 +591,7 @@ int ty_object_protocol_answers(TyKind rt, TyKind at, const char *name, int argc)
   int kind = ty_object_protocol_kind(rt);
   if (argc == 0) {
     if (kind == 1)
-      return sp_streq(name, "frozen?") || sp_streq(name, "freeze") ||
+      return is_freeze_family(name) ||
              (ty_object_protocol_io(rt) && sp_streq(name, "to_s"));
     /* a Range is always frozen; Time and Tms carry no frozen bit, so neither
        question is answered for them */
@@ -503,7 +603,7 @@ int ty_object_protocol_answers(TyKind rt, TyKind at, const char *name, int argc)
   int is_equal = sp_streq(name, "equal?");
   int is_eql = sp_streq(name, "eql?");
   int is_case = sp_streq(name, "===");
-  int is_eq = is_case || sp_streq(name, "==") || sp_streq(name, "!=");
+  int is_eq = is_case || is_eq_or_ne(name);
   if (!is_eq && !is_eql && !is_equal) return 0;
   if (kind == 0) {
     /* the cross-family tier */
@@ -519,4 +619,29 @@ int ty_object_protocol_answers(TyKind rt, TyKind at, const char *name, int argc)
   /* a by-value struct has no identity to compare */
   if (kind == 2 && is_equal) return 0;
   return 1;
+}
+
+/* ty_traits (types.h): generated from the functions each column names by
+   spinel --dump-traits, and checked against them by --check-traits. */
+const TyTraits ty_traits[TY_TRAITS_N] = {
+#include "ty_traits.inc"
+};
+
+/* A builtin value's type, which lays out no instance variables: a String,
+   a number, true, false, nil, a Symbol, a Range (of any endpoints), a Random,
+   an Array or a Hash. */
+int ty_builtin_ivar_less(TyKind t) {
+  return t == TY_STRING || t == TY_STRBUF || t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_NIL ||
+         t == TY_SYMBOL || t == TY_BIGINT || t == TY_RANGE || t == TY_FLOAT_RANGE || t == TY_STR_RANGE ||
+         t == TY_RANDOM || ty_is_array(t) || ty_is_hash(t);
+}
+
+/* Of those, the values whose identity Spinel keeps, so the runtime's map can
+   hold their ivars (sp_bivar_*): an Array, a Hash, a Random. An exception
+   is keyed too, though it is no ivar-less builtin: one of the program's
+   exception classes keeps its ivars in its own layout, so the reflection on
+   it dispatches by the runtime class (emit_exc_ivar_call), and only a copy
+   of it reads this predicate. */
+int ty_bivar_keyed(TyKind t) {
+  return t == TY_RANDOM || t == TY_EXCEPTION || ty_is_array(t) || ty_is_hash(t);
 }

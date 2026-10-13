@@ -32,6 +32,7 @@ module Enumerable
   end
 
   def tally(hash = nil)
+    __no_false(hash, "Hash")
     if hash
       each { |x| hash[x] = hash.fetch(x, 0) + 1 }
       hash
@@ -50,6 +51,7 @@ module Enumerable
     if block_given?
       forever = true
       rounds = 0
+      __no_false(n, "Integer")
       if n
         raise TypeError, "no implicit conversion of #{n.class} into Integer" unless n.is_a?(Integer) || n.is_a?(Float)
         forever = false
@@ -108,6 +110,7 @@ module Enumerable
 
   def min_by(n = nil)
     if block_given?
+      __no_false(n, "Integer")
       if n
         raise ArgumentError, "negative size (#{n})" if n < 0
         sort_by { |x| yield x }.first(n)
@@ -142,6 +145,7 @@ module Enumerable
 
   def max_by(n = nil)
     if block_given?
+      __no_false(n, "Integer")
       if n
         raise ArgumentError, "negative size (#{n})" if n < 0
         # descending by key, ties in encounter order: a stable ascending sort
@@ -217,54 +221,51 @@ module Enumerable
     # it answers an Enumerator), minmax always computes immediately: with a
     # block, the block IS the comparator (`yield(a, b)`, not `a <=> b`);
     # without one, `<=>` is. Neither arm can be `each` (an Enumerator).
+    #
+    # One walk with a flag, as min_by and max_by take theirs: a leading nil is
+    # an element like any other (`[nil, 3].minmax` raises), and only an empty
+    # receiver answers [nil, nil].
+    min = nil
+    max = nil
+    found = false
     if block_given?
-      min = first
-      if min.nil?
-        [nil, nil]
-      else
-        max = min
-        skip = true
-        each do |x|
-          if skip
-            skip = false
-          else
-            c = yield(x, min)
-            raise ArgumentError, "comparison of #{min.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
-            min = x if c < 0
-            c = yield(x, max)
-            raise ArgumentError, "comparison of #{max.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
-            max = x if c > 0
-          end
+      each do |x|
+        if found
+          c = yield(x, min)
+          raise ArgumentError, "comparison of #{min.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
+          min = x if c < 0
+          c = yield(x, max)
+          raise ArgumentError, "comparison of #{max.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
+          max = x if c > 0
+        else
+          min = x
+          max = x
+          found = true
         end
-        [min, max]
       end
+      [min, max]
     else
-      min = first
-      if min.nil?
-        [nil, nil]
-      else
-        max = min
-        skip = true
-        each do |x|
-          if skip
-            skip = false
-          else
-            c = x <=> min
-            # CRuby's own message names the ACCUMULATOR's class unconditionally
-            # first, the new element's class or inspect second (the mirror of
-            # min_by/max_by's message, which names the new element first) --
-            # verified against `[1, "a"].minmax` ("comparison of Integer with
-            # String failed") and `["a", 1].minmax` ("comparison of String
-            # with 1 failed").
-            raise ArgumentError, "comparison of #{min.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
-            min = x if c < 0
-            c = x <=> max
-            raise ArgumentError, "comparison of #{max.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
-            max = x if c > 0
-          end
+      each do |x|
+        if found
+          c = x <=> min
+          # CRuby's own message names the ACCUMULATOR's class unconditionally
+          # first, the new element's class or inspect second (the mirror of
+          # min_by/max_by's message, which names the new element first) --
+          # verified against `[1, "a"].minmax` ("comparison of Integer with
+          # String failed") and `["a", 1].minmax` ("comparison of String
+          # with 1 failed").
+          raise ArgumentError, "comparison of #{min.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
+          min = x if c < 0
+          c = x <=> max
+          raise ArgumentError, "comparison of #{max.class} with #{(x.nil? || x == true || x == false || x.is_a?(Numeric) || x.is_a?(Symbol)) ? x.inspect : x.class} failed" if c.nil?
+          max = x if c > 0
+        else
+          min = x
+          max = x
+          found = true
         end
-        [min, max]
       end
+      [min, max]
     end
   end
 
@@ -589,5 +590,12 @@ module Enumerable
       each { |x| out << x unless pattern === x }
     end
     out
+  end
+
+  # An optional argument is absent only when it is nil: false is one, which
+  # CRuby refuses. The test is on truthiness, so an omitted argument folds
+  # it away.
+  def __no_false(opt, what)
+    raise TypeError, "no implicit conversion of false into #{what}" if !opt && !opt.nil?
   end
 end

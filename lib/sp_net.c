@@ -140,6 +140,54 @@ int sp_net_listen_host(const char *host, int port, int backlog) {
     return fd;
 }
 
+/* Socket.tcp_server_sockets(host, port): one listening fd per address the
+   host resolves to, up to `cap`, into fds; returns how many. An IPv6 socket
+   is IPv6-only so it can sit beside the IPv4 one on the same port, and port
+   0 binds the first address to an ephemeral port that the rest then share.
+   An address that cannot be bound is skipped. With none bound it returns 0
+   and leaves errno and *op (the step that failed: "socket", "bind(2)" or
+   "listen(2)") from the last attempt; -1 when the host does not resolve,
+   with *op the resolver's message. The port goes to the resolver as given,
+   as CRuby passes it, so the resolver decides what an out-of-range one is. */
+int sp_net_listen_all(const char *host, int port, int *fds, int cap, const char **op) {
+    signal(SIGPIPE, SIG_IGN);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+    char portbuf[16];
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+    int rc = sp_net_resolve((host && *host) ? host : NULL, portbuf, &hints, &res);
+    if (rc != 0) { *op = gai_strerror(rc); return -1; }
+    int n = 0, e = 0;
+    *op = "bind(2)";
+    for (struct addrinfo *ai = res; ai && n < cap; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) { e = errno; *op = "socket(2)"; continue; }
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef IPV6_V6ONLY
+        if (ai->ai_family == AF_INET6)
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+#endif
+        /* port 0: every later address takes the port the first one got */
+        if (n > 0 && port == 0) {
+            int p0 = sp_net_local_port(fds[0]);
+            if (ai->ai_family == AF_INET)
+                ((struct sockaddr_in *)ai->ai_addr)->sin_port = htons((unsigned short)p0);
+            else if (ai->ai_family == AF_INET6)
+                ((struct sockaddr_in6 *)ai->ai_addr)->sin6_port = htons((unsigned short)p0);
+        }
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0) { e = errno; *op = "bind(2)"; close(fd); continue; }
+        if (listen(fd, SOMAXCONN) != 0) { e = errno; *op = "listen(2)"; close(fd); continue; }
+        fds[n++] = fd;
+    }
+    freeaddrinfo(res);
+    if (n == 0) errno = e ? e : EADDRNOTAVAIL;
+    return n;
+}
+
 /* The local port a bound/listening fd ended up on (port 0 => ephemeral). */
 int sp_net_local_port(int fd) {
     struct sockaddr_storage ss;
@@ -169,6 +217,43 @@ int sp_net_sock_ip(int fd, int peer, char *ipbuf, int cap) {
         return (int)ntohs(a->sin6_port);
     }
     return -1;
+}
+
+/* The local/peer address of a socket fd as the packed sockaddr bytes, into
+   out: their length, or -1 with errno set. peer != 0 reads the remote end. */
+int sp_net_sock_name(int fd, int peer, void *out, int cap) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    int r = peer ? getpeername(fd, (struct sockaddr *)&ss, &len)
+                 : getsockname(fd, (struct sockaddr *)&ss, &len);
+    if (r != 0) return -1;
+    if (len > (socklen_t)sizeof(ss)) len = sizeof(ss);
+    if ((int)len > cap) len = (socklen_t)cap;
+    memcpy(out, &ss, len);
+    return (int)len;
+}
+
+/* The host name the local/peer address of a socket fd reverse-resolves to,
+   into hostbuf: 0, or -1 when it has none (the caller then reports the
+   numeric address, as CRuby does). A lookup may take seconds, so it runs
+   outside the world, as getaddrinfo does. */
+int sp_net_sock_host(int fd, int peer, char *hostbuf, int cap) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    int r = peer ? getpeername(fd, (struct sockaddr *)&ss, &len)
+                 : getsockname(fd, (struct sockaddr *)&ss, &len);
+    if (r != 0) return -1;
+    if (ss.ss_family != AF_INET && ss.ss_family != AF_INET6) return -1;
+#ifdef NI_NAMEREQD
+    sp_native_enter();
+    int rc = getnameinfo((struct sockaddr *)&ss, len, hostbuf, (socklen_t)cap, NULL, 0, NI_NAMEREQD);
+    sp_native_leave();
+    return rc == 0 ? 0 : -1;
+#else
+    /* no reverse lookup on this platform (wasm32-wasi): the numeric address */
+    (void)len; (void)hostbuf; (void)cap;
+    return -1;
+#endif
 }
 
 int sp_net_listen(int port, int reuseport) {
@@ -414,12 +499,12 @@ int sp_net_socket(int domain, int type, int protocol) {
 /* getaddrinfo, one resolution at a time: `idx` selects the entry so the caller
    can walk them without owning the addrinfo list. Fills family/socktype/
    protocol/ip/port; returns 0 on success, -1 past the end or on failure. */
-int sp_net_getaddrinfo_at(const char *host, int port, int socktype, int idx,
+int sp_net_getaddrinfo_at(const char *host, int port, int want_family, int socktype, int idx,
                           int *family, int *stype, int *proto,
                           char *ipbuf, int ipcap, int *port_out) {
     struct addrinfo hints, *res = NULL, *ai;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
+    hints.ai_family   = want_family > 0 ? want_family : AF_UNSPEC;
     hints.ai_socktype = socktype > 0 ? socktype : 0;
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
@@ -572,23 +657,7 @@ static int sp_net_wait_io(int fd, short events) {
 #endif
 }
 
-int sp_net_write_str(int fd, const char *s) {
-    size_t len = strlen(s);
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(fd, s + off, len - off, 0);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && sp_net_wait_io(fd, POLLOUT)) continue;
-            return -1;
-        }
-        off += (size_t)n;
-    }
-    return 0;
-}
-
-int sp_net_write_bytes(int fd, const char *data, int n) {
-    size_t total = (n < 0) ? 0 : (size_t)n;
+static int sp_net_send_all(int fd, const char *data, size_t total) {
     size_t off = 0;
     while (off < total) {
         ssize_t w = send(fd, data + off, total - off, 0);
@@ -600,6 +669,14 @@ int sp_net_write_bytes(int fd, const char *data, int n) {
         off += (size_t)w;
     }
     return 0;
+}
+
+int sp_net_write_str(int fd, const char *s) {
+    return sp_net_send_all(fd, s, strlen(s));
+}
+
+int sp_net_write_bytes(int fd, const char *data, int n) {
+    return sp_net_send_all(fd, data, (n < 0) ? 0 : (size_t)n);
 }
 
 /* Write what the socket will take right now and answer how much that was,
@@ -997,16 +1074,43 @@ int sp_net_pack_sockaddr_un(const char *path, void *out, int cap) {
 
 /* Read a packed sockaddr back: the port is the return, the numeric address
  * goes into `ipbuf`. -1 when the buffer is not a sockaddr this understands. */
+/* The path a packed AF_UNIX sockaddr names, into pathbuf: its length, -1
+   when the bytes are not an AF_UNIX sockaddr, -2 when they are longer than a
+   struct sockaddr_un. Only trailing NULs are dropped, so an abstract name
+   ("\0name") keeps its leading NUL. */
+int sp_net_unpack_sockaddr_un(const void *sa, int salen, char *pathbuf, int cap) {
+    int off = (int)offsetof(struct sockaddr_un, sun_path);
+    if (!sa || salen < off || !pathbuf || cap <= 0) return -1;
+    /* the family read out of the bytes, which are a String's and need not
+       be aligned for the struct (as in sp_net_unpack_sockaddr_in) */
+    sa_family_t fam;
+    memcpy(&fam, (const char *)sa + offsetof(struct sockaddr, sa_family), sizeof fam);
+    if (fam != AF_UNIX) return -1;
+    if (salen > (int)sizeof(struct sockaddr_un)) return -2;
+    const char *p = (const char *)sa + off;
+    int n = salen - off;
+    while (n > 0 && p[n - 1] == 0) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(pathbuf, p, (size_t)n);
+    pathbuf[n] = 0;
+    return n;
+}
+
 int sp_net_unpack_sockaddr_in(const void *sa, int salen, char *ipbuf, int cap) {
     if (!sa || salen < (int)sizeof(struct sockaddr) || !ipbuf || cap <= 0) return -1;
-    const struct sockaddr *s = (const struct sockaddr *)sa;
+    /* The bytes are a String's, at no particular alignment: read as the
+       structs only once copied into storage aligned for them. */
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    memcpy(&ss, sa, salen < (int)sizeof ss ? (size_t)salen : sizeof ss);
+    const struct sockaddr *s = (const struct sockaddr *)&ss;
     if (s->sa_family == AF_INET && salen >= (int)sizeof(struct sockaddr_in)) {
-        const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)&ss;
         if (!inet_ntop(AF_INET, &v4->sin_addr, ipbuf, (socklen_t)cap)) return -1;
         return (int)ntohs(v4->sin_port);
     }
     if (s->sa_family == AF_INET6 && salen >= (int)sizeof(struct sockaddr_in6)) {
-        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)&ss;
         if (!inet_ntop(AF_INET6, &v6->sin6_addr, ipbuf, (socklen_t)cap)) return -1;
         return (int)ntohs(v6->sin6_port);
     }

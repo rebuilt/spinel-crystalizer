@@ -8,6 +8,13 @@
 -include $(dir $(lastword $(MAKEFILE_LIST)))local.mk
 
 CC       ?= cc
+# A native Windows build (MinGW-w64 gcc, as MSYS2 and RubyInstaller ship it),
+# or a cross-build for Windows from another host (CC=x86_64-w64-mingw32-gcc:
+# the compile-only check), sets its toolchain and the lib/win32 shim up in
+# win32.mk; elsewhere every PLATFORM_ variable is empty.
+ifneq ($(filter Windows_NT,$(OS))$(findstring -w64-mingw32-,$(CC)),)
+include $(dir $(lastword $(MAKEFILE_LIST)))win32.mk
+endif
 # Auto-wrap CC with sccache or ccache when present. Skip when CC is
 # already wrapped -- the substring guard catches both "ccache" and
 # "sccache" since "ccache" is a substring of "sccache", so CI's
@@ -40,6 +47,10 @@ OPT     ?= $(COPT)
 ifeq ($(shell uname -s),Linux)
 LDFLAGS += -lcrypt
 endif
+# backtrace(3), which the runtime archive calls, is libexecinfo's on OpenBSD
+ifeq ($(shell uname -s),OpenBSD)
+LDFLAGS += -lexecinfo
+endif
 # A Float `a * b - c` is two IEEE operations in Ruby, each rounded to
 # double; clang (-ffp-contract=on) and gcc (=fast) fuse the pair written in
 # one C expression into a single fused multiply-add that rounds once, and
@@ -48,13 +59,13 @@ endif
 # runtime objects, the packages, bench) -- src/main.c says the same on the
 # generated program's own command line.
 FP_FLAGS = -ffp-contract=off
-CFLAGS   = $(OPT) -Wno-all -Wno-unknown-warning-option -Wno-alloc-size-larger-than -Wno-format-truncation $(FP_FLAGS)
+CFLAGS   = $(OPT) -Wno-all -Wno-unknown-warning-option -Wno-alloc-size-larger-than -Wno-format-truncation $(FP_FLAGS) $(PLATFORM_FLAGS)
 
 # The product build -- bin/spinel, libspinel_rt.a, and the generated
 # programs -- uses CFLAGS and never used LTO, so there is no LTO toggle.
 
 # Per-function sections let the linker strip unused bigint/regexp code.
-SEC_FLAGS = -ffunction-sections -fdata-sections $(FP_FLAGS)
+SEC_FLAGS = -ffunction-sections -fdata-sections $(FP_FLAGS) $(PLATFORM_FLAGS)
 # The target's word width, asked of the C compiler: 32 or 64. A 32-bit
 # target (`make CC='cc -m32'` on a 64-bit host, or a 32-bit host) gets a
 # 32-bit sp_int (lib/sp_types.h) and two things a Ruby needs there: 64-bit
@@ -79,7 +90,9 @@ endif
 # Wrapper around the system `timeout` that always returns GNU coreutils'
 # exit code (124 on timeout), regardless of which `timeout` is on PATH.
 # The bench target keys on 124 to mark a run as SKIP; busybox uses 143
-# and BSDs use 399, which would be misclassified. Built once from C.
+# and BSDs use 399, which would be misclassified. Built once from C. The
+# seconds it takes are CPU seconds of the command, with a backstop on the clock
+# of six times as many (scripts/spinel-timeout.c).
 # It is a build ARTEFACT, so it belongs under build/ with the rest of them --
 # not beside its source in scripts/, where it would need its own ignore rule
 # and would survive `make clean`.

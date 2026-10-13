@@ -235,6 +235,22 @@ mpz_init_set(mpz_ctx_t *ctx, mpz_t *s, mpz_t *t)
 }
 
 static void
+mpz_set_uint64(mpz_ctx_t *ctx, mpz_t *y, uint64_t u)
+{
+  size_t len = 0;
+
+  for (uint64_t u0=u; u0; u0>>=DIG_SIZE,len++)
+    ;
+  y->sn = (u != 0);
+  mpz_realloc(ctx, y, len);
+  y->sz = len;
+  for (size_t i=0; i<len; i++) {
+    y->p[i] = (mp_limb)LOW(u);
+    u >>= DIG_SIZE;
+  }
+}
+
+static void
 mpz_set_int(mpz_ctx_t *ctx, mpz_t *y, mrb_int v)
 {
   mrb_uint u;
@@ -255,33 +271,17 @@ mpz_set_int(mpz_ctx_t *ctx, mpz_t *y, mrb_int v)
   }
 #if MRB_INT_BIT > DIG_SIZE
   if ((u & ~DIG_MASK) != 0) {
-    mpz_realloc(ctx, y, 2);
-    y->p[1] = (mp_limb)HIGH(u);
-    y->p[0] = (mp_limb)LOW(u);
-    y->sz = 2;
+    /* An mrb_int can be wider than two limbs; mpz_set_uint64() counts them.
+       It derives the sign from the magnitude, so keep the one v gave. */
+    short sn = y->sn;
+    mpz_set_uint64(ctx, y, u);
+    y->sn = sn;
     return;
   }
 #endif
   mpz_realloc(ctx, y, 1);
   y->p[0] = (mp_limb)u;
   y->sz = 1;
-}
-
-
-static void
-mpz_set_uint64(mpz_ctx_t *ctx, mpz_t *y, uint64_t u)
-{
-  size_t len = 0;
-
-  for (uint64_t u0=u; u0; u0>>=DIG_SIZE,len++)
-    ;
-  y->sn = (u != 0);
-  mpz_realloc(ctx, y, len);
-  y->sz = len;
-  for (size_t i=0; i<len; i++) {
-    y->p[i] = (mp_limb)LOW(u);
-    u >>= DIG_SIZE;
-  }
 }
 
 #ifdef MRB_INT32
@@ -598,7 +598,11 @@ mpz_add_int(mpz_ctx_t *ctx, mpz_t *x, mrb_int n)
   if (carry != 0) {
     mpz_realloc(ctx, x, x->sz + 1);
     x->p[x->sz-1] = (mp_limb)carry;
-    x->sn = 1;
+    /* the magnitude grew; keep the sign the caller set (the routine "ignores
+       sign of x"). Forcing it positive here turned a magnitude-growing step on
+       a negative value positive, so mrb_bint_sub_n()/add_n() gave the wrong
+       sign whenever the carry crossed a limb, e.g. -(2**64-1) - 1. */
+    if (x->sn == 0) x->sn = 1;
   }
   trim(x);
 }
@@ -3084,10 +3088,10 @@ mpz_mod(mpz_ctx_t *ctx, mpz_t *r, mpz_t *x, mpz_t *y)
     return;
   }
 
-  /* Fast path for single-limb modulus */
+  /* Fast path for single-limb modulus; the remainder takes the sign of x,
+     as in the other paths, whatever the sign of y */
   if (y->sz == 1) {
     mpz_mod_limb(ctx, r, x, y->p[0]);
-    if (y->sn < 0) r->sn = -r->sn;
     return;
   }
 
@@ -3096,11 +3100,16 @@ mpz_mod(mpz_ctx_t *ctx, mpz_t *r, mpz_t *x, mpz_t *y)
    * violate it and the algorithm silently truncates high limbs. Fall through
    * to general division for those. */
   if (y->sz >= 4 && y->sz <= 16 && x->sz >= y->sz + 2 && x->sz <= 2 * y->sz) {
+    /* Barrett reads its operands as signed, so it is handed their
+       magnitudes, as the division below is: given a negative x it found
+       x < m and answered x unreduced. The sign goes on afterwards. */
+    mpz_t ax = *x, ay = *y;
     mpz_t mu;
+    ax.sn = ay.sn = 1;
     mpz_init_temp(ctx, &mu, y->sz + 1);
-    mpz_barrett_mu(ctx, &mu, y);
+    mpz_barrett_mu(ctx, &mu, &ay);
     mpz_realloc(ctx, r, y->sz);
-    mpz_barrett_reduce(ctx, r, x, y, &mu);
+    mpz_barrett_reduce(ctx, r, &ax, &ay, &mu);
     r->sn = sn;
     if (uzero_p(r))
       r->sn = 0;
@@ -4033,6 +4042,10 @@ mpz_get_int(mpz_t *y, mrb_int *v)
     return TRUE;
   }
 
+  /* The negative range is one wider than the positive one, so MRB_INT_MIN
+     fits as an absolute value of MRB_INT_MAX + 1. */
+  mrb_uint limit = (mrb_uint)MRB_INT_MAX + (y->sn < 0 ? 1 : 0);
+
 #ifdef MRB_NO_MPZ64BIT
   /* When using 16-bit limbs, we need to handle larger accumulation */
   mrb_uint i = 0;
@@ -4040,13 +4053,13 @@ mpz_get_int(mpz_t *y, mrb_int *v)
 
   while (d-- > y->p) {
     /* Check for overflow before shifting */
-    if (i > (mrb_uint)(MRB_INT_MAX >> DIG_SIZE)) {
+    if (i > (limit >> DIG_SIZE)) {
       return FALSE;
     }
     i = (i << DIG_SIZE) | *d;
   }
 
-  if (i > (mrb_uint)MRB_INT_MAX) {
+  if (i > limit) {
     return FALSE;
   }
 #else
@@ -4061,14 +4074,16 @@ mpz_get_int(mpz_t *y, mrb_int *v)
     }
     i = (i << DIG_SIZE) | *d;
   }
-  if (i > MRB_INT_MAX) {
+  if (i > limit) {
     /* overflow */
     return FALSE;
   }
 #endif
 
   if (y->sn < 0) {
-    *v = -(mrb_int)i;
+    /* On this branch `limit` is the absolute value of MRB_INT_MIN, which has
+       no positive counterpart to negate, so it is spelled out instead. */
+    *v = (i == limit) ? MRB_INT_MIN : -(mrb_int)i;
   }
   else {
     *v = (mrb_int)i;
@@ -4696,14 +4711,16 @@ limb_gcd(mp_limb a, mp_limb b)
       b >>= 1;
     }
 
-    /* Now both a and b are odd. Ensure a >= b */
-    if (a < b) {
+    /* Now both a and b are odd. Ensure a <= b, since a limb is unsigned and
+       the subtraction below has to stay one: with a the larger, b - a borrows
+       past zero and the loop never reaches it. */
+    if (a > b) {
       mp_limb temp = a;
       a = b;
       b = temp;
     }
 
-    /* Replace b with (b - a) */
+    /* Replace b with (b - a), which is even and smaller than b was */
     b = b - a;
 
   } while (b != 0);
@@ -5387,9 +5404,26 @@ sp_Bigint *sp_bigint_remainder(sp_Bigint *a, sp_Bigint *b) {
 sp_Bigint *sp_bigint_powmod(sp_Bigint *base, intptr_t exp, sp_Bigint *mod) {
   if (exp < 0) sp_raise_cls("RangeError", "Integer#pow() 1st argument cannot be negative when 2nd argument specified");
   if (zero_p(&mod->mpz)) sp_bigint_raise_zerodiv("divided by 0");
+  /* As mruby's mrb_bint_powm (1ee6d4619): reduce by |m|, with the base
+     first taken into [0, |m|) (the reductions expect it; a negative base gave
+     a negative or unreduced result), and a negative modulus moves a nonzero
+     result down by |m|, into (m, 0] as Ruby's modulo does. */
+  mpz_t c, b;
+  mpz_init(sp_mpz_ctx, &c);
+  mpz_set(sp_mpz_ctx, &c, &mod->mpz);
+  int neg_mod = c.sn < 0;
+  if (neg_mod) c.sn = 1;
+  mpz_init(sp_mpz_ctx, &b);
+  mpz_mod(sp_mpz_ctx, &b, &base->mpz, &c);
+  if (b.sn < 0 && !uzero_p(&b)) mpz_add(sp_mpz_ctx, &b, &b, &c);
   sp_Bigint *r = sp_bigint_alloc();
   mpz_init(sp_mpz_ctx, &r->mpz);
-  mpz_powm_i(sp_mpz_ctx, &r->mpz, &base->mpz, exp, &mod->mpz);
+  if (!((zero_p(&b) || uzero_p(&b)) && exp > 0))
+    mpz_powm_i(sp_mpz_ctx, &r->mpz, &b, exp, &c);
+  if (neg_mod && !zero_p(&r->mpz) && !uzero_p(&r->mpz))
+    mpz_sub(sp_mpz_ctx, &r->mpz, &r->mpz, &c);
+  mpz_clear(sp_mpz_ctx, &b);
+  mpz_clear(sp_mpz_ctx, &c);
   return r;
 }
 
@@ -5661,6 +5695,26 @@ const char *sp_bigint_to_s(sp_Bigint *b) {
   return result;
 }
 
+/* Integer#size of a value held as a Bignum: CRuby answers sizeof(long) for
+   a Fixnum and the byte count of a Bignum's MAGNITUDE (BIGSIZE), which is
+   never less. So it is the magnitude's bytes, at least an sp_int's
+   (intptr_t, lib/sp_types.h): a small value a Bignum slot holds (2**70 -
+   (2**70 - 7)) is 8, and -(2**64) is 9, where the two's-complement
+   bit_length (64) would make it 8. */
+intptr_t sp_bigint_int_size(sp_Bigint *b) {
+  intptr_t bytes = 0;
+  if (b) {
+    sp_bigint_init_ctx();
+    mpz_t *z = &b->mpz;
+    size_t n = z->sn == 0 ? 0 : digits(z);
+    if (n > 0) {
+      int topbits = 0;
+      for (mp_limb t = z->p[n - 1]; t; t >>= 1) topbits++;
+      bytes = (intptr_t)(((mrb_int)(n - 1) * (mrb_int)DIG_SIZE + topbits + 7) / 8);
+    }
+  }
+  return bytes < (intptr_t)sizeof(intptr_t) ? (intptr_t)sizeof(intptr_t) : bytes;
+}
 /* Integer#bit_length: the number of bits in the two's-complement representation
    excluding the sign bit -- i.e. the magnitude's bit count for a non-negative
    value, and (|self| - 1)'s bit count for a negative one (a magnitude that is an
@@ -5692,21 +5746,24 @@ intptr_t sp_bigint_bit_length(sp_Bigint *b) {
 
 /* --- Bignum receiver conveniences (#2025) ------------------------------- */
 
-/* to_s(base): mpz_get_str renders any base in [2, 36]. Owner-frees contract
-   matches sp_bigint_to_s. */
+/* to_s(base): mpz_get_str renders any base in [2, 36]. A STRING-HEAP
+   string, as sp_bigint_to_s answers and for the same reason: the poly
+   to_s(base) hands it to Ruby as it is, and a bare malloc'd buffer has no
+   marker byte, so its length was read from the byte before the chunk. */
 const char *sp_bigint_to_s_base(sp_Bigint *b, intptr_t base) {
   if (base < 2 || base > 36) {
     sp_raise_cls("ArgumentError", sp_sprintf("invalid radix %lld", (long long)base));
     return NULL;
   }
-  if (!b) { char *z0 = (char*)malloc(2); z0[0] = '0'; z0[1] = 0; return z0; }
+  if (!b) { char *z0 = sp_str_alloc_ext(1); z0[0] = '0'; return z0; }
   mpz_t *z = &b->mpz;
   size_t est = mpz_sizeinbase(z, 2) + 3;  /* base-2 digit count bounds every base */
   char *buf = (char*)malloc(est);
+  if (!buf) sp_oom_die();
   mpz_get_str(sp_mpz_ctx, buf, (mrb_int)est, base, z);
   size_t len = strlen(buf);
-  char *result = (char*)malloc(len + 1);
-  memcpy(result, buf, len + 1);
+  char *result = sp_str_alloc_ext(len);
+  memcpy(result, buf, len);
   free(buf);
   return result;
 }

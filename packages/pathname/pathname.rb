@@ -13,9 +13,8 @@
 # This covers the surface a program actually reaches for rather than every
 # CRuby corner. Not modelled: the Find/FileUtils-backed corners (#find is here
 # but #each_entry, #chown, #lchmod are not), #opendir, #sysopen, #make_link /
-# #make_symlink, #birthtime, and the mixed-in Kernel#Pathname() constructor,
-# which cannot be spelled in Spinel yet (a toplevel method named after a class
-# collides with the class's own symbol) -- use Pathname.new.
+# #make_symlink and #birthtime. Kernel#Pathname() is the toplevel method at
+# the end of this file, spelled the way BigDecimal() and URI() are.
 
 class Pathname
   include Comparable
@@ -98,7 +97,8 @@ class Pathname
     return Pathname.new(o) if @path == ""
     return self if o == "" || o == "."
 
-    Pathname.new(Pathname.clean_str("#{@path}#{SEPARATOR}#{o}"))
+    joined = Pathname.clean_str("#{@path}#{SEPARATOR}#{o}")
+    Pathname.new(Pathname.dir_form?(o, joined) ? "#{joined}#{SEPARATOR}" : joined)
   end
 
   def /(other)
@@ -203,9 +203,15 @@ class Pathname
     raise ArgumentError, "different prefix" if absolute? != b.start_with?(SEPARATOR)
 
     mine = Pathname.split_str(Pathname.clean_str(@path))
-    theirs = Pathname.split_str(Pathname.clean_str(b))
+    cleaned_base = Pathname.clean_str(b)
+    theirs = Pathname.split_str(cleaned_base)
     i = 0
     i += 1 while i < mine.length && i < theirs.length && mine[i] == theirs[i]
+    j = i
+    while j < theirs.length
+      raise ArgumentError, "base_directory has ..: #{cleaned_base.inspect}" if theirs[j] == ".."
+      j += 1
+    end
     out = []
     (theirs.length - i).times { out.push("..") }
     j = i
@@ -458,6 +464,18 @@ class Pathname
   # ---- string helpers, shared by the pure-path methods ----
 
   # The name components of a path, with separators, "" and "." removed.
+  # Does `self + o` keep o's trailing slash? CRuby keeps it when o still
+  # names something after its leading "." and ".." are resolved against the
+  # receiver (`a + "b/"` is `a/b/`, `a/b + "../../../"` is `../`), and drops
+  # it when they consume all of o (`a + "./"` is `a`, `a + "../"` is `.`).
+  def self.dir_form?(o, joined)
+    return false unless o.end_with?(SEPARATOR) && joined != SEPARATOR
+    last = ""
+    o.split(SEPARATOR).each { |part| last = part unless part == "" }
+    return true unless last == "." || last == ".."
+    joined == ".." || joined.end_with?("#{SEPARATOR}..")
+  end
+
   def self.split_str(path)
     out = []
     path.split(SEPARATOR).each do |part|
@@ -491,4 +509,11 @@ class Pathname
 
     body == "" ? "." : body
   end
+end
+
+# Kernel#Pathname(path): the conversion function CRuby mixes into Kernel.
+# A Pathname comes back as itself; anything else goes through Pathname.new.
+def Pathname(path)
+  return path if path.is_a?(Pathname)
+  Pathname.new(path)
 end

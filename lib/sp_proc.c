@@ -1,5 +1,6 @@
 /* sp_proc.c -- cold sp_Proc/sp_Curry ops (see sp_proc.h). 0 optcarrot uses. */
 #include "sp_proc.h"
+#include "sp_exc.h"   /* sp_arity_check */
 
 void sp_Proc_scan(void *p) { sp_Proc *pr = (sp_Proc *)p; if (pr->cap && pr->cap_scan) pr->cap_scan(pr->cap); }
 sp_Proc *sp_proc_new_meta(void *fn, void *cap, void (*cap_scan)(void *), sp_int arity, sp_bool lambda_p, sp_int param_count, const sp_sym *param_kinds, const sp_sym *param_names) { sp_Proc *p = (sp_Proc *)sp_gc_alloc(sizeof(sp_Proc), NULL, sp_Proc_scan); p->fn = fn; p->cap = cap; p->cap_scan = cap_scan; p->arity = arity; p->lambda_p = lambda_p; p->param_count = param_count; p->param_kinds = param_kinds; p->param_names = param_names; return p; }
@@ -25,22 +26,6 @@ const char *sp_proc_inspect(sp_Proc *p) {SP_GC_ROOT(p);
   if (!p) return SPL("nil");
   return sp_sprintf(p->lambda_p ? "#<Proc:0x%016llx (lambda)>" : "#<Proc:0x%016llx>",
                     (unsigned long long)(uintptr_t)p);
-}
-/* Lambda strict-arity check: raise ArgumentError if argc is outside
-   [req, req+opt] (no upper bound with a rest param). Procs are lenient. */
-void sp_proc_lambda_arity_check(sp_int argc, sp_int req, sp_int opt, sp_bool has_rest, sp_bool has_kw) {
-  /* has_kw: the trailing argument is the keyword hash, which is not counted
-     against the positional arity. */
-  sp_int given = argc - (has_kw ? 1 : 0);
-  if (given >= req && (has_rest || given <= req + opt)) return;
-  if (has_rest)
-    sp_raise_cls("ArgumentError", sp_sprintf("wrong number of arguments (given %lld, expected %lld+)",
-                                             (long long)given, (long long)req));
-  if (opt > 0)
-    sp_raise_cls("ArgumentError", sp_sprintf("wrong number of arguments (given %lld, expected %lld..%lld)",
-                                             (long long)given, (long long)req, (long long)(req + opt)));
-  sp_raise_cls("ArgumentError", sp_sprintf("wrong number of arguments (given %lld, expected %lld)",
-                                           (long long)given, (long long)req));
 }
 /* Proc#parameters with an explicit mode. Kinds are stored canonically
    (lambda-style: a plain positional is "req"); printing for proc mode remaps
@@ -80,8 +65,6 @@ sp_Curry *sp_curry_new(sp_Proc *p) {
    (an optional widens it, a rest lifts it), so the call site passes it in --
    max < 0 means unlimited-or-unknown, and the message then says "min+". */
 sp_Curry *sp_curry_new_n(sp_Proc *p, sp_int n, sp_int max) {
-  /* an int-typed slot's nil sentinel is CRuby's nil count: no count at all */
-  if (n == SP_INT_NIL) return sp_curry_new(p);
   if (p && p->lambda_p) {
     sp_int min = p->arity < 0 ? -p->arity - 1 : p->arity;
     sp_int mx = max >= 0 ? max : (p->arity >= 0 ? p->arity : -1);
@@ -89,18 +72,7 @@ sp_Curry *sp_curry_new_n(sp_Proc *p, sp_int n, sp_int max) {
        is the target's own truth. A guess below it names a different write of
        the same name -- trust the target, drop the guess. */
     if (mx >= 0 && mx < min) mx = -1;
-    if (n < min || (mx >= 0 && n > mx)) {
-      const char *want = mx < 0 ? sp_sprintf("%lld+", (long long)min)
-                       : mx == min ? sp_sprintf("%lld", (long long)min)
-                       : sp_sprintf("%lld..%lld", (long long)min, (long long)mx);
-      /* both strings live on the collected heap; the second sp_sprintf and
-         the raise path itself allocate, so root them across those */
-      SP_GC_ROOT_STR(want);
-      const char *msg = sp_sprintf("wrong number of arguments (given %lld, expected %s)",
-                                   (long long)n, want);
-      SP_GC_ROOT_STR(msg);
-      sp_raise_cls("ArgumentError", msg);
-    }
+    sp_arity_check(n, min, mx, NULL);
   }
   sp_Curry *c = sp_curry_new(p);
   c->arity = n < 0 ? 0 : n;
@@ -159,8 +131,9 @@ sp_int sp_method_proc_tramp(void *cap, sp_int argc, sp_int *args) {
      decline (#4542). A count outside its range is CRuby's ArgumentError,
      raised by the thunk in CRuby's words. The generated call arms try their
      stamped casts first and reach this trampoline only when those decline,
-     so the thunk is the general lane, not the hot one. */
-  if (m->thunk && !m->unbound && argc <= SP_PROC_ARG_SLOTS)
+     so the thunk is the general lane, not the hot one. It reads an argument
+     past the channel's slots from the call's wide store. */
+  if (m->thunk && !m->unbound)
     return ((sp_int (*)(void *, sp_int, sp_int *))(uintptr_t)m->thunk)(cap, argc, args);
   /* A poly-ABI target (every slot an sp_RbVal; stamped at bind time) takes
      the boxed side-channel values directly -- the same values the scalar
@@ -421,6 +394,7 @@ sp_int sp_method_proc_tramp(void *cap, sp_int argc, sp_int *args) {
   #undef SP_BM_TRAMP_RET
 }
 sp_Proc *sp_method_to_proc(sp_BoundMethod *m) {
+  SP_GC_ROOT(m);   /* `&method(:m)` hands over a Method nothing else holds */
   return sp_proc_new_meta((void *)sp_method_proc_tramp, m, sp_bm_cap_scan, 1, TRUE, 0, NULL, NULL);
 }
 /* Bound Method object: `obj.method(:foo)` / `method(:foo)`. `self` is the

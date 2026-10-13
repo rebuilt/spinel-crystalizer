@@ -1,3 +1,4 @@
+# spinel: share
 # CRuby's implicit conversion protocol at the builtin slots that take a path,
 # a mode, an offset, or a write payload: a user object converts through
 # #to_path / #to_str / #to_int / #to_s where the slot asks for it, instead of
@@ -5,7 +6,11 @@
 require "pathname"
 require "stringio"
 
-dir = "/tmp/spinel_implicit_conversion_protocol"
+# a nil perm below creates a file with the default mode, 0666 less the umask:
+# fix the umask, so the expected mode does not depend on who runs the test
+File.umask(022)
+
+dir = "/tmp/spinel_implicit_conversion_protocol_#{Process.pid}"
 if Dir.exist?(dir)
   Dir.children(dir).each { |e| File.delete("#{dir}/#{e}") }
   Dir.rmdir(dir)

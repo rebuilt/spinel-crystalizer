@@ -1,0 +1,13 @@
+# Tests the corpus does not run under --int-overflow=wrap (#8331).
+#
+# By design: they pin raise mode's overflow answers, which wrap gives as
+# wrapped values.
+test/bounded_counter_unchecked_add.rb
+test/int_overflow_op_assign.rb
+test/int_overflow_raises.rb
+test/poly_int_overflow_raises.rb
+#
+# Gaps found when the lane began, at bcce09575: arithmetic on a nil
+# Integer wraps its sentinel instead of raising NoMethodError, and a
+# SystemStackError is not raised. A gap leaves this list with its fix.
+test/stack_overflow_unhandled.rb

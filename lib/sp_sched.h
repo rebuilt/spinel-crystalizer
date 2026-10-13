@@ -35,9 +35,12 @@ typedef struct sp_sched_timer sp_sched_timer;
 
 typedef struct sp_thread {
   sp_Fiber         *fiber;       /* the green thread's coroutine; NULL for the main thread (root) */
+  sp_Fiber         *at;          /* the Fiber it resumed and stopped inside, or NULL when it
+                                    stopped in its own: run_thread_once switches back there */
   sp_RbVal          arg;         /* Thread.new(arg) -> the block's first param, on first run */
   sp_RbVal          retval;      /* block result (copied from fiber->yielded_value at death) */
   sp_RbVal          name;        /* #name / #name= (a string or nil) */
+  int               priority;    /* #priority: -3..3, a hint as in CRuby; inherited at spawn */
   const char       *birth_file;  /* creation site for #inspect (#3126); rodata */
   sp_int           birth_line;
   sp_thread_state   state;
@@ -76,6 +79,7 @@ typedef struct sp_thread {
   void             *tls;         /* thread-local storage (Thread#[] / #[]=); lazily allocated */
   sp_sched_timer   *timer;       /* active scheduler timer for this wait, if any */
   unsigned char     timer_expired; /* set when a generic timed wait reaches its deadline */
+  unsigned char     woken;         /* Thread#wakeup ended its sleep early */
   int               io_fd;       /* fd this thread is parked on for I/O (-1 = none, scheduler-aware I/O) */
   short             io_events;   /* poll events it is waiting for (POLLIN/POLLOUT) */
   short             io_revents;  /* poll result the monitor delivered when the fd became ready */
@@ -101,13 +105,20 @@ sp_RbVal   sp_Thread_value(sp_thread *t);
 sp_thread *sp_Thread_kill(sp_thread *t);  /* #kill / #exit / #terminate */
 sp_thread *sp_Thread_raise(sp_thread *t, const char *cls, const char *msg, void *obj);  /* #raise */
 void       sp_Thread_pass(void);          /* Thread.pass: cooperative yield */
+void       sp_Thread_stop(void);          /* Thread.stop: sleep until #wakeup */
+sp_thread *sp_Thread_wakeup(sp_thread *t);  /* #wakeup */
+sp_thread *sp_Thread_run(sp_thread *t);     /* #run: #wakeup, then pass */
+sp_bool    sp_Thread_stop_p(sp_thread *t);  /* #stop?: dead or asleep */
+void       sp_sched_sleep_forever(void);  /* a bare Kernel#sleep */
 /* Kernel#sleep(seconds): park the calling thread and free its OS worker for other
    green threads; a monitor thread wakes it after the duration. Falls back to a
    plain blocking sleep only in the single-threaded build (spinel_rt.h). */
 void       sp_sched_sleep(double seconds);
 int        sp_sched_other_threads_live(void);
+int        sp_sched_threads_started(void);   /* the worker pool is up: Process.daemon refuses to fork */
 int        sp_sched_wait_child(int pid, int *status);
 void       sp_sleep(sp_float s);   /* Kernel#sleep; relocated from spinel_rt.h to lib/sp_cold.c */
+void       sp_sleep_forever(void);  /* a bare Kernel#sleep, until Thread#wakeup */
 /* Scheduler-aware blocking I/O: park the calling green thread until `fd` is ready
    for `events` (POLLIN/POLLOUT), freeing its OS worker for other threads; the
    monitor polls the fd and wakes it. Returns 1 to retry the syscall (fd ready or
@@ -153,6 +164,8 @@ sp_int    sp_Thread_list_count(void);     /* Thread.list (built by the TU) */
 sp_thread *sp_Thread_list_at(sp_int i);
 sp_RbVal   sp_Thread_get_name(sp_thread *t);                       /* #name */
 sp_RbVal   sp_Thread_set_name(sp_thread *t, sp_RbVal v);           /* #name= */
+sp_int     sp_Thread_get_priority(sp_thread *t);                   /* #priority */
+void       sp_Thread_set_priority(sp_thread *t, sp_int p);         /* #priority= */
 sp_RbVal   sp_Thread_status(sp_thread *t); /* #status: "run"/"sleep"/false/nil */
 const char *sp_Thread_inspect(sp_thread *t); /* #inspect / #to_s */
 sp_RbVal   sp_Thread_tls_get(sp_thread *t, sp_sym k);              /* Thread#[] */
@@ -264,6 +277,7 @@ const char *sp_Mutex_class_name(sp_mutex *m); /* "Monitor" or "Thread::Mutex" */
 const char *sp_Queue_class_name(sp_queue *q);  /* "Thread::SizedQueue" or "Thread::Queue" */
 void       sp_Mutex_lock(sp_mutex *m);
 void       sp_Mutex_unlock(sp_mutex *m);
+sp_RbVal   sp_Mutex_sleep(sp_mutex *m, int has_timeout, double timeout);  /* #sleep / #sleep(t) */
 sp_bool   sp_Mutex_try_lock(sp_mutex *m);   /* #try_lock: true if acquired */
 sp_bool   sp_Mutex_locked(sp_mutex *m);     /* #locked? */
 sp_bool   sp_Mutex_owned(sp_mutex *m);      /* #owned? */

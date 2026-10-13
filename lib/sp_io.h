@@ -13,11 +13,25 @@
 #include "sp_types.h"   /* sp_int, sp_bool */
 #include "sp_array.h"   /* sp_IntArray (for #winsize) */
 
+/* File.fnmatch's flags: CRuby's File::FNM_* values, which codegen emits by
+   these names and sp_file_fnmatch (lib/sp_cold.c) reads */
+#define SP_FNM_NOESCAPE 1
+#define SP_FNM_PATHNAME 2
+#define SP_FNM_DOTMATCH 4
+#define SP_FNM_CASEFOLD 8
+#define SP_FNM_EXTGLOB  16
+
 typedef struct {
   FILE *fp; const char *path; const char *mode; sp_int lineno;
   unsigned char bin_flag;      /* #binmode was called (#3131) */
+  unsigned char ext_enc;       /* #set_encoding chose the encoding a read with
+                                  no length answers: 1 UTF-8, 2 ASCII-8BIT;
+                                  0, the handle's binmode decides */
   unsigned char no_autoclose;  /* #autoclose = false (#3131) */
   unsigned char is_sock;       /* a socket handle: writes bypass stdio (#2922) */
+  unsigned char rev_lookup;    /* a socket's #do_not_reverse_lookup is false:
+                                  addr / peeraddr report the host name. Taken
+                                  from the class setting when it is made */
   unsigned char sync_on;       /* #sync is true for this handle: a write reaches
                                   the descriptor at once. A socket is always
                                   sync (its writes bypass stdio); IO.pipe's
@@ -77,7 +91,7 @@ int sp_io_make_pipe(int fds[2]);
 /* IO.pipe end: wrap a raw pipe fd in a GC-managed sp_File. */
 sp_File *sp_io_fdopen(int fd, const char *mode);
 sp_File *sp_io_fdopen_ex(int fd, const char *mode, int owns_fd);
-sp_File *sp_File_open_perm(const char *path, const char *mode, sp_int perm);
+sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm);   /* a nil perm is CRuby's default, 0666 */
 /* Wrap a connected/listening socket fd. Reads stay on the buffered FILE* so
    #gets and friends work; writes bypass stdio straight to write(2), matching
    CRuby sockets' sync = true. `kind` labels the handle ("tcp", "tcpserver",
@@ -128,18 +142,29 @@ const char *sp_io_kind_name(sp_File *f);
 sp_File *sp_sock_accept(sp_File *f);
 sp_File *sp_sock_accept_nb(sp_File *f, sp_bool exc);
 const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv, sp_bool *eof);
-sp_int sp_sock_write_nb(sp_File *f, const char *data, sp_bool exc);
-sp_int sp_sock_write_nb_bin(sp_File *f, const char *data, sp_bool exc);
-sp_int sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc);
+/* the byte count, or nil when the call would block (exception: false) */
+sp_oint sp_sock_write_nb(sp_File *f, const char *data, sp_bool exc);
+sp_oint sp_sock_write_nb_bin(sp_File *f, const char *data, sp_bool exc);
+sp_oint sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc);
 /* Addrinfo-form connect_nonblock (already-resolved endpoint) */
-sp_int sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen,
+sp_oint sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen,
                                  sp_bool exc);
 sp_bool sp_io_is_a(sp_File *f, const char *cls);
+/* Of the reopened IO classes names[] (NULL-ended), the one nearest the
+   handle's kind up its class chain: its idx[] entry, or 0x7fffffff. */
+int sp_io_pick_class(sp_File *f, const char *const *names, const int *idx);
 sp_bool sp_io_instance_of(sp_File *f, const char *cls);
 sp_File *sp_sock_udp_new(sp_int family);
 const char *sp_sock_gethostname(void);
-sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port);
+sp_int sp_sock_addrinfo_hint(sp_RbVal v, sp_int is_family);
+sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port, sp_int family, sp_int socktype);
 sp_Addrinfo *sp_sock_address(sp_File *f, sp_int peer);
+const char *sp_sock_getname(sp_File *f, sp_int peer);
+/* BasicSocket.do_not_reverse_lookup (shared by every socket class) and the
+   per-socket flag a new socket takes from it */
+extern sp_bool sp_sock_dnrl_default;
+sp_bool sp_sock_dnrl(sp_File *f);
+void sp_sock_set_dnrl(sp_File *f, sp_bool on);
 /* Packed sockaddr strings: what Socket.sockaddr_in / Socket.pack_sockaddr_in,
    Socket.pack_sockaddr_un and Addrinfo#to_sockaddr answer, and what the 1-arg
    connect_nonblock takes. Byte strings -- they carry NUL. */
@@ -147,7 +172,10 @@ const char *sp_sock_pack_sockaddr_in(sp_int port, const char *host);
 const char *sp_sock_pack_sockaddr_un(const char *path);
 const char *sp_addrinfo_to_sockaddr(sp_Addrinfo *a);
 sp_PolyArray *sp_sock_unpack_sockaddr_in(const char *sa);
+const char *sp_sock_unpack_sockaddr_un(const char *sa);
 sp_File *sp_sock_new(sp_int domain, sp_int type, sp_int proto);
+sp_PolyArray *sp_sock_tcp_server_sockets(const char *host, sp_int port);
+sp_File *sp_sock_for_fd(sp_int fd, sp_int kind);
 sp_File *sp_sock_pair_end(sp_int domain, sp_int type, sp_int proto, sp_int which);
 sp_File *sp_sock_unix_server(const char *path);
 sp_File *sp_sock_unix_connect(const char *path);
@@ -158,6 +186,7 @@ sp_int sp_sock_shutdown(sp_File *f, sp_int how);
 sp_int sp_sock_const(const char *n);
 const char *sp_sock_recv(sp_File *f, sp_int len);
 const char *sp_sock_recvfrom(sp_File *f, sp_int len, const char **ip_out, sp_int *port_out);
+sp_int sp_sock_optval(sp_RbVal v);
 sp_int sp_sock_setsockopt(sp_File *f, sp_int level, sp_int opt, sp_int value);
 sp_SockOpt *sp_sock_getsockopt(sp_File *f, sp_int level, sp_int opt);
 sp_int sp_sock_listen(sp_File *f, sp_int backlog);
@@ -171,7 +200,13 @@ sp_int sp_File_readbyte(sp_File *f);
 void sp_File_ungetbyte(sp_File *f, sp_int byte);
 sp_bool sp_File_binmode_p(sp_File *f);
 void sp_File_set_binmode(sp_File *f);
+/* Does a read with no length (and getc) answer ASCII-8BIT? */
+static inline sp_bool sp_File_reads_binary(sp_File *f) {
+  return f->ext_enc ? f->ext_enc == 2 : sp_File_binmode_p(f);
+}
 sp_File *sp_File_reopen_io(sp_File *f, sp_File *other);
+sp_File *sp_File_dup(sp_File *f, int keep_frozen);
+const char *sp_io_fd_mode(int fd);
 sp_bool sp_File_close_on_exec_p(sp_File *f);
 void sp_File_set_close_on_exec(sp_File *f, sp_bool on);
 sp_int sp_File_fcntl(sp_File *f, sp_int cmd, sp_int arg);
@@ -186,6 +221,9 @@ sp_int sp_File_rewind(sp_File *f);     /* #rewind */
 sp_bool sp_File_tty_p(sp_File *f);     /* #tty? / #isatty -- isatty(fileno) */
 sp_int sp_File_fileno(sp_File *f);     /* #fileno */
 sp_IntArray *sp_File_winsize(sp_File *f); /* #winsize -> [rows, cols] (ioctl, or [0,0]) */
+sp_int sp_File_tty_mode(sp_File *f, sp_int kind);   /* IO#raw (1) / IO#noecho (2): set, answer the saved slot */
+sp_int sp_File_tty_restore(sp_File *f, sp_int slot); /* ... and back */
+sp_IntArray *sp_File_set_winsize(sp_File *f, sp_IntArray *size); /* #winsize= [rows, cols(, xpx, ypx)] (ioctl; Errno on a non-tty) */
 
 /* STDOUT / STDERR as shared IO handles wrapping the C stdout/stderr streams.
    The handle is a function-local static (stdout/stderr are not constant
@@ -207,8 +245,8 @@ sp_bool sp_file_sticky(const char *path);
 sp_bool sp_file_socket(const char *path);
 sp_bool sp_file_blockdev(const char *path);
 sp_bool sp_file_chardev(const char *path);
-sp_int sp_file_world_readable(const char *path);
-sp_int sp_file_world_writable(const char *path);
+sp_oint sp_file_world_readable(const char *path);
+sp_oint sp_file_world_writable(const char *path);
 sp_int sp_file_do_symlink(const char *oldp, const char *newp);
 sp_int sp_file_do_link(const char *oldp, const char *newp);
 sp_int sp_file_umask(sp_int mask, int have_arg);

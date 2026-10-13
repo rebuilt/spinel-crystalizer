@@ -45,6 +45,12 @@ sp_Time sp_time_in_zone_s(sp_Time t, const char *z);
 sp_Time sp_time_at_float(double epoch);
 sp_Time sp_time_at_div(int64_t num, int64_t den);
 sp_Time sp_time_parse(const char *s);
+/* require "time"'s strict class parsers */
+sp_Time sp_time_s_httpdate(const char *s);
+sp_Time sp_time_s_rfc2822(const char *s);
+sp_Time sp_time_s_xmlschema(const char *s);
+/* and Time.parse, for the numeric ISO 8601 forms */
+sp_Time sp_time_s_parse(const char *s);
 sp_Time sp_time_new(int64_t y, int64_t mo, int64_t d, int64_t h, int64_t mi, int64_t s);
 int64_t sp_time_month_arg(const char *s);
 sp_Time sp_time_new_utc(int64_t y, int64_t mo, int64_t d, int64_t h, int64_t mi, int64_t s);
@@ -89,8 +95,9 @@ double sp_time_sub_t(sp_Time a, sp_Time b);
 /* Formatters: return a GC-heap string (from sp_alloc.h), "" on failure. */
 const char *sp_time_strftime(sp_Time t, const char *fmt);
 const char *sp_time_iso8601(sp_Time t);
+const char *sp_time_httpdate(sp_Time t);
+const char *sp_time_rfc2822(sp_Time t);
 const char *sp_time_iso8601_frac(sp_Time t, int64_t digits);
-int32_t sp_time_offset_from_str(const char *s);
 sp_Time sp_time_getlocal_off(sp_Time t, int64_t off);
 const char *sp_time_zone(sp_Time t);
 const char *sp_time_inspect_v(sp_Time t);  /* renders fractional seconds */

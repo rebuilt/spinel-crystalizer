@@ -20,6 +20,10 @@
 # answers #to_io, which is why IO.select had to learn that protocol. The
 # handle is an Integer naming a connection in the C table -- no SSL pointer
 # is handed to a garbage-collected world.
+
+# CRuby's openssl extension requires digest, so a program that requires only
+# "openssl" can name the top-level Digest.
+require "digest"
 require "openssl/buffering"
 require "openssl/digest"
 require "openssl/cipher"
@@ -152,6 +156,13 @@ module OpenSSL
       # to find the descriptor to wait on.
       def to_io
         @io
+      end
+
+      # CRuby forwards the socket options to the underlying socket
+      # (OpenSSL::SSL::SocketForwarder)
+      def setsockopt(level, optname, optval)
+        @io.setsockopt(level, optname, optval)
+        0
       end
 
       def connect

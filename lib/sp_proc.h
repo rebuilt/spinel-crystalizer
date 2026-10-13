@@ -22,7 +22,7 @@
 #include "sp_gc.h"      /* sp_RbVal, sp_gc_alloc, sp_gc_mark */
 #include "sp_alloc.h"   /* sp_PolyArray, sp_box_sym, sp_box_poly_array, sp_raise_cls */
 
-typedef struct sp_Proc { void *fn; void *cap; void (*cap_scan)(void *); sp_int arity; sp_bool lambda_p; sp_int param_count; const sp_sym *param_kinds; const sp_sym *param_names; sp_bool frozen; /* Object#freeze observed (sp_gc_alloc zero-fills) */ void *origin; /* dup/clone lineage root for Proc#== (NULL: self is the root) */ } sp_Proc;
+typedef struct sp_Proc { void *fn; void *cap; void (*cap_scan)(void *); sp_int arity; sp_bool lambda_p; sp_int param_count; const sp_sym *param_kinds; const sp_sym *param_names; sp_bool frozen; /* Object#freeze observed (sp_gc_alloc zero-fills) */ void *origin; /* dup/clone lineage root for Proc#== (NULL: self is the root) */ sp_int ie_cls; } sp_Proc;
 /* arity: the count this accumulator realizes at -- Proc#curry(n)'s n, else
    the target's required-parameter count (CRuby's min arity, so a variadic
    base realizes on its first call). Carried here so a curry that travels
@@ -39,6 +39,12 @@ sp_int sp_proc_call(sp_Proc *p, sp_int argc, sp_int *args);   /* defined in the 
 #define SP_PROC_ARG_SLOTS 64
 extern SP_TLS sp_RbVal _sp_proc_poly_args[SP_PROC_ARG_SLOTS];    /* defined in the generated TU */
 extern SP_TLS sp_RbVal _sp_proc_poly_ret;                        /* defined in the generated TU */
+/* A call wider than the channel: its boxed arguments past the
+   SP_PROC_ARG_SLOTS slots ride a call-sized store the call opens
+   (sp_proc_wide_open) and its callee reads (sp_proc_arg). The store stays
+   here, marked with the channel, until the next wide call replaces it. */
+typedef struct { sp_int n; sp_RbVal v[]; } sp_ProcWide;
+extern SP_TLS sp_ProcWide *_sp_proc_poly_wide;                   /* defined in the generated TU */
 
 /* The lineage root of a proc: dups/clones of one proc share it, so Proc#== /
    #eql? compare roots (a dup == its original) while distinct literals differ. */
@@ -51,7 +57,6 @@ sp_Proc *sp_proc_new(void *fn, void *cap, void (*cap_scan)(void *));
 sp_int sp_proc_arity(sp_Proc *p);
 sp_bool sp_proc_lambda_p(sp_Proc *p);
 const char *sp_proc_inspect(sp_Proc *p);
-void sp_proc_lambda_arity_check(sp_int argc, sp_int req, sp_int opt, sp_bool has_rest, sp_bool has_kw);
 sp_PolyArray *sp_proc_parameters_ids(sp_Proc *p, int mode, sp_sym req_id, sp_sym opt_id);
 sp_PolyArray *sp_proc_parameters(sp_Proc *p);
 void sp_curry_scan(void *p);
@@ -166,7 +171,7 @@ typedef struct sp_BoundMethod { void *self; sp_int fn; const char *name; sp_int 
                            default below full arity, a rest, a mixed promote
                            signature); 0 when the bind site had no static target
                            or the target's shape declines (keywords). */
-  sp_int thunk_min, thunk_max;   /* the argument counts it binds (max 16 for a rest) */
+  sp_int thunk_min, thunk_max;   /* the argument counts it binds (max -1 for a rest: any count) */
 } sp_BoundMethod;
 void sp_bm_cap_scan(void *p);
 sp_int sp_method_proc_tramp(void *cap, sp_int argc, sp_int *args);
@@ -212,13 +217,10 @@ static inline sp_bool sp_bm_thunk_ok(sp_BoundMethod *m, sp_int argc) {
    box their own kind; a typed array adapter that returns self (push) or a
    laundered element (StrArray get/set) boxes the real value instead of
    mis-tagging the pointer as an Integer (#4395). A Bigint pointer boxes into
-   its Ruby value. SP_BM_RET_INT
-   goes through sp_box_int_or_nil: an IntArray
-   `[]` out of range answers the nullable SP_INT_NIL sentinel (INTPTR_MIN),
-   which sp_box_int would hand back as a truthy Integer instead of nil, and a
-   regular TY_INT method uses the same reserved sentinel for nil (see
-   sp_poly_as_int_or_nil / sp_box_int_or_nil in sp_alloc.h) so boxing it as nil
-   is the documented invariant. */
+   its Ruby value. SP_BM_RET_INT is a plain Integer: a method whose return
+   is a nullable Integer answers an sp_oint, two registers, which this
+   one-register ABI cannot carry -- such a method is bound through the boxed
+   (sp_RbVal) ABI instead. */
 static inline sp_RbVal sp_bm_box_ret(sp_BoundMethod *m, sp_int raw) {
   sp_int r = m ? m->legacy_ret : SP_BM_RET_INT;
   switch (SP_BM_RET_KIND(r)) {
@@ -231,7 +233,7 @@ static inline sp_RbVal sp_bm_box_ret(sp_BoundMethod *m, sp_int raw) {
     case SP_BM_RET_OBJ:       return sp_box_nullable_obj((void *)(uintptr_t)raw, (int)(r >> 8));
     case SP_BM_RET_OBJ_DYN:   return sp_box_nullable_obj_dyn((void *)(uintptr_t)raw, 0);
     case SP_BM_RET_BIGINT:    return raw ? sp_box_bigint((sp_Bigint *)(uintptr_t)raw) : sp_box_nil();
-    default:                  return sp_box_int_or_nil(raw);
+    default:                  return sp_box_int(raw);
   }
 }
 /* The raw register as the trampoline hands it back untouched to a typed

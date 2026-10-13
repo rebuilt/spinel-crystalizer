@@ -6,6 +6,9 @@
  *
  * Self-contained: includes sp_io.h (the sp_File layout) + sp_gc.h
  * (sp_mark_string), not spinel_rt.h. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* pipe2 */
+#endif
 #include "sp_io.h"
 #include "sp_gc.h"   /* sp_mark_string */
 #include <stdlib.h>
@@ -14,12 +17,16 @@
 #include <unistd.h>   /* pipe, isatty */
 #include <sys/stat.h> /* stat() for the File predicates */
 #include <sys/ioctl.h> /* TIOCGWINSZ for #winsize */
+#if !defined(__wasi__) && !defined(_WIN32)
+#include <termios.h>   /* io/console's IO#raw / IO#noecho */
+#endif
 #include <sys/socket.h> /* the Socket:: constants */
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/un.h>
 #include <sys/time.h> /* utimes() for File.utime */
 #include <errno.h>
+#include <limits.h>  /* INT_MAX for the socket int arguments */
 #include <fcntl.h>   /* fcntl flags for #close_on_exec?, #fcntl */
 #include <poll.h>    /* POLLIN for the socket read park */
 
@@ -80,12 +87,36 @@ static void sp_File_scan(void *p) { sp_File *f = (sp_File *)p; if (f->path) sp_m
    the same mode scan (which refuses "rx"), O_CLOEXEC, and the errno-named
    error, rather than fopen's looser mode and a flat ENOENT. */
 sp_File *sp_File_open(const char *path, const char *mode) {
-  return sp_File_open_perm(path, mode ? mode : "r", SP_INT_NIL);
+  return sp_File_open_perm(path, mode ? mode : "r", sp_oint_nil());
 }
 
-/* Returns 0 on success, -1 on error. */
+#if !defined(__linux__) && !defined(_WIN32)
+static int sp_io_set_cloexec(int fd) {
+  int fl = fcntl(fd, F_GETFD);
+  if (fl < 0) return -1;
+  return (fl & FD_CLOEXEC) ? 0 : fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+#endif
+
+/* Returns 0 on success, -1 on error with errno set. Both ends are
+   close-on-exec, as CRuby's are. Without pipe2 the flag is set after pipe(),
+   so a spawn on another worker in between can still inherit them. */
 int sp_io_make_pipe(int fds[2]) {
+#if defined(__linux__)
+  return pipe2(fds, O_CLOEXEC);
+#elif defined(_WIN32)
   return pipe(fds);
+#else
+  if (pipe(fds) != 0) return -1;
+  if (sp_io_set_cloexec(fds[0]) != 0 || sp_io_set_cloexec(fds[1]) != 0) {
+    int e = errno;
+    close(fds[0]);
+    close(fds[1]);
+    errno = e;
+    return -1;
+  }
+  return 0;
+#endif
 }
 
 /* IO.pipe end: wrap a raw pipe fd in a GC-managed sp_File so the
@@ -108,6 +139,10 @@ sp_File *sp_io_fdopen_ex(int fd, const char *mode, int owns_fd) {SP_GC_ROOT_STR(
 }
 sp_File *sp_io_fdopen(int fd, const char *mode) { return sp_io_fdopen_ex(fd, mode, 1); }
 
+/* BasicSocket.do_not_reverse_lookup: true unless the program changes it; a
+   socket takes it when it is made, and keeps its own copy after that */
+sp_bool sp_sock_dnrl_default = 1;
+
 /* Wrap a socket fd (#2922). The FILE* serves the buffered READ side (gets and
    friends need lookahead); every write bypasses stdio straight to write(2) --
    see sp_sock_write below -- so a response is on the wire immediately, like
@@ -125,7 +160,7 @@ sp_File *sp_io_fdopen_sock(int fd, const char *kind) {SP_GC_ROOT_STR(kind);
   f->path = NULL;
   f->mode = kind;
   f->lineno = 0;
-  f->is_sock = 1;
+  f->is_sock = 1; f->rev_lookup = !sp_sock_dnrl_default;
   return f;
 }
 
@@ -312,7 +347,8 @@ static sp_int sp_sock_write(sp_File *f, const char *s, size_t n) {
       if (room == 0) continue;
       if (room > 0 && (size_t)room < want) want = (size_t)room;
       put = send(fd, s + off, want, SP_MSG_DONTWAIT);
-    } else {
+    }
+    else {
       put = write(fd, s + off, want);
     }
     if (put < 0) {
@@ -350,8 +386,13 @@ static sp_int sp_io_write_raw(sp_File *f, const char *s, size_t n) {
      the descriptor past where stdio thinks it is, and a zero-length write
      is still a valid sync point. Without this, a subsequent ftello,
      buffered read, or buffered write on the same stream would use the
-     stale stdio offset. */
-  if (fseeko(f->fp, 0, SEEK_CUR) != 0) sp_file_raise_errno("write", "file");
+     stale stdio offset. The stream is set to the descriptor's own offset:
+     a relative seek (SEEK_CUR) counts from stdio's cached offset, which the
+     raw write did not move, and moved the descriptor back to it, so the
+     next syswrite overwrote this one. A descriptor with no offset (a pipe,
+     a terminal) has none to share, where the relative seek raised ESPIPE. */
+  off_t pos = lseek(fd, 0, SEEK_CUR);
+  if (pos >= 0 && fseeko(f->fp, pos, SEEK_SET) != 0) sp_file_raise_errno("write", "file");
   return (sp_int)n;
 }
 
@@ -434,6 +475,98 @@ sp_IntArray *sp_File_winsize(sp_File *f) {
   return a;
 }
 
+/* io/console's IO#raw { } and IO#noecho { }, which the analysis turns into
+   `s = io.__sp_tty_mode(kind); begin ... ensure io.__sp_tty_restore(s) end`.
+   The terminal's settings are saved and the mode set as CRuby's console.c
+   sets it (set_rawmode: cfmakeraw, then ECHOE and ECHOK off; set_noecho:
+   ECHO, ECHOE, ECHOK and ECHONL off), applied with TCSANOW. A handle that is
+   not a terminal raises tcgetattr's Errno (ENOTTY), as CRuby's does. Answers
+   the slot the saved settings sit in, for the restore; nested modes take a
+   slot each. */
+#if defined(__wasi__) || defined(_WIN32)
+/* No termios: no handle is a terminal whose mode can be set. */
+sp_int sp_File_tty_mode(sp_File *f, sp_int kind) {
+  (void)kind;
+  SP_IO_OPEN(f);
+  sp_raise_cls(sp_errno_class_name(ENOTTY), strerror(ENOTTY));
+  return 0;
+}
+sp_int sp_File_tty_restore(sp_File *f, sp_int slot) { (void)f; (void)slot; return 0; }
+#else
+#define SP_TTY_SLOTS 16
+static struct termios sp_tty_saved[SP_TTY_SLOTS];
+static int sp_tty_saved_fd[SP_TTY_SLOTS];
+static int sp_tty_saved_used[SP_TTY_SLOTS];
+sp_int sp_File_tty_mode(sp_File *f, sp_int kind) {
+  SP_IO_OPEN(f);
+  int fd = (int)sp_File_fileno(f);
+  struct termios t;
+  if (tcgetattr(fd, &t) != 0) { int e = errno; sp_raise_cls(sp_errno_class_name(e), strerror(e)); }
+  int slot = -1;
+  for (int i = 0; i < SP_TTY_SLOTS; i++) if (!sp_tty_saved_used[i]) { slot = i; break; }
+  if (slot < 0) sp_raise_cls("RuntimeError", "io/console: terminal modes nested too deep");
+  sp_tty_saved[slot] = t;
+  sp_tty_saved_fd[slot] = fd;
+  sp_tty_saved_used[slot] = 1;
+  if (kind == 1) {
+    cfmakeraw(&t);
+    t.c_lflag &= ~(tcflag_t)(ECHOE | ECHOK);
+  } else {
+    t.c_lflag &= ~(tcflag_t)(ECHO | ECHOE | ECHOK | ECHONL);
+  }
+  if (tcsetattr(fd, TCSANOW, &t) != 0) {
+    int e = errno;
+    sp_tty_saved_used[slot] = 0;
+    sp_raise_cls(sp_errno_class_name(e), strerror(e));
+  }
+  return (sp_int)slot;
+}
+/* The settings slot `slot` saved, back on the terminal they came from. */
+sp_int sp_File_tty_restore(sp_File *f, sp_int slot) {
+  (void)f;
+  if (slot < 0 || slot >= SP_TTY_SLOTS || !sp_tty_saved_used[slot]) return 0;
+  tcsetattr(sp_tty_saved_fd[slot], TCSANOW, &sp_tty_saved[slot]);
+  sp_tty_saved_used[slot] = 0;
+  return 0;
+}
+#endif
+
+/* IO#winsize= [rows, cols] or [rows, cols, xpixel, ypixel], as CRuby's
+   io/console: any other length is ArgumentError, and a handle that is not a
+   terminal raises the ioctl's Errno (ENOTTY) rather than answering quietly,
+   since a size that was not set is not something to carry on from. Answers
+   its argument, which is what an assignment yields. A pty master is the case
+   that needs it: the program sizes the terminal its child sees. */
+sp_IntArray *sp_File_set_winsize(sp_File *f, sp_IntArray *size) {
+  SP_IO_OPEN(f);
+  sp_int n = size ? size->len : 0;
+  if (n != 2 && n != 4) {
+    char msg[96];
+    snprintf(msg, sizeof msg, "wrong number of arguments (given %lld, expected 2 or 4)", (long long)n);
+    sp_raise_cls("ArgumentError", msg);
+  }
+  const sp_int *v = size->data + size->start;
+  struct winsize ws;
+  memset(&ws, 0, sizeof ws);
+  ws.ws_row = (unsigned short)v[0];
+  ws.ws_col = (unsigned short)v[1];
+  if (n == 4) {
+    ws.ws_xpixel = (unsigned short)v[2];
+    ws.ws_ypixel = (unsigned short)v[3];
+  }
+#ifdef TIOCSWINSZ
+  if (ioctl(fileno(f->fp), TIOCSWINSZ, &ws) != 0) {
+    int e = errno;
+    sp_raise_cls(sp_errno_class_name(e), strerror(e));
+  }
+#else
+  /* a platform with no terminal-size ioctl (wasm32-wasi) */
+  (void)ws;
+  sp_raise_cls("NotImplementedError", "winsize= is not implemented on this platform");
+#endif
+  return size;
+}
+
 /* The standard streams are singletons in static storage, not GC allocations.
    Reads of $stdout / $stderr compile straight to these calls and only ever
    dereference the result, so nothing scanned ever held one -- until
@@ -492,10 +625,16 @@ sp_int sp_File_close(sp_File *f) {
      check reads EOF from the sentinel instead of dereferencing NULL or the
      connection the next accept gave that number (#4546). */
   if (f && f->fp && !f->closed && f->fp != stdout && f->fp != stderr && f->fp != stdin) {
+    /* Two threads closing one handle at once both passed the check above
+       and both fclosed the FILE: a double free (two pumps of a connection
+       closing it from their ensures, #8205's test). The one that swaps the
+       sentinel in owns the close; the other finds it already taken. */
     FILE *fp = f->fp;
+    FILE *sentinel = sp_io_closed_sentinel();
+    if (fp == sentinel || !SP_ATOMIC_CAS(&f->fp, &fp, sentinel, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      return 0;
     int fd = fileno(fp);
     f->closed = 1;
-    f->fp = sp_io_closed_sentinel();
     sp_sched_ev_forget(fd);
     /* autoclose=false on an IO that wraps the fd itself: flush and abandon
        the FILE (see sp_File_fin); a for_fd wrapper holds a dup, so its
@@ -516,6 +655,13 @@ FILE *sp_io_closed_sentinel(void) {
   if (!sentinel) {
     FILE *s = fopen("/dev/null", "r+");
     if (!s) s = fopen("/dev/null", "r");
+#ifdef __wasi__
+    /* WASI has no /dev/null (nor any path the host did not grant): an
+       in-memory stream positioned at its end reads EOF the same way ("r"
+       makes the whole buffer readable, so it starts at the end). A write
+       racing a close fails here rather than being discarded. */
+    if (!s) { static char none[1]; if ((s = fmemopen(none, sizeof none, "r"))) fseek(s, 0, SEEK_END); }
+#endif
     if (!s) sp_raise_cls("IOError", "cannot open /dev/null");
     if (!SP_ATOMIC_CAS(&sentinel, &(FILE *){NULL}, s, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) fclose(s);
   }
@@ -544,7 +690,8 @@ const char *sp_io_kind_name(sp_File *f) {
 /* The builtin superclass chain for a handle's class, mirroring the one the
    generated TU carries for class VALUES (sp_builtin_superclass). A handle
    answers #is_a? from its kind, which is a runtime property, so the walk lives
-   here rather than in the emitted switch. */
+   here rather than in the emitted switch. io_super_name (src/analyze_util.c)
+   is the compiler's copy; keep the two the same. */
 static const char *sp_io_super_of(const char *k) {
   if (strcmp(k, "TCPServer") == 0)   return SPL("TCPSocket");
   if (strcmp(k, "TCPSocket") == 0)   return SPL("IPSocket");
@@ -565,6 +712,14 @@ sp_bool sp_io_is_a(sp_File *f, const char *cls) {SP_GC_ROOT(f);
   for (const char *k = sp_io_kind_name(f); k; k = sp_io_super_of(k))
     if (strcmp(k, cls) == 0) return 1;
   return 0;
+}
+int sp_io_pick_class(sp_File *f, const char *const *names, const int *idx) {SP_GC_ROOT(f);
+  if (!f) return 0x7fffffff;
+  if (f->mode && (strcmp(f->mode, "stat") == 0 || strcmp(f->mode, "lstat") == 0)) return 0x7fffffff;
+  for (const char *k = sp_io_kind_name(f); k; k = sp_io_super_of(k))
+    for (int i = 0; names[i]; i++)
+      if (strcmp(k, names[i]) == 0) return idx[i];
+  return 0x7fffffff;
 }
 sp_bool sp_io_instance_of(sp_File *f, const char *cls) {SP_GC_ROOT(f);
   return cls && strcmp(sp_io_kind_name(f), cls) == 0;
@@ -678,21 +833,38 @@ sp_File *sp_sock_udp_new(sp_int family) {
   sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), sp_File_fin, sp_File_scan);
   f->fp = fdopen(fd, "r+");
   if (!f->fp) { close(fd); sp_raise_cls("IOError", "fdopen failed"); return NULL; }
-  f->path = NULL; f->mode = "udp"; f->lineno = 0; f->is_sock = 1;
+  f->path = NULL; f->mode = SPL("udp"); f->lineno = 0; f->is_sock = 1; f->rev_lookup = !sp_sock_dnrl_default;
   return f;
 }
 sp_File *sp_sock_unix_server(const char *path) {SP_GC_ROOT_STR(path);
   extern int sp_net_unix_listen(const char *path, int backlog);
   int fd = sp_net_unix_listen(path, 128);
   if (fd < 0) sp_file_raise_errno("bind", path ? path : "");
-  sp_File *f = sp_io_fdopen_sock(fd, "unixserver");
+  sp_File *f = sp_io_fdopen_sock(fd, SPL("unixserver"));
   return f;
 }
 sp_File *sp_sock_unix_connect(const char *path) {SP_GC_ROOT_STR(path);
   extern int sp_net_unix_connect(const char *path);
   int fd = sp_net_unix_connect(path);
   if (fd < 0) sp_file_raise_errno("connect", path ? path : "");
-  return sp_io_fdopen_sock(fd, "unix");
+  return sp_io_fdopen_sock(fd, SPL("unix"));
+}
+
+/* BasicSocket#do_not_reverse_lookup and its writer: a socket's own, so a
+   File or a pipe answers NoMethodError, as CRuby does */
+static void sp_sock_dnrl_check(sp_File *f, const char *name) {
+  if (!f) sp_nil_recv(name);
+  if (!f->is_sock)
+    sp_raise_cls("NoMethodError", sp_sprintf("undefined method '%s' for an instance of %s",
+                                             name, sp_io_kind_name(f)));
+}
+sp_bool sp_sock_dnrl(sp_File *f) {
+  sp_sock_dnrl_check(f, "do_not_reverse_lookup");
+  return !f->rev_lookup;
+}
+void sp_sock_set_dnrl(sp_File *f, sp_bool on) {
+  sp_sock_dnrl_check(f, "do_not_reverse_lookup=");
+  f->rev_lookup = !on;
 }
 
 const char *sp_sock_gethostname(void) {
@@ -712,8 +884,50 @@ sp_File *sp_sock_new(sp_int domain, sp_int type, sp_int proto) {
   if (!f->fp) { close(fd); sp_raise_cls("IOError", "fdopen failed"); return NULL; }
   /* Socket.new answers Socket, not the protocol-specific subclass CRuby uses
      for TCPSocket.new -- the caller asked for the generic class. */
-  f->path = NULL; f->mode = "socket"; f->lineno = 0; f->is_sock = 1;
+  f->path = NULL; f->mode = SPL("socket"); f->lineno = 0; f->is_sock = 1; f->rev_lookup = !sp_sock_dnrl_default;
   return f;
+}
+/* An Integer argument a C int parameter takes, checked in its full width
+   first: a wider value cut down to an int could name another port or open
+   descriptor. Worded as CRuby's NUM2INT. */
+static int sp_sock_int_arg(sp_int v) {
+  if (v > INT_MAX) sp_raise_cls("RangeError", sp_sprintf("integer %lld too big to convert to 'int'", (long long)v));
+  if (v < INT_MIN) sp_raise_cls("RangeError", sp_sprintf("integer %lld too small to convert to 'int'", (long long)v));
+  return (int)v;
+}
+/* Socket.tcp_server_sockets(host, port) -> [Socket, ...]: a listening Socket
+   per address the host resolves to (an IPv4 and an IPv6 one for a nil host on
+   a dual-stack machine). Raises what the last address failed with when none
+   could be bound, as CRuby does. */
+sp_PolyArray *sp_sock_tcp_server_sockets(const char *host, sp_int port) {SP_GC_ROOT_STR(host);
+  extern int sp_net_listen_all(const char *host, int port, int *fds, int cap, const char **op);
+  int fds[16];
+  const char *op = NULL;
+  int n = sp_net_listen_all(host, sp_sock_int_arg(port), fds, 16, &op);
+  if (n < 0) sp_raise_cls("SocketError", sp_sprintf("getaddrinfo: %s", op));
+  if (n == 0) {
+    int e = errno;
+    sp_raise_cls(sp_errno_class_name(e),
+                 sp_sprintf("%s - %s for %s:%d", strerror(e), op,
+                            (host && *host) ? host : "nil", (int)port));
+  }
+  sp_PolyArray *a = sp_PolyArray_new();
+  SP_GC_ROOT(a);
+  for (int i = 0; i < n; i++)
+    sp_PolyArray_push(a, sp_box_obj(sp_io_fdopen_sock(fds[i], SPL("socket")), SP_BUILTIN_IO));
+  return a;
+}
+/* TCPServer.for_fd(fd) and the other socket classes': wrap a descriptor the
+   program already holds as that class. The handle owns the fd from then on,
+   so the usual move is to set autoclose = false on the one it came from. */
+sp_File *sp_sock_for_fd(sp_int fd, sp_int kind) {
+  int d = sp_sock_int_arg(fd);
+  if (d < 0 || fcntl(d, F_GETFD) < 0)
+    sp_raise_cls("Errno::EBADF", "Bad file descriptor");
+  const char *k = kind == 1 ? SPL("tcpserver") : kind == 2 ? SPL("tcp") :
+                  kind == 3 ? SPL("udp") : kind == 4 ? SPL("unixserver") :
+                  kind == 5 ? SPL("unix") : SPL("socket");
+  return sp_io_fdopen_sock(d, k);
 }
 /* Socket.pair / Socket.socketpair -> the two connected ends. */
 sp_File *sp_sock_pair_end(sp_int domain, sp_int type, sp_int proto, sp_int which) {
@@ -726,12 +940,37 @@ sp_File *sp_sock_pair_end(sp_int domain, sp_int type, sp_int proto, sp_int which
   int fd = cached[which == 0 ? 0 : 1];
   if (fd < 0) sp_raise_cls("IOError", "socketpair");
   (void)domain; (void)type;
-  return sp_io_fdopen_sock(fd, "socket");
+  return sp_io_fdopen_sock(fd, SPL("socket"));
 }
 
 /* Socket.getaddrinfo: one row per resolution, in CRuby's 7-element shape. */
-sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port) {SP_GC_ROOT_STR(host);
-  extern int sp_net_getaddrinfo_at(const char *host, int port, int socktype, int idx,
+/* A family or socktype argument of Socket.getaddrinfo: nil is 0
+   (unrestricted), an Integer as given, a String or Symbol by name with or
+   without its AF_ / SOCK_ prefix, as CRuby reads it. An unknown name is CRuby's
+   SocketError. */
+sp_int sp_sock_addrinfo_hint(sp_RbVal v, sp_int is_family) {
+  v = sp_rbval_str(v);
+  if (v.tag == SP_TAG_NIL) return 0;
+  if (v.tag == SP_TAG_INT) return v.v.i;
+  const char *name = NULL;
+  if (v.tag == SP_TAG_STR) name = v.v.s;
+  else if (v.tag == SP_TAG_SYM && sp_sym_name_fn) name = sp_sym_name_fn((sp_sym)v.v.i);
+  if (!name) sp_raise_cls("TypeError", "no implicit conversion into Integer");
+  const char *prefix = is_family ? "AF_" : "SOCK_";
+  size_t pl = strlen(prefix);
+  if (strncmp(name, prefix, pl) == 0) name += pl;
+  if (is_family && strcmp(name, "UNSPEC") == 0) return 0;
+  char full[64];
+  snprintf(full, sizeof full, "%s%s", prefix, name);
+  sp_int r = sp_sock_const(full);
+  if (r < 0) sp_raise_cls("SocketError", is_family ? "unknown socket domain" : "unknown socket type");
+  return r;
+}
+
+/* Socket.getaddrinfo(host, port [, family [, socktype]]): a family or socktype
+   of 0 (nil) leaves it unrestricted, as in CRuby. */
+sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port, sp_int family, sp_int socktype) {SP_GC_ROOT_STR(host);
+  extern int sp_net_getaddrinfo_at(const char *host, int port, int want_family, int socktype, int idx,
                                    int *family, int *stype, int *proto,
                                    char *ipbuf, int ipcap, int *port_out);
   sp_PolyArray *out = sp_PolyArray_new();
@@ -739,11 +978,12 @@ sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port) {SP_GC_ROOT_STR
   for (int i = 0; i < 64; i++) {
     int fam = 0, stype = 0, proto = 0, p = 0;
     char ip[64];
-    if (sp_net_getaddrinfo_at(host, (int)port, 0, i, &fam, &stype, &proto,
+    if (sp_net_getaddrinfo_at(host, (int)port, (int)family, (int)socktype, i, &fam, &stype, &proto,
                               ip, (int)sizeof ip, &p) != 0) break;
     const char *ips = sp_str_from_bytes(ip, strlen(ip));
+    SP_GC_ROOT_STR(ips);   /* held across the row's allocation */
     sp_PolyArray *row = sp_PolyArray_new();
-    sp_PolyArray_push(row, sp_box_str(fam == AF_INET6 ? "AF_INET6" : "AF_INET"));
+    sp_PolyArray_push(row, sp_box_str(fam == AF_INET6 ? SPL("AF_INET6") : SPL("AF_INET")));
     sp_PolyArray_push(row, sp_box_int((sp_int)p));
     sp_PolyArray_push(row, sp_box_str(ips));
     sp_PolyArray_push(row, sp_box_str(ips));
@@ -808,6 +1048,19 @@ sp_PolyArray *sp_sock_unpack_sockaddr_in(const char *sa) {SP_GC_ROOT_STR(sa);
   return out;
 }
 
+/* Socket.unpack_sockaddr_un -> the path, the inverse of sockaddr_un. */
+const char *sp_sock_unpack_sockaddr_un(const char *sa) {SP_GC_ROOT_STR(sa);
+  extern int sp_net_unpack_sockaddr_un(const void *sa, int salen, char *pathbuf, int cap);
+  char path[256];
+  int len = sa ? (int)sp_str_byte_len(sa) : 0;
+  int n = sp_net_unpack_sockaddr_un(sa, len, path, (int)sizeof path);
+  if (n == -2)
+    sp_raise_cls("TypeError", sp_sprintf("too long sockaddr_un - %d longer than %d",
+                                         len, (int)sizeof(struct sockaddr_un)));
+  if (n < 0) sp_raise_cls("ArgumentError", "not an AF_UNIX sockaddr");
+  return sp_str_from_bytes(path, (size_t)n);
+}
+
 /* #local_address / #remote_address -> Addrinfo for this end / the peer. */
 sp_Addrinfo *sp_sock_address(sp_File *f, sp_int peer) {SP_GC_ROOT(f);
   extern sp_Addrinfo *sp_addrinfo_new(const char *ip, sp_int port, sp_int stype, sp_int is_unix);
@@ -821,16 +1074,39 @@ sp_Addrinfo *sp_sock_address(sp_File *f, sp_int peer) {SP_GC_ROOT(f);
   int fd = fileno(f->fp);
   const char *k = sp_io_kind_name(f);
   int is_unix = (strcmp(k, "UNIXSocket") == 0 || strcmp(k, "UNIXServer") == 0);
+  /* The address goes to sp_addrinfo_new as a String: it roots its argument
+     across its allocation, and a root on this stack buffer had the
+     collector read the byte before the array for a tag. */
   char buf[256];
   buf[0] = '\0';
   if (is_unix) {
     sp_net_unix_path(fd, (int)peer, buf, (int)sizeof buf);
-    return sp_addrinfo_new(buf, 0, SOCK_STREAM, 1);
+    return sp_addrinfo_new(sp_str_dup_external(buf), 0, SOCK_STREAM, 1);
   }
   int port = sp_net_sock_ip(fd, (int)peer, buf, (int)sizeof buf);
   if (port < 0) { buf[0] = '\0'; port = 0; }
   int stype = (strcmp(k, "UDPSocket") == 0) ? SOCK_DGRAM : SOCK_STREAM;
-  return sp_addrinfo_new(buf, (sp_int)port, stype, 0);
+  return sp_addrinfo_new(sp_str_dup_external(buf), (sp_int)port, stype, 0);
+}
+
+/* #getsockname / #getpeername -> the packed sockaddr of this end / the peer,
+   as a binary String (what Socket.unpack_sockaddr_in and Addrinfo take). */
+const char *sp_sock_getname(sp_File *f, sp_int peer) {SP_GC_ROOT(f);
+  extern int sp_net_sock_name(int fd, int peer, void *out, int cap);
+  const char *m = peer ? "getpeername" : "getsockname";
+  if (!f || !f->is_sock)
+    sp_raise_cls("NoMethodError",
+                 sp_sprintf("undefined method '%s' for an instance of %s", m, sp_io_kind_name(f)));
+  SP_IO_OPEN(f);
+  char buf[256];
+  int n = sp_net_sock_name(fileno(f->fp), (int)peer, buf, (int)sizeof buf);
+  if (n < 0) {
+    int e = errno;
+    sp_raise_cls(sp_errno_class_name(e), sp_sprintf("%s - %s(2)", strerror(e), m));
+  }
+  char *s = (char *)sp_str_from_bytes(buf, (size_t)n);
+  sp_str_mark_binary(s);
+  return s;
 }
 
 /* Only a socket answers the socket-specific methods; say which class the
@@ -862,16 +1138,40 @@ sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, const char *host, 
   if (n < 0) sp_file_raise_errno("send", host ? host : "");
   return (sp_int)n;
 }
+static long sp_io_buffered(sp_File *f);
 /* #recv reads one datagram (or up to `len` stream bytes) as a String;
    #recvfrom pairs it with the sender's address, CRuby's 4-element form. */
 const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
   extern int sp_net_udp_recv_from(int fd, char *buf, int cap, char *ipbuf, int ipcap, int *port_out);
   sp_sock_require(f, "recv");
   if (len <= 0) return sp_str_from_bytes("", 0);
+  /* bytes a read on the stream already pulled into stdio's buffer are the
+     peer's next ones: served first, as readpartial does, or recv stepped
+     over them (#7195) */
+  long pend = sp_io_buffered(f);
+  if (pend > 0) {
+    size_t want = (size_t)len < (size_t)pend ? (size_t)len : (size_t)pend;
+    char *r = sp_str_alloc(want);
+    size_t got = fread(r, 1, want, f->fp);
+    r[got] = 0;
+    sp_str_set_len(r, got);
+    return r;
+  }
+  /* park until the peer writes, as readpartial does: a close from another
+     thread then wakes this one with CRuby's IOError, where a recv(2) already
+     blocked in the kernel answered EBADF, or read a descriptor that was by
+     then someone else's (#7555) */
+  sp_io_wait_readable(f);
   char *buf = (char *)malloc((size_t)len);
   if (!buf) sp_raise_cls("NoMemoryError", "recv");
   int n = sp_net_udp_recv_from(fileno(f->fp), buf, (int)len, NULL, 0, NULL);
   if (n < 0) { free(buf); sp_file_raise_errno("recv", ""); }
+  /* a stream socket at EOF answers nil (Ruby 3.3 and later); an empty
+     datagram is still "" */
+  if (n == 0) {
+    int st = 0; socklen_t sl = sizeof st;
+    if (getsockopt(fileno(f->fp), SOL_SOCKET, SO_TYPE, &st, &sl) == 0 && st == SOCK_STREAM) { free(buf); return NULL; }
+  }
   const char *s = sp_str_from_bytes(buf, (size_t)n);
   free(buf);
   return s;
@@ -882,12 +1182,18 @@ const char *sp_sock_recvfrom(sp_File *f, sp_int len, const char **ip_out, sp_int
   sp_sock_require(f, "recvfrom");
   char ipbuf[64];
   int port = 0;
-  if (len <= 0) { *ip_out = sp_str_from_bytes("", 0); *port_out = 0; return sp_str_from_bytes("", 0); }
+  if (len <= 0) {
+    const char *s = sp_str_from_bytes("", 0); SP_GC_ROOT_STR(s);   /* across the address's copy */
+    *ip_out = sp_str_from_bytes("", 0);
+    *port_out = 0;
+    return s;
+  }
+  sp_io_wait_readable(f);   /* as sp_sock_recv (#7555) */
   char *buf = (char *)malloc((size_t)len);
   if (!buf) sp_raise_cls("NoMemoryError", "recvfrom");
   int n = sp_net_udp_recv_from(fileno(f->fp), buf, (int)len, ipbuf, (int)sizeof ipbuf, &port);
   if (n < 0) { free(buf); sp_file_raise_errno("recvfrom", ""); }
-  const char *s = sp_str_from_bytes(buf, (size_t)n);
+  const char *s = sp_str_from_bytes(buf, (size_t)n); SP_GC_ROOT_STR(s);   /* across the address's copy */
   free(buf);
   *ip_out = sp_str_from_bytes(ipbuf, strlen(ipbuf));
   *port_out = (sp_int)port;
@@ -899,6 +1205,24 @@ sp_int sp_sock_shutdown(sp_File *f, sp_int how) {SP_GC_ROOT(f);
   if (sp_net_shutdown(fileno(f->fp), (int)how) != 0) sp_file_raise_errno("shutdown", "");
   return 0;
 }
+/* A setsockopt value as the int the option takes: an Integer, true/false as
+   1/0, or the option's packed bytes ([1].pack("i")), as CRuby accepts it. */
+sp_int sp_sock_optval(sp_RbVal v) {
+  /* a shared String handle reads as its bytes (sp_String's first field) */
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p) { v.tag = SP_TAG_STR; v.v.s = *(const char **)v.v.p; }
+  if (v.tag == SP_TAG_INT) return v.v.i;
+  if (v.tag == SP_TAG_BOOL) return v.v.i != 0;
+  if (v.tag == SP_TAG_STR && v.v.s) {
+    int n = 0;
+    if (sp_str_byte_len(v.v.s) != sizeof n)
+      sp_raise_cls("ArgumentError", "only an int-sized packed option value is supported");
+    memcpy(&n, v.v.s, sizeof n);
+    return n;
+  }
+  sp_raise_cls("TypeError", "no implicit conversion into Integer");
+  return 0;
+}
+
 sp_int sp_sock_setsockopt(sp_File *f, sp_int level, sp_int opt, sp_int value) {SP_GC_ROOT(f);
   extern int sp_net_setsockopt_int(int fd, int level, int optname, int value);
   sp_sock_require(f, "setsockopt");
@@ -971,7 +1295,7 @@ sp_File *sp_sock_accept_nb(sp_File *f, sp_bool exc) {SP_GC_ROOT(f);
   int e = errno;
   sp_io_nb_end(f, saved);
   errno = e;
-  if (fd >= 0) return sp_io_fdopen_sock(fd, "tcp");
+  if (fd >= 0) return sp_io_fdopen_sock(fd, SPL("tcp"));
   if (sp_sock_would_block()) {
     if (!exc) return NULL;
     sp_sock_raise_wait(0, "accept");
@@ -999,7 +1323,7 @@ sp_File *sp_sock_accept_nb(sp_File *f, sp_bool exc) {SP_GC_ROOT(f);
    the OS worker, which never reaches a safepoint, so the next stop-the-world
    collection waited on it forever and one green thread idle in readpartial
    on a quiet socket froze every other thread's allocation (#4528). */
-const char *sp_File_readpartial(sp_File *f, sp_int n) {SP_GC_ROOT(f);
+const char *sp_File_readpartial_or_nil(sp_File *f, sp_int n) {SP_GC_ROOT(f);
   SP_IO_OPEN(f);
   if (n < 0) sp_raise_cls("EOFError", "end of file reached");
   if (n == 0) return sp_str_empty_binary();
@@ -1015,10 +1339,17 @@ const char *sp_File_readpartial(sp_File *f, sp_int n) {SP_GC_ROOT(f);
     do { got = read(fileno(f->fp), r, (size_t)n); } while (got < 0 && errno == EINTR);
     if (got < 0) sp_file_raise_errno("read", "");
   }
-  if (got == 0) sp_raise_cls("EOFError", "end of file reached");
+  if (got == 0) return NULL;
   r[got] = 0;
   sp_str_set_len(r, (size_t)got);
   sp_str_mark_binary(r);   /* readpartial / sysread answer ASCII-8BIT, as CRuby */
+  return r;
+}
+
+/* readpartial / sysread: EOFError at the end of the stream. */
+const char *sp_File_readpartial(sp_File *f, sp_int n) {
+  const char *r = sp_File_readpartial_or_nil(f, n);
+  if (!r) sp_raise_cls("EOFError", "end of file reached");
   return r;
 }
 
@@ -1026,7 +1357,8 @@ const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv
   if (eof) *eof = 0;
   if (is_recv) sp_sock_nb_prepare(f, "recv_nonblock");
   else SP_IO_OPEN(f);
-  if (len <= 0) return sp_str_from_bytes("", 0);
+  /* the bytes read are BINARY, as CRuby's read_nonblock and recv answer them */
+  if (len <= 0) { char *e = (char *)sp_str_from_bytes("", 0); sp_str_mark_binary(e); return e; }
   char *buf = (char *)malloc((size_t)len);
   if (!buf) sp_raise_cls("NoMemoryError", "read_nonblock");
   ssize_t n;
@@ -1042,14 +1374,15 @@ const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv
     sp_io_nb_end(f, saved);
     errno = e;
   }
-  if (n > 0) { const char *s = sp_str_from_bytes(buf, (size_t)n); free(buf); return s; }
+  if (n > 0) { char *s = (char *)sp_str_from_bytes(buf, (size_t)n); free(buf); sp_str_mark_binary(s); return s; }
   if (n == 0) {
     free(buf);
     if (eof) *eof = 1;
-    /* recv_nonblock answers "" at EOF in BOTH forms -- it does not raise
-       EOFError and it does not answer nil. read_nonblock is the one that
-       tells them apart: nil for `exception: false`, EOFError otherwise. */
-    if (is_recv) return sp_str_from_bytes("", 0);
+    /* recv_nonblock answers nil at EOF in BOTH forms (Ruby 3.3 and later;
+       it was "" before) -- it does not raise EOFError. read_nonblock is the
+       one that tells them apart: nil for `exception: false`, EOFError
+       otherwise. */
+    if (is_recv) return NULL;
     if (!exc) return NULL;                     /* CRuby: nil at EOF */
     sp_raise_cls("EOFError", "end of file reached");
   }
@@ -1060,35 +1393,35 @@ const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv
   }
   sp_file_raise_errno("read", "");
 }
-/* write_nonblock -> the byte count, or SP_INT_NIL when it would block.
+/* write_nonblock -> the byte count, or nil when it would block.
    Paired like sp_File_write: the _bin entry sizes with the header length and
    is emitted only for a String value; this one stays strlen for bare
    literals (a poly operand reaches it through sp_poly_to_s, which answers
    static class/symbol names with no marker byte). */
-static sp_int sp_sock_write_nb_len(sp_File *f, const char *data, size_t len, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);
+static sp_oint sp_sock_write_nb_len(sp_File *f, const char *data, size_t len, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);
   ssize_t n;
   int saved = sp_io_nb_begin(f);
   do { n = write(fileno(f->fp), data ? data : "", len); } while (n < 0 && errno == EINTR);
   int we = errno;
   sp_io_nb_end(f, saved);
   errno = we;
-  if (n >= 0) return (sp_int)n;
+  if (n >= 0) return sp_oint_of((sp_int)n);
   if (sp_sock_would_block()) {
-    if (!exc) return SP_INT_NIL;
+    if (!exc) return sp_oint_nil();
     sp_sock_raise_wait(1, "write");
   }
   sp_file_raise_errno("write", "");
 }
-sp_int sp_sock_write_nb(sp_File *f, const char *data, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);
+sp_oint sp_sock_write_nb(sp_File *f, const char *data, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);
   SP_IO_OPEN(f);
   return sp_sock_write_nb_len(f, data, data ? strlen(data) : 0, exc);
 }
-sp_int sp_sock_write_nb_bin(sp_File *f, const char *data, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);
+sp_oint sp_sock_write_nb_bin(sp_File *f, const char *data, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);
   SP_IO_OPEN(f);
   return sp_sock_write_nb_len(f, data, data ? sp_str_byte_len(data) : 0, exc);
 }
 /* connect_nonblock: an in-flight connect is IO::EINPROGRESSWaitWritable. */
-sp_int sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(host);
+sp_oint sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(host);
   extern int sp_net_udp_connect(int fd, const char *host, int port);
   sp_sock_nb_prepare(f, "connect_nonblock");
   int saved = sp_io_nb_begin(f);
@@ -1096,19 +1429,27 @@ sp_int sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc
   int ce = errno;
   sp_io_nb_end(f, saved);
   errno = ce;
-  if (rc == 0) return 0;
+  if (rc == 0) return sp_oint_of(0);
   if (errno == EINPROGRESS || errno == EALREADY) {
-    if (!exc) return SP_INT_NIL;
+    if (!exc) return sp_oint_nil();
     sp_raise_cls("IO::EINPROGRESSWaitWritable", "operation in progress - connect(2) would block");
   }
-  if (errno == EISCONN) return 0;
+  if (errno == EISCONN) return sp_oint_of(0);
   sp_file_raise_errno("connect", host ? host : "");
 }
 /* connect_nonblock(sockaddr). The peer is already resolved into a packed
    struct sockaddr (the binary String returned by Socket.sockaddr_in or
    #to_sockaddr on an Addrinfo). connect(2) takes the raw bytes; we just
-   pass them through. Same nonblocking lifecycle as sp_sock_connect_nb. */
-sp_int sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sa);
+   pass them through -- from an aligned copy. The GC String's data pointer
+   carries no alignment promise, and netstacks may require one: lwIP's
+   connect guard (IS_SOCK_ADDR_ALIGNED, MEM_ALIGNMENT=4) silently rejects
+   an unaligned address with ERR_ARG -> EIO before any packet is sent
+   (observed on ESP32: every 1-arg connect from a freshly allocated
+   String failed in microseconds while bind() -- which passes the
+   resolver's own aligned addrinfo buffer -- worked). Copy through a
+   maximally-aligned local, sized for sockaddr_storage. Same nonblocking
+   lifecycle as sp_sock_connect_nb. */
+sp_oint sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sa);
   /* sp_sock_nb_prepare runs first: it checks the closed-socket and
      wrong-class guards and raises the matching exception (e.g. IOError
      "closed stream") before we touch the address. The sa/salen guard
@@ -1119,22 +1460,28 @@ sp_int sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool e
     errno = EINVAL;
     sp_file_raise_errno("connect", "");
   }
+  if (salen > (sp_int)sizeof(struct sockaddr_storage)) {
+    errno = EINVAL;
+    sp_file_raise_errno("connect", "");
+  }
+  struct sockaddr_storage aligned_sa;
+  memcpy(&aligned_sa, sa, (size_t)salen);
   int saved = sp_io_nb_begin(f);
-  int rc = connect(fileno(f->fp), (const struct sockaddr *)sa, (socklen_t)salen);
+  int rc = connect(fileno(f->fp), (const struct sockaddr *)&aligned_sa, (socklen_t)salen);
   int ce = errno;
   sp_io_nb_end(f, saved);
   errno = ce;
-  if (rc == 0) return 0;
+  if (rc == 0) return sp_oint_of(0);
   if (errno == EINPROGRESS || errno == EALREADY) {
-    if (!exc) return SP_INT_NIL;
+    if (!exc) return sp_oint_nil();
     sp_raise_cls("IO::EINPROGRESSWaitWritable", "operation in progress - connect(2) would block");
   }
   /* Already connected answers 0, the same as the two-argument form above and
      the same as CRuby answers here -- measured on both, in both exception
      modes, including a second connect to a different address. */
-  if (errno == EISCONN) return 0;
+  if (errno == EISCONN) return sp_oint_of(0);
   sp_file_raise_errno("connect", "");
-  return -1;
+  return sp_oint_of(-1);
 }
 
 /* TCPServer#accept: park cooperatively for a pending connection first -- a
@@ -1147,7 +1494,7 @@ sp_File *sp_sock_accept(sp_File *f) {SP_GC_ROOT(f);
                  sp_sprintf("undefined method 'accept' for an instance of %s", sp_io_kind_name(f)));
   SP_IO_OPEN(f);
   sp_io_wait_readable(f);
-  return sp_io_fdopen_sock(sp_net_accept(fileno(f->fp)), "tcp");
+  return sp_io_fdopen_sock(sp_net_accept(fileno(f->fp)), SPL("tcp"));
 }
 
 /* `#<File:/etc/passwd>` for a path-backed handle, `#<IO:<STDOUT>>` for a
@@ -1299,16 +1646,16 @@ sp_bool sp_file_chardev(const char *path) {
   return path && stat(path, &st) == 0 && S_ISCHR(st.st_mode);
 }
 /* world_readable? / world_writable?: the permission bits (0..0777) when the
-   other-read / other-write bit is set, else nil (SP_INT_NIL) (#3005) */
-sp_int sp_file_world_readable(const char *path) {
+   other-read / other-write bit is set, else nil (#3005) */
+sp_oint sp_file_world_readable(const char *path) {
   struct stat st;
-  if (!(path && stat(path, &st) == 0 && (st.st_mode & S_IROTH))) return SP_INT_NIL;
-  return (sp_int)(st.st_mode & 0777);
+  if (!(path && stat(path, &st) == 0 && (st.st_mode & S_IROTH))) return sp_oint_nil();
+  return sp_oint_of((sp_int)(st.st_mode & 0777));
 }
-sp_int sp_file_world_writable(const char *path) {
+sp_oint sp_file_world_writable(const char *path) {
   struct stat st;
-  if (!(path && stat(path, &st) == 0 && (st.st_mode & S_IWOTH))) return SP_INT_NIL;
-  return (sp_int)(st.st_mode & 0777);
+  if (!(path && stat(path, &st) == 0 && (st.st_mode & S_IWOTH))) return sp_oint_nil();
+  return sp_oint_of((sp_int)(st.st_mode & 0777));
 }
 sp_int sp_file_do_symlink(const char *oldp, const char *newp) {SP_GC_ROOT_STR(newp);
   if (symlink(oldp, newp) != 0) sp_file_raise_errno("symlink", newp);
@@ -1389,13 +1736,16 @@ void sp_File_ungetbyte(sp_File *f, sp_int byte) {
   SP_IO_OPEN(f);
   ungetc((int)(unsigned char)byte, f->fp);
 }
-/* IO#binmode?: true after #binmode, or for a handle opened in binary mode. */
+/* IO#binmode?: true after #binmode, or for a handle opened in binary mode.
+   A socket is binary too, as CRuby's is (its encoding is BINARY). */
 sp_bool sp_File_binmode_p(sp_File *f) {
   SP_IO_OPEN(f);
-  if (f->bin_flag) return 1;
+  if (f->bin_flag || f->is_sock) return 1;
   return f->mode && strchr(f->mode, 'b') != NULL;
 }
-void sp_File_set_binmode(sp_File *f) { SP_IO_OPEN(f); f->bin_flag = 1; }
+/* binmode makes the external encoding ASCII-8BIT again, whatever an earlier
+   #set_encoding chose */
+void sp_File_set_binmode(sp_File *f) { SP_IO_OPEN(f); f->bin_flag = 1; f->ext_enc = 0; }
 /* The handle flags codegen used to read straight off the struct (#2792,
    #3131): a closed handle answers IOError for them as for everything else.
    #sync= keeps the flush a truthy value implies (#4229). */
@@ -1432,6 +1782,64 @@ sp_File *sp_File_reopen_io(sp_File *f, sp_File *other) {SP_GC_ROOT(f);SP_GC_ROOT
   f->mode = other->mode;
   f->lineno = 0;
   return f;
+}
+/* The fopen mode a descriptor's own access mode answers ("r", "w", "a" or
+   "r+"), as CRuby derives it. A marked literal: the handle keeps the pointer
+   as f->mode, and the collector reads its marker byte. */
+const char *sp_io_fd_mode(int fd) {
+  int fl = fcntl(fd, F_GETFL);
+  int acc = fl >= 0 ? (fl & O_ACCMODE) : O_RDONLY;
+  if (acc == O_WRONLY) return (fl & O_APPEND) ? SPL("a") : SPL("w");
+  if (acc == O_RDWR) return SPL("r+");
+  return SPL("r");
+}
+
+/* IO#dup / #clone: a new handle on a dup(2) of the descriptor, as CRuby makes
+   it. The two share the open file (its offset and status flags) but not the
+   descriptor, so closing or reopening one leaves the other as it was:
+   `orig = $stdout.dup; $stdout.reopen(f); ...; $stdout.reopen(orig)` puts
+   stdout back. The original's stream is first brought to its logical
+   position -- buffered output written, read-ahead given back to the
+   descriptor -- so the copy starts where the original stands. glibc's and
+   musl's fflush do both; BSD's only writes. A descriptor with no offset (a
+   pipe) keeps its read-ahead with the original, as CRuby's does. The copy is close-on-exec, and sync where the
+   original is ($stderr always is). A File::Stat shares the handle type and
+   has no descriptor: it is answered as itself, as before. */
+sp_File *sp_File_dup(sp_File *f, int keep_frozen) {SP_GC_ROOT(f);
+  if (f && f->mode && (strcmp(f->mode, "stat") == 0 || strcmp(f->mode, "lstat") == 0)) return f;
+  SP_IO_OPEN(f);
+  off_t pos = ftello(f->fp);
+  /* Buffered output that cannot be written is an error here, as in CRuby.
+     Only a writable stream is checked: BSD stdio's fflush on a read-only
+     stream fails with EBADF, whatever the descriptor's own mode. */
+  if (fflush(f->fp) != 0 && f->mode && strpbrk(f->mode, "wa+"))
+    sp_file_raise_errno("rb_sys_fail_on_write", f->path ? f->path : "");
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+  /* BSD stdio's fflush leaves a read stream's read-ahead in place: give it
+     back to the descriptor by hand */
+  if (pos >= 0 && lseek(fileno(f->fp), 0, SEEK_CUR) != pos) {
+    fpurge(f->fp);
+    lseek(fileno(f->fp), pos, SEEK_SET);
+  }
+#else
+  (void)pos;
+#endif
+  int d = dup(fileno(f->fp));
+  if (d < 0) sp_file_raise_errno("dup", f->path ? f->path : "");
+  { int fdf = fcntl(d, F_GETFD); if (fdf >= 0) fcntl(d, F_SETFD, fdf | FD_CLOEXEC); }
+  sp_File *g = sp_io_fdopen_ex(d, sp_io_fd_mode(d), 1); SP_GC_ROOT(g);
+  sp_gc_wb((void *)g);
+  g->path = f->path;
+  g->mode = f->mode;
+  g->lineno = f->lineno;
+  g->bin_flag = f->bin_flag;
+  g->ext_enc = f->ext_enc;
+  g->is_sock = f->is_sock;
+  g->rev_lookup = f->rev_lookup;
+  g->is_file = f->is_file;
+  g->frozen = keep_frozen ? f->frozen : 0;
+  if (f->sync_on || f->fp == stderr) sp_File_set_sync(g, 1);
+  return g;
 }
 /* IO#close_on_exec? / #close_on_exec= via the FD_CLOEXEC descriptor flag. */
 sp_bool sp_File_close_on_exec_p(sp_File *f) {
@@ -1515,15 +1923,29 @@ void sp_File_close_half(sp_File *f, sp_bool reading) {SP_GC_ROOT(f);
 /* IO#reopen(path, mode): rebind the handle to another file. */
 sp_File *sp_File_reopen(sp_File *f, const char *path, const char *mode) {SP_GC_ROOT(f);SP_GC_ROOT_STR(path);SP_GC_ROOT_STR(mode); sp_gc_wb((void*)f);
   if (!f) return f;
+  /* with no mode the handle keeps its own, as CRuby's does: a "w" handle
+     reopens for writing (and truncates), an "rb" one stays binary. fopen
+     takes the access part of it only: no encoding suffix, no "x" */
+  char km[8]; const char *om = mode && mode[0] ? mode : "r";
+  if (!(mode && mode[0]) && f->mode && (f->mode[0] == 'r' || f->mode[0] == 'w' || f->mode[0] == 'a')) {
+    int n = 0;
+    for (const char *q = f->mode; *q && *q != ':' && n < (int)sizeof km - 1; q++)
+      if (*q == 'r' || *q == 'w' || *q == 'a' || *q == '+' || *q == 'b') km[n++] = *q;
+    km[n] = 0;
+    om = km;
+  }
   /* a closed handle carries the shared sentinel, which must not be
      reopened: it gets a fresh stream */
-  FILE *nf = (f->closed || !f->fp) ? fopen(path ? path : "", mode && mode[0] ? mode : "r")
-                                   : freopen(path ? path : "", mode && mode[0] ? mode : "r", f->fp);
+  FILE *nf = (f->closed || !f->fp) ? fopen(path ? path : "", om)
+                                   : freopen(path ? path : "", om, f->fp);
   if (!nf) sp_file_raise_errno("reopen", path ? path : "");
   f->fp = nf;
   f->closed = 0;
   f->path = path;
-  f->mode = mode && mode[0] ? mode : "r";
+  /* a mode given replaces the handle's, as CRuby's does: an earlier
+     #binmode or #set_encoding no longer decides what a read answers */
+  if (mode && mode[0]) { f->bin_flag = 0; f->ext_enc = 0; }
+  if (om != km) f->mode = om;
   f->lineno = 0;
   return f;
 }

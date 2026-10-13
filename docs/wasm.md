@@ -28,6 +28,27 @@ runtime archive built for the target, and the module is written to
   (`-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false`; the driver
   passes them).
 
+## A host without exception handling (`--exceptions=abort`)
+
+Some hosts load only modules without the exception-handling instructions
+(wasmtime with `-W exceptions=n`, or an embedder that turns the proposal
+off). `spinel --target=wasm32-wasi --exceptions=abort` builds for them: the
+program and the runtime are compiled without the sjlj lowering and without
+`setjmp`/`longjmp` (`lib/sp_setjmp.h`), against
+`lib/wasm32-wasi/libspinel_rt_noexc.a` and the packages'
+`sp_*_wasi_noexc.o`, which `make wasm-rt` builds too.
+
+- A `raise` runs the `at_exit` hooks, prints what an uncaught exception
+  prints and the module traps (`unreachable`). An `ensure` around it does
+  not run.
+- What needs a frame to catch an exception is refused at compile time,
+  naming the flag: `rescue` (and its modifier form), `retry`,
+  `catch`/`throw`, a `break` out of a block that is not inlined into its
+  method, a `return` out of a proc, and `Fiber`.
+- `exit` ends the program with its status, after the `at_exit` hooks; an
+  `ensure` around it does not run either. A program that neither raises
+  nor exits from inside an `ensure` behaves as without the flag.
+
 ## What is different on this target
 
 - **`Integer` is 32-bit.** `sp_int` is the pointer width
@@ -64,7 +85,17 @@ runtime archive built for the target, and the module is written to
   its own 8 MB; raise it with `wasmtime run -W max-wasm-stack=16777216`.
 - **The GC.** The runtime's slab allocator takes 64 MB of linear memory
   once and gives none of it back (wasm memory only grows); past that every
-  block is a `malloc`.
+  block is a `malloc`. `SPINEL_GC_SLAB_MB=N` in the module's environment
+  takes N MB instead, rounded down to a multiple of 4; below 4, or a value
+  that is not a number, the slab is off, as with `SPINEL_GC_SLAB=0`. The
+  size matters where a host counts the whole memory against a limit,
+  touched or not: the slab's size is added to the memory the module needs
+  with the slab off, so a module of 13 MB with the slab off is 77 MB with
+  the default and 21 MB with `SPINEL_GC_SLAB_MB=8`. The cost shows when the
+  live heap outgrows the slab: an allocation then tries the slab before its
+  `malloc`, and a program allocating 150 MB ran 1.5 times as long with 8 or
+  16 MB as with 64, and about as long with the slab off as with 64. Size it
+  to the heap, or turn it off.
 - **Function size.** wasm engines cap a single function's body (wasmtime:
   7.6 MB). The `setjmp` lowering keeps every live local in memory around
   every call in a function that contains a `rescue`, so a very large

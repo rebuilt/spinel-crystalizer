@@ -5,35 +5,53 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+    # A PR that only touches docs or top-level markdown never affects the
+    # compiler, runtime, or tests; skip CI for it entirely.
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
 
 # One run per branch at a time: a push that supersedes a queued or running
 # run cancels it. Every run was 13 jobs against a small runner pool, and a
 # busy afternoon queued 22 master runs and several per PR branch, so a
 # result arrived hours late; only the newest commit of a branch matters.
+#
+# On master a running run is left to finish: the macOS lane runs there only
+# (see the posix matrix), and its queue is long, so cancelling on every push
+# left no master run with a finished macOS job (five pushes in a row on
+# 2026-09-30). A push that arrives meanwhile waits as the group's one
+# pending run, which a newer push replaces, so master still tests its
+# newest commit next.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The corpus is what a job's wall time is made of (six minutes of the
-  # eight on a 4-vCPU runner). Only the Linux/gcc lane splits it, into two
-  # slices (make's TEST_SHARD=k/n, by position in the sorted list), since
-  # its slice 1 also carries the property gates, the benchmarks and
-  # optcarrot; every other lane runs the whole corpus in one job. Three
-  # slices per lane made a run 13 jobs, and with several pushes an hour
-  # the runner pool, not the tests, set the latency: results arrived hours
-  # after their commit. Slice 1 of each lane carries the C-side test legs.
+  # Every lane runs the whole corpus in one job. The Linux/gcc lane used to
+  # split it into two slices (make's TEST_SHARD=k/n), which shortened that
+  # lane's wall time; but with dozens of PRs open at once the runner pool,
+  # not a job's length, set the latency, and the extra job per run only
+  # lengthened the queue. TEST_SHARD stays in the make call (1/1 picks the
+  # whole corpus) so a lane can be split again by changing its nshards.
+  # Slice 1 of each lane carries the C-side test legs, the property gates,
+  # the benchmarks and optcarrot.
   posix:
-    name: ${{ matrix.os }} / ${{ matrix.cc }} (${{ matrix.shard }}/${{ matrix.nshards }})
+    # The slice shows in the name only when the corpus is split.
+    name: ${{ matrix.os }} / ${{ matrix.cc }}${{ matrix.nshards > 1 && format(' ({0}/{1})', matrix.shard, matrix.nshards) || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # A pull request runs one job: the clang lane, the whole corpus at -O0.
+      # A PR is checked where the maintainer's own gate (gcc, with the
+      # property gates, benchmarks and optcarrot) is not, and every lane --
+      # gcc, clang, macOS, -m32 and wasm -- runs again on the merge commit,
+      # which is where the rest is caught and fixed. With a few dozen PRs
+      # open at once the runner pool, not a job's length, set the latency,
+      # and each PR held four jobs of it. The macOS runners are the fewest,
+      # so that lane stays on master pushes (its queue was 16 minutes at the
+      # median and over an hour at the tail when every PR ran it).
       matrix:
-        include:
-          - { os: ubuntu-latest, cc: gcc, shard: 1, nshards: 2 }
-          - { os: ubuntu-latest, cc: gcc, shard: 2, nshards: 2 }
-          - { os: ubuntu-latest, cc: clang, shard: 1, nshards: 1 }
-          - { os: macos-latest, cc: clang, shard: 1, nshards: 1 }
+        include: ${{ fromJSON(github.event_name == 'push' && '[{"os":"ubuntu-latest","cc":"gcc","shard":1,"nshards":1},{"os":"ubuntu-latest","cc":"clang","shard":1,"nshards":1},{"os":"macos-latest","cc":"clang","shard":1,"nshards":1}]' || '[{"os":"ubuntu-latest","cc":"clang","shard":1,"nshards":1}]') }}
     env:
       # `sccache <cc>` wrapper. sccache forwards through to the
       # underlying compiler when its cache misses, so this stays
@@ -63,7 +81,11 @@ jobs:
       # Keep the server alive across steps. See the pre-start step below.
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
+      # Two commits deep: a pull request's checkout is its merge commit, and
+      # the pre-commit check below compares it with its first parent.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -73,7 +95,7 @@ jobs:
       # earlier one for the same lane and slice, from this branch or from
       # master. Old entries fall to the repository's cache eviction.
       - name: Restore the sccache store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .sccache
           key: sccache-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.shard }}-${{ github.run_id }}
@@ -86,7 +108,16 @@ jobs:
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.4"
+          ruby-version: "4.0"
+
+      # The pre-commit hook's checks (tools/gate.rb check) on what the pull
+      # request changes: the merge commit against its first parent, the base
+      # it merges into. A commit made without the hook reached master past
+      # them, and the next contributor's hook then refused a merge of master
+      # it did not write. It needs no build, so it runs first and fails fast.
+      - name: Check the change as the pre-commit hook does
+        if: github.event_name == 'pull_request'
+        run: ruby tools/gate.rb check-range HEAD^1 HEAD
 
       # coreutils is NOT preinstalled on the macOS runners, so `timeout` and
       # `gtimeout` were both absent and the whole suite ran with no time limit:
@@ -110,7 +141,9 @@ jobs:
         # Opt level is compiler-specific -- they behave oppositely on the
         # spinel_rt.h-heavy per-test TUs (800+ static fns):
         #   gcc:   -O1 prunes unreferenced statics + DCEs before the costly
-        #          codegen, so -O1 compiles ~9x FASTER than -O0 (2.7 vs 25ms).
+        #          codegen, so -O1 compiles faster than -O0 (0.54 vs 0.94 s a
+        #          file on 2026-10-05; the header was far smaller when this
+        #          was first measured at 2.7 vs 25 ms).
         #   clang: -O1 still runs the full optimizer over every emitted inline
         #          static, so -O1 is ~2.5x SLOWER than -O0 (213 vs 88ms/file).
         # So gcc builds tests at -O1 and clang at -O0. Correctness is opt-level
@@ -127,27 +160,53 @@ jobs:
         # the -m32 lane paid until it got the same wrapper. The override
         # is kept as the spelling of the opt level per compiler; NO_CCACHE=1
         # would be the way to actually unwrap.
-        run: make -j$(getconf _NPROCESSORS_ONLN) ${{ matrix.shard == 1 && 'test' || 'test-corpus' }} TEST_SHARD=${{ matrix.shard }}/${{ matrix.nshards }} ${{ matrix.cc == 'clang' && 'OPT=-O0 CC=clang' || 'OPT=-O1 CC=gcc' }}
+        #
+        # The gcc lane runs one eighth of the corpus, a different eighth each
+        # run (the run number picks it), beside the C-side legs. The whole
+        # corpus under gcc is what `make gate` runs before every push to
+        # master, so the lane repeated it, and it had become the slowest job
+        # by far: 45 minutes of a 51-minute job on run 37272572814. Nearly
+        # every push touches lib/spinel_rt.h, which every test's C includes,
+        # so sccache missed on 96% of 6,366 compiles, and gcc takes about
+        # 0.5 s a file on this header where clang -O0 takes 0.08 s (1.4 s on
+        # the runner). The clang lanes and the -m32 lane still run every
+        # test; the eighth keeps a different gcc than the maintainer's own
+        # in the loop.
+        run: |
+          shard="${{ matrix.shard }}/${{ matrix.nshards }}"
+          if [ "${{ matrix.cc }}" = gcc ]; then shard="$(( GITHUB_RUN_NUMBER % 8 + 1 ))/8"; fi
+          # the Linux clang lane on a master push: a quarter, rotating. The maintainer's own
+          # pre-push lanes (clang, clang -m32, wasm32 on a separate machine) run the whole
+          # corpus before every push, so this lane was repeating them (2026-10-07); a pull
+          # request still runs all of it.
+          if [ "${{ matrix.cc }}" = clang ] && [ "${{ matrix.os }}" = ubuntu-latest ] && [ "${{ github.event_name }}" = push ]; then shard="$(( GITHUB_RUN_NUMBER % 4 + 1 ))/4"; fi
+          # macOS on a master push: a rotating quarter plus every test whose answer depends on the
+          # operating system (tools/os_sensitive.re: time, files, processes, signals, sockets, threads,
+          # the GC, FFI) and the packages' tests, which is where its failures have been. It was the
+          # whole corpus, 20 of the run's 21 minutes. Add a pattern to the file when a test fails here
+          # alone and the pattern would have kept it in.
+          always=""
+          if [ "${{ matrix.os }}" = macos-latest ] && [ "${{ github.event_name }}" = push ]; then
+            shard="$(( GITHUB_RUN_NUMBER % 4 + 1 ))/4"
+            always="TEST_ALWAYS=tools/os_sensitive.re"
+          fi
+          echo "corpus slice: $shard $always"
+          make -j$(getconf _NPROCESSORS_ONLN) ${{ matrix.shard == 1 && 'test' || 'test-corpus' }} TEST_SHARD=$shard $always ${{ matrix.cc == 'clang' && 'OPT=-O0 CC=clang' || 'OPT=-O1 CC=gcc' }}
 
-      # Inference/allocation property gates. These assert the SHAPE of the
-      # generated C -- that a slot keeps its typed representation, that the
-      # alloc report keeps its format -- which the output diffs above cannot
-      # see: a boxed hash still prints the right answer. They lived only in the
-      # local `make check` target, so an Int-keyed hash lost its typed variant
-      # and stayed that way for weeks with CI green throughout. Linux/gcc only:
-      # what they read is compiler- and OS-independent.
-      - name: Run inference and allocation property gates
+      # spin's end-to-end check: it builds real projects, which a clean
+      # checkout on another machine is worth seeing. Linux/gcc only.
+      #
+      # alloc-report-test, infer-test and scale-test ran here too. What they
+      # read is the generated C and a count of the front end's work, neither
+      # of which depends on the machine or the C compiler, and `make gate`
+      # runs all three before every push to master (gate-props), so the lane
+      # only repeated an answer already known: about 3.5 minutes a run. They
+      # were put here when the pre-push gate did not include them (an Int-
+      # keyed hash lost its typed variant for weeks with CI green); it has
+      # since.
+      - name: Run spin's end-to-end check
         if: matrix.os == 'ubuntu-latest' && matrix.cc == 'gcc' && matrix.shard == 1
-        run: make alloc-report-test infer-test spin-check
-
-      # The front end's scaling, as a work ratio between a program and one four
-      # times its size (see scale-test in the Makefile). A per-node rescan of
-      # the node table has come back four times, each found weeks late by hand
-      # profiling (rubys/roundhouse#72); this makes the next one a red build.
-      # The count is deterministic, so one lane is enough.
-      - name: Run the front-end scaling test
-        if: matrix.os == 'ubuntu-latest' && matrix.cc == 'gcc' && matrix.shard == 1
-        run: make -j$(getconf _NPROCESSORS_ONLN) build/spinel-work && make scale-test
+        run: make spin-check
 
       # Benchmark integration test. Compiles every benchmark/*.rb through
       # the full pipeline (cc -Werror) and diffs the output against CRuby.
@@ -196,11 +255,25 @@ jobs:
   # 148 s for the same slice), the whole difference was the cache. The
   # -m32 flag is part of sccache's key, so this lane's entries never
   # collide with the 64-bit gcc lane's.
+  #
+  # master pushes only, not pull requests. A commit that changes the runtime
+  # headers, or codegen every program goes through, misses sccache for the
+  # whole corpus, and the one-job lane then compiles all ~4500 programs on four
+  # vCPUs: 27 minutes, against 3 on a warm cache. Every PR waited on that. A
+  # word-size break a PR brings is found on its merge commit instead, and
+  # fixed there; splitting the lane into slices would halve it but take one
+  # more runner per run, which is what queues the pool when pushes cluster.
   linux32:
-    name: ubuntu-latest / gcc -m32
+    name: ubuntu-latest / clang -m32
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # A hung apt-get in the toolchain step held this job for over four
+    # hours on 2026-10-01, and with it the master concurrency group: every
+    # later push waited as the group's pending run. The lane takes about
+    # 20 minutes.
+    timeout-minutes: 60
     env:
-      CC: sccache gcc -m32
+      CC: sccache clang -m32
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       SCCACHE_STARTUP_TIMEOUT: "30"
       SCCACHE_IDLE_TIMEOUT: "0"
@@ -211,11 +284,11 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Restore the sccache store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .sccache
-          key: sccache-ubuntu-latest-gcc-m32-${{ github.run_id }}
-          restore-keys: sccache-ubuntu-latest-gcc-m32-
+          key: sccache-ubuntu-latest-clang-m32-${{ github.run_id }}
+          restore-keys: sccache-ubuntu-latest-clang-m32-
 
       - name: Pre-start sccache server
         run: sccache --start-server
@@ -223,9 +296,10 @@ jobs:
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.4"
+          ruby-version: "4.0"
 
       - name: Install the 32-bit toolchain
+        timeout-minutes: 10
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
@@ -237,8 +311,75 @@ jobs:
       - name: Build (parse + regexp + spinelc), 32-bit
         run: make -j$(getconf _NPROCESSORS_ONLN) all
 
+      # clang -O0: the lane checks word-size assumptions, not what an
+      # optimizer makes of them, and the corpus is all compile time. Nearly
+      # every push misses sccache for the whole corpus (the runtime header
+      # changed), and on that header gcc -m32 -Og takes 0.34 s a file where
+      # clang -m32 -O0 with its precompiled header takes 0.10 s; an eighth
+      # of the corpus ran in 32 s against 14 s on 16 cores (2026-10-05).
+      # Under gcc the lane took 26 to 28 minutes of a run.
+      # A quarter of the corpus per push, rotating by run number: the maintainer's pre-push
+      # -m32 lane runs the whole corpus (2026-10-07), so this one repeated it in 9 minutes.
       - name: Run the test corpus as 32-bit programs
-        run: make -j$(getconf _NPROCESSORS_ONLN) test-corpus OPT=-O1
+        run: |
+          shard="$(( GITHUB_RUN_NUMBER % 4 + 1 ))/4"
+          echo "corpus slice: $shard"
+          make -j$(getconf _NPROCESSORS_ONLN) test-corpus OPT=-O0 TEST_SHARD=$shard
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # The other two Integer overflow modes. The corpus ran only under the
+  # default raise mode, so a change that broke wrap or promote was found
+  # from outside the repo, if at all (#8331). Master pushes only, as the
+  # 32-bit and macOS lanes: a pull request keeps its one job. The tests a
+  # mode answers otherwise today are listed in test/int-overflow/<mode>-skip.txt,
+  # and a gap leaves its list with its fix. clang -O0, as the 32-bit lane:
+  # the lane checks what the mode answers, not what an optimizer makes of it.
+  int-overflow:
+    name: ubuntu-latest / --int-overflow=${{ matrix.mode }}
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [wrap, promote]
+    env:
+      CC: sccache clang
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_STARTUP_TIMEOUT: "30"
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Restore the sccache store
+        uses: actions/cache@v6
+        with:
+          path: .sccache
+          key: sccache-ubuntu-latest-clang-${{ matrix.mode }}-${{ github.run_id }}
+          restore-keys: sccache-ubuntu-latest-clang-${{ matrix.mode }}-
+
+      - name: Pre-start sccache server
+        run: sccache --start-server
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build (parse + regexp + spinelc)
+        run: make -j$(getconf _NPROCESSORS_ONLN) all
+
+      - name: Run the test corpus under --int-overflow=${{ matrix.mode }}
+        run: make -j$(getconf _NPROCESSORS_ONLN) test-corpus OPT=-O0 SPINEL_INT_OVERFLOW=${{ matrix.mode }}
 
       - name: sccache stats
         if: always()
@@ -262,6 +403,9 @@ jobs:
   # doing nothing.
   wasm:
     name: wasm32-wasi
+    # master pushes only, as the -m32 and macOS lanes: a PR runs the clang
+    # lane alone (see the matrix above)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
       # docs/wasm.md asks for 34 or later (the exnref lowering)
@@ -280,7 +424,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Restore the sccache store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .sccache
           key: sccache-wasm-${{ github.run_id }}
@@ -292,11 +436,11 @@ jobs:
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.4"
+          ruby-version: "4.0"
 
       - name: Restore the wasi-sdk
         id: wasi-sdk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .wasi-sdk
           key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-x86_64-linux

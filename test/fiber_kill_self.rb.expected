@@ -1,0 +1,23 @@
+f ensure
+nil
+false
+1
+nil
+false
+t ensure
+nil
+nil
+false
+:outer_done
+thread ensure
+nil
+a ensure
+nil
+main goes on
+"fiber called across threads"
+true
+"attempt to resume a transferring fiber"
+:t3_done
+"attempt to resume a transferring fiber"
+main ensure
+at_exit

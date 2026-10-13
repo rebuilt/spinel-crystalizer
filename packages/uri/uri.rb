@@ -7,8 +7,11 @@
 #
 # * only http, https and a bare/relative form parse; there is no URI::FTP,
 #   URI::LDAP, URI::MailTo, URI::WS, or the scheme registry behind them
-# * userinfo, fragment and opaque are parsed and readable, but there is no
-#   #merge, #route_to, #normalize or #select
+# * userinfo, fragment and opaque are parsed and readable; #merge (and #+,
+#   URI.join) resolves a reference, but there is no #merge!, #route_to,
+#   #route_from, #normalize or #select
+# * an absent port reads as 0 when the scheme has no default, where CRuby
+#   answers nil; the other absent components are nil, as in CRuby
 # * URI.encode_www_form_component / .decode_www_form_component are here
 #   because a query builder needs them; the URI.escape family CRuby removed
 #   is not
@@ -19,6 +22,66 @@ module URI
   class InvalidURIError < Error
   end
 
+  class BadURIError < Error
+  end
+
+  # The regexp sources CRuby's RFC 2396 parser builds itself from, which a
+  # server reads to match what a request carries -- webrick matches a Host
+  # header with `URI::RFC2396_Parser.new.pattern.fetch(:HOST)`. #pattern
+  # answers the table up to :USERINFO, each source spelled as CRuby spells
+  # it; the path and whole-URI patterns after it, the #regexp table, and
+  # the parser's own #parse/#split/#escape are absent.
+  class RFC2396_Parser
+    module PATTERN
+      ALPHA = "a-zA-Z"
+      ALNUM = "#{ALPHA}\\d"
+      HEX = "a-fA-F\\d"
+      ESCAPED = "%[#{HEX}]{2}"
+      UNRESERVED = "\\-_.!~*'()#{ALNUM}"
+      RESERVED = ";/?:@&=+$,\\[\\]"
+      DOMLABEL = "(?:[#{ALNUM}](?:[-#{ALNUM}]*[#{ALNUM}])?)"
+      TOPLABEL = "(?:[#{ALPHA}](?:[-#{ALNUM}]*[#{ALNUM}])?)"
+    end
+
+    attr_reader :pattern
+
+    def initialize
+      escaped = PATTERN::ESCAPED
+      unreserved = PATTERN::UNRESERVED
+      reserved = PATTERN::RESERVED
+      uric = "(?:[#{unreserved}#{reserved}]|#{escaped})"
+      hostname = "(?:[a-zA-Z0-9\\-.]|%\\h\\h)+"
+      ipv4addr = "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"
+      hex4 = "[#{PATTERN::HEX}]{1,4}"
+      lastpart = "(?:#{hex4}|#{ipv4addr})"
+      hexseq1 = "(?:#{hex4}:)*#{hex4}"
+      hexseq2 = "(?:#{hex4}:)*#{lastpart}"
+      ipv6addr = "(?:#{hexseq2}|(?:#{hexseq1})?::(?:#{hexseq2})?)"
+      ipv6ref = "\\[#{ipv6addr}\\]"
+      host = "(?:#{hostname}|#{ipv4addr}|#{ipv6ref})"
+      port = "\\d*"
+      @pattern = {
+        ESCAPED: escaped,
+        UNRESERVED: unreserved,
+        RESERVED: reserved,
+        DOMLABEL: PATTERN::DOMLABEL,
+        TOPLABEL: PATTERN::TOPLABEL,
+        HOSTNAME: hostname,
+        URIC: uric,
+        URIC_NO_SLASH: "(?:[#{unreserved};?:@&=+$,]|#{escaped})",
+        QUERY: "#{uric}*",
+        FRAGMENT: "#{uric}*",
+        IPV4ADDR: ipv4addr,
+        IPV6ADDR: ipv6addr,
+        IPV6REF: ipv6ref,
+        HOST: host,
+        PORT: port,
+        HOSTPORT: "#{host}(?::#{port})?",
+        USERINFO: "(?:[#{unreserved};:&=+$,]|#{escaped})*",
+      }
+    end
+  end
+
   class Generic
     attr_reader :scheme, :userinfo, :host, :port, :path, :query, :fragment
     # The component writers CRuby's Generic has: a parsed URI is edited
@@ -27,6 +90,10 @@ module URI
     # validates the new component and raises InvalidComponentError on a
     # bad one, which is absent here the way the rest of the subset is.
     attr_writer :scheme, :userinfo, :host, :port, :path, :query, :fragment
+
+    # What follows the scheme of a URI with no hierarchy ("isbn:1" in
+    # "urn:isbn:1"); nil for every other URI.
+    attr_accessor :opaque
 
     def hostname=(value)
       @host = value
@@ -40,6 +107,13 @@ module URI
       @path = path
       @query = query
       @fragment = fragment
+      @opaque = nil
+    end
+
+    # true when the URI names a scheme -- a full URL rather than a bare
+    # path such as a request line's "/hello"
+    def absolute?
+      !@scheme.nil? && !@scheme.empty?
     end
 
     def default_port
@@ -54,7 +128,7 @@ module URI
     # path is empty -- `URI("http://example.com").request_uri` is "/".
     def request_uri
       p = (@path.nil? || @path.empty?) ? "/" : @path
-      @query.nil? || @query.empty? ? p : "#{p}?#{@query}"
+      @query.nil? ? p : "#{p}?#{@query}"
     end
 
     # the host without the brackets an IPv6 address carries in a URI, as
@@ -66,16 +140,119 @@ module URI
 
     def to_s
       s = String.new
-      s << "#{@scheme}://" unless @scheme.nil? || @scheme.empty?
-      s << "#{@userinfo}@" unless @userinfo.nil? || @userinfo.empty?
-      s << @host.to_s
-      # A cleared port (`uri.port = nil`) is omitted, as CRuby omits it.
-      s << ":#{@port}" if !@port.nil? && @port != default_port && @port > 0
-      s << @path.to_s
-      s << "?#{@query}" unless @query.nil? || @query.empty?
-      s << "##{@fragment}" unless @fragment.nil? || @fragment.empty?
+      s << "#{@scheme}:" unless @scheme.nil? || @scheme.empty?
+      if @opaque.nil?
+        # The authority's "//" goes in whenever there is a host, so a
+        # network-path reference ("//host/x") keeps it; file URIs keep
+        # it with an empty host, as CRuby does ("file:///etc").
+        s << "//" if !@host.nil? || @scheme == "file" || @scheme == "postgres"
+        s << "#{@userinfo}@" unless @userinfo.nil?
+        s << @host.to_s
+        # A cleared port (`uri.port = nil`) is omitted, as CRuby omits it.
+        s << ":#{@port}" if !@port.nil? && @port != default_port && @port > 0
+        s << @path.to_s
+        s << "?#{@query}" unless @query.nil?
+      else
+        s << @opaque
+      end
+      s << "##{@fragment}" unless @fragment.nil?
       s
     end
+
+    # Resolves +oth+ (a URI or a String) against this URI, as CRuby's
+    # URI::Generic#merge does: an absolute reference is returned as it is,
+    # one with an authority ("//host/x") keeps only the scheme, an absolute
+    # path replaces the path, and a relative path is merged with this one's
+    # directory, "." and ".." segments removed. The query and fragment come
+    # from the reference. Raises BadURIError when both URIs are relative.
+    def merge(oth)
+      rel = URI.for_merge(oth)
+      return rel if rel.absolute?
+      raise BadURIError, "both URI are relative" unless absolute?
+
+      base = dup
+      authority = !rel.userinfo.nil? || !rel.host.nil? ||
+                  (!rel.port.nil? && rel.port > 0)
+
+      # Only a fragment (or nothing at all): this URI with that fragment.
+      if (rel.path.nil? || rel.path.empty?) && !authority && rel.query.nil?
+        base.fragment = rel.fragment unless rel.fragment.nil?
+        return base
+      end
+
+      base.query = nil
+      base.fragment = nil
+      if authority
+        # The reference's authority replaces the base's whole: a port it
+        # leaves out is the scheme's default, not the base's.
+        base.userinfo = rel.userinfo
+        base.host = rel.host
+        base.port = !rel.port.nil? && rel.port > 0 ? rel.port : base.default_port
+        base.path = rel.path.to_s
+      elsif base.opaque.nil?
+        base.path = merge_path(base.path.to_s, rel.path.to_s)
+      end
+      base.query = rel.query unless rel.query.nil?
+      base.fragment = rel.fragment unless rel.fragment.nil?
+      base
+    end
+    def +(oth)
+      merge(oth)
+    end
+
+    private
+
+    # The path of #merge for a relative-path reference: +rel+ appended to
+    # the directory of +base+, then its "." and ".." segments resolved; a
+    # ".." that would climb above the root is dropped.
+    def merge_path(base, rel)
+      base_path = base.split("/", -1)
+      rel_path = rel.split("/", -1)
+
+      base_path << "" if base_path.last == ".."
+      while (i = base_path.index(".."))
+        base_path.slice!(i - 1, 2)
+      end
+
+      first = rel_path.first
+      if first && first.empty?
+        base_path.clear
+        rel_path.shift
+      end
+
+      rel_path.push("") if rel_path.last == "." || rel_path.last == ".."
+      rel_path.delete(".")
+
+      tmp = []
+      rel_path.each do |x|
+        if x == ".." && !(tmp.empty? || tmp.last == "..")
+          tmp.pop
+        else
+          tmp << x
+        end
+      end
+
+      add_trailer_slash = !tmp.empty?
+      if base_path.empty?
+        base_path = [""]
+      elsif add_trailer_slash
+        base_path.pop
+      end
+      while (x = tmp.shift)
+        if x == ".."
+          base_path.pop if base_path.size > 1
+        else
+          base_path << x
+          tmp.each { |t| base_path << t }
+          add_trailer_slash = false
+          break
+        end
+      end
+      base_path.push("") if add_trailer_slash
+      base_path.join("/")
+    end
+
+    public
 
     def inspect
       "#<#{self.class}: #{self}>"
@@ -131,7 +308,7 @@ module URI
     nil
   end
 
-  def self.decode_www_form_component(str)
+  def self.decode_www_form_component(str, enc = Encoding::UTF_8)
     out = String.new
     s = str.to_s
     i = 0
@@ -152,14 +329,83 @@ module URI
         i += 1
       end
     end
-    out
+    out.force_encoding(enc)
+  end
+
+  # The www-form decoding of one key or value: "+" is a space and a "%" with two
+  # hex digits is that byte. Unlike decode_www_form_component, a "%" that is not
+  # followed by two hex digits is left as it is, not an error.
+  def self.decode_www_form_lenient(s, enc = Encoding::UTF_8)
+    out = String.new
+    i = 0
+    while i < s.length
+      ch = s[i]
+      if ch == "+"
+        out << " "
+        i += 1
+      elsif ch == "%" && hex_digit(s[i + 1]) && hex_digit(s[i + 2])
+        out << (hex_digit(s[i + 1]) * 16 + hex_digit(s[i + 2])).chr
+        i += 3
+      else
+        out << ch
+        i += 1
+      end
+    end
+    out.force_encoding(enc).scrub
+  end
+
+  # `URI.decode_www_form("a=1&b=x+y")` -> [["a", "1"], ["b", "x y"]]. Keys and
+  # values take the encoding argument, UTF-8 by default. `use__charset_` is not
+  # supported.
+  def self.decode_www_form(str, enc = Encoding::UTF_8, separator: "&", use__charset_: false, isindex: false)
+    raise ArgumentError, "the input of URI.decode_www_form must be ASCII only string" unless str.ascii_only?
+    raise NotImplementedError, "URI.decode_www_form: use__charset_ is not supported" if use__charset_
+    raise NotImplementedError, "URI.decode_www_form: an empty separator is not supported" if separator.empty?
+    ary = []
+    return ary if str.empty?
+    pos = 0
+    n = str.length
+    sl = separator.length
+    while pos < n
+      e = str.index(separator, pos)
+      if e
+        piece = str[pos, e - pos]
+        pos = e + sl
+      else
+        piece = str[pos, n - pos]
+        pos = n
+      end
+      eq = piece.index("=")
+      key = eq ? piece[0, eq] : piece
+      val = eq ? piece[eq + 1, piece.length - eq - 1] : ""
+      if isindex
+        if eq.nil?
+          val = key
+          key = ""
+        end
+        isindex = false
+      end
+      ary << [decode_www_form_lenient(key, enc), decode_www_form_lenient(val, enc)]
+    end
+    ary
   end
 
   # `URI.encode_www_form({"a" => 1, "b" => "x y"})` -> "a=1&b=x+y"
   def self.encode_www_form(pairs)
     parts = []
     pairs.each do |k, v|
-      parts << "#{encode_www_form_component(k)}=#{encode_www_form_component(v)}"
+      key = encode_www_form_component(k)
+      if v.nil?
+        parts << key
+      elsif v.respond_to?(:to_ary)
+        values = []
+        v.to_ary.each do |item|
+          values << (item.nil? ? "" : "#{key}=#{encode_www_form_component(item)}")
+        end
+        parts << values.join("&")
+      else
+        parts << "#{key}=#{encode_www_form_component(v)}"
+      end
     end
     parts.join("&")
   end
@@ -188,7 +434,9 @@ module URI
     fi = s.index("#")
     qi = nil if qi && fi && fi < qi          # `#a?b` is all fragment
     auth_end = -1
-    ai = s.index("://")
+    # the authority follows "scheme://", or the "//" that opens a
+    # network-path reference ("//[::1]:81/x")
+    ai = s.start_with?("//") ? -1 : s.index("://")
     if ai
       auth_end = s.length
       i = ai + 3
@@ -244,53 +492,70 @@ module URI
     false
   end
 
+  # Splits +str+ the RFC 3986 way: an optional "scheme:", then either an
+  # opaque part (a scheme followed by no "/", as in "urn:isbn:1") or a
+  # hierarchical part -- an optional "//authority", the path, "?query" --
+  # and "#fragment". With no scheme it is a relative reference: "c" and
+  # "../d" are paths, and only "//host/x" carries a host.
   def self.parse(str)
     s = str.to_s
     raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}" if invalid_char?(s)
+
+    fragment = nil
+    fi = s.index("#")
+    if fi
+      fragment = s[(fi + 1)..-1].to_s
+      s = s[0, fi]
+    end
+
     scheme = ""
     rest = s
-    idx = s.index("://")
-    if idx
-      scheme = s[0, idx].downcase
-      rest = s[(idx + 3)..-1].to_s
+    ci = s.index(":")
+    if ci && ci > 0 && s[0, ci] =~ /\A[A-Za-z][A-Za-z0-9+\-.]*\z/
+      scheme = s[0, ci].downcase
+      rest = s[(ci + 1)..-1].to_s
     end
 
-    fragment = ""
-    fi = rest.index("#")
-    if fi
-      fragment = rest[(fi + 1)..-1].to_s
-      rest = rest[0, fi]
+    if !scheme.empty? && !rest.empty? && !rest.start_with?("/")
+      u = Generic.new(scheme, nil, nil, 0, "", nil, fragment)
+      u.opaque = rest
+      return u
     end
 
-    query = ""
+    query = nil
     qi = rest.index("?")
     if qi
       query = rest[(qi + 1)..-1].to_s
       rest = rest[0, qi]
     end
 
-    authority = rest
-    path = ""
-    pi = rest.index("/")
-    if pi
-      authority = rest[0, pi]
-      path = rest[pi..-1].to_s
+    authority = nil
+    path = rest
+    if rest.start_with?("//")
+      authority = rest[2..-1].to_s
+      path = ""
+      pi = authority.index("/")
+      if pi
+        path = authority[pi..-1].to_s
+        authority = authority[0, pi]
+      end
     end
 
-    userinfo = ""
-    ai = authority.index("@")
-    if ai
-      userinfo = authority[0, ai]
-      authority = authority[(ai + 1)..-1].to_s
-    end
-
-    host = authority
+    userinfo = nil
+    host = nil
     port = 0
-    ci = authority.rindex(":")
-    if ci && !authority[(ci + 1)..-1].to_s.empty? &&
-       authority[(ci + 1)..-1].to_s =~ /\A[0-9]+\z/
-      host = authority[0, ci]
-      port = authority[(ci + 1)..-1].to_i
+    if authority
+      ai = authority.index("@")
+      if ai
+        userinfo = authority[0, ai]
+        authority = authority[(ai + 1)..-1].to_s
+      end
+      host = authority
+      ci = authority.rindex(":")
+      if ci && authority[(ci + 1)..-1].to_s =~ /\A[0-9]*\z/
+        host = authority[0, ci]
+        port = authority[(ci + 1)..-1].to_i
+      end
     end
 
     if port == 0
@@ -307,29 +572,89 @@ module URI
     end
   end
 
-  def self.join(base, rel)
-    b = parse(base.to_s)
-    r = rel.to_s
-    return parse(r) if r.include?("://")
-    if r.start_with?("/")
-      path = r
+  # #merge's argument: a URI as it is, a String parsed.
+  def self.for_merge(oth)
+    if oth.is_a?(Generic)
+      oth
+    elsif oth.is_a?(String)
+      parse(oth)
     else
-      dir = b.path.to_s
-      cut = dir.rindex("/")
-      dir = cut ? dir[0, cut + 1] : "/"
-      path = dir + r
+      raise ArgumentError, "bad argument (expected URI object or URI string)"
     end
-    q = ""
-    qi = path.index("?")
-    if qi
-      q = path[(qi + 1)..-1].to_s
-      path = path[0, qi]
+  end
+
+  # The RFC 2396 parser's #make_regexp, the pattern CRuby builds for an
+  # absolute URI. The rest of the parser (#split, #parse, #escape, the
+  # pattern and regexp tables) is not here.
+  class RFC2396_Parser
+    def make_regexp(schemes = nil)
+      x = x_abs_uri
+      return Regexp.new(x, Regexp::EXTENDED) unless schemes
+      Regexp.new("(?=(?i:#{Regexp.union(*schemes).source}):)#{x}", Regexp::EXTENDED)
     end
-    if b.scheme == "https"
-      HTTPS.new(b.scheme, b.userinfo, b.host, b.port, path, q, "")
-    else
-      HTTP.new(b.scheme, b.userinfo, b.host, b.port, path, q, "")
+
+    private
+
+    # The pieces of CRuby's initialize_pattern the absolute-URI pattern uses.
+    def x_abs_uri
+      alpha = "a-zA-Z"
+      alnum = "#{alpha}\\d"
+      hex = "a-fA-F\\d"
+      escaped = "%[#{hex}]{2}"
+      unreserved = "\\-_.!~*'()#{alnum}"
+      reserved = ";/?:@&=+$,\\[\\]"
+      uric = "(?:[#{unreserved}#{reserved}]|#{escaped})"
+      uric_no_slash = "(?:[#{unreserved};?:@&=+$,]|#{escaped})"
+      query = "#{uric}*"
+      fragment = "#{uric}*"
+      hostname = "(?:[a-zA-Z0-9\\-.]|%\\h\\h)+"
+      ipv4addr = "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"
+      hex4 = "[#{hex}]{1,4}"
+      lastpart = "(?:#{hex4}|#{ipv4addr})"
+      hexseq1 = "(?:#{hex4}:)*#{hex4}"
+      hexseq2 = "(?:#{hex4}:)*#{lastpart}"
+      ipv6addr = "(?:#{hexseq2}|(?:#{hexseq1})?::(?:#{hexseq2})?)"
+      ipv6ref = "\\[#{ipv6addr}\\]"
+      host = "(?:#{hostname}|#{ipv4addr}|#{ipv6ref})"
+      userinfo = "(?:[#{unreserved};:&=+$,]|#{escaped})*"
+      pchar = "(?:[#{unreserved}:@&=+$,]|#{escaped})"
+      param = "#{pchar}*"
+      segment = "#{pchar}*(?:;#{param})*"
+      path_segments = "#{segment}(?:/#{segment})*"
+      reg_name = "(?:[#{unreserved}$,;:@&=+]|#{escaped})+"
+      scheme = "[#{alpha}][\\-+.#{alpha}\\d]*"
+      abs_path = "/#{path_segments}"
+      opaque_part = "#{uric_no_slash}#{uric}*"
+      "
+        (#{scheme}):                           (?# 1: scheme)
+        (?:
+           (#{opaque_part})                    (?# 2: opaque)
+        |
+           (?:(?:
+             //(?:
+                 (?:(?:(#{userinfo})@)?        (?# 3: userinfo)
+                   (?:(#{host})(?::(\\d*))?))? (?# 4: host, 5: port)
+               |
+                 (#{reg_name})                 (?# 6: registry)
+               )
+             |
+             (?!//))                           (?# XXX: '//' is the mark for hostport)
+             (#{abs_path})?                    (?# 7: path)
+           )(?:\\?(#{query}))?                 (?# 8: query)
+        )
+        (?:\\#(#{fragment}))?                  (?# 9: fragment)
+      "
     end
+  end
+
+  RFC2396_PARSER = RFC2396_Parser.new
+
+  # `URI.join("http://example.com/a/", "b", "../c")`: the first argument
+  # parsed, then each of the rest merged onto it in turn.
+  def self.join(base, *rels)
+    u = for_merge(base)
+    rels.each { |r| u = u.merge(r) }
+    u
   end
 end
 

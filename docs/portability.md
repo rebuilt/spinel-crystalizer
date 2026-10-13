@@ -34,6 +34,7 @@ source and every generated program sees it.
 | `SP_ATOMIC_*` | the `__atomic` builtins | the plain operation: only the single-threaded runtime can use it |
 | `SP_THREAD_LOCAL` | `__thread` | C11 `_Thread_local` |
 | `SP_WEAK` | `__attribute__((weak))` | none; the jemalloc probe that uses it is compiled out |
+| `SP_HAVE_X86_SHA`, `SP_TARGET_X86_SHA` | on x86-64, `__attribute__((target("sha,sse4.1")))` for a function its caller reaches only after asking the CPU | 0: the function is not compiled, and SHA-256 stays the portable C |
 
 ## `PORTABLE=1`: take every fallback
 
@@ -49,11 +50,10 @@ Use a tree of its own for it: the objects differ, and make does not rebuild on
 a change of flags. For a program of your own, compile the generated C and the
 runtime with `-DSP_PORTABLE`.
 
-Two things keep the extension under `SP_PORTABLE`, because the program needs
-them to be correct rather than fast. The threaded runtime (`SP_THREADS`) keeps
+One thing keeps the extension under `SP_PORTABLE`, because the program needs
+it to be correct rather than fast: the threaded runtime (`SP_THREADS`) keeps
 the `__atomic` builtins; C11 atomics would need the shared variables declared
-`_Atomic`. `SP_FLOAT_NIL_CONST` keeps `__builtin_nan("0x1")`, the nil
-sentinel of a `Float?` slot, which has to be a constant expression.
+`_Atomic`.
 
 `SP_PORTABLE` costs speed. optcarrot runs about 25% slower, 21 points of it
 from losing the forced inlining of the generated C; the benchmarks that run
@@ -72,8 +72,7 @@ generated C until the generator writes them differently:
   temporaries the generator splices;
 - `__attribute__((constructor))`, the runtime's start-up hooks;
 - the `__asm__` label on `--ffi` declarations, and the fiber context switch,
-  written in assembly per architecture;
-- `SP_FLOAT_NIL_CONST`, above.
+  written in assembly per architecture.
 
 With `-D_DEFAULT_SOURCE` for the POSIX declarations, the runtime compiles under
 `-std=c11 -pedantic` with only one kind of diagnostic: a function pointer kept

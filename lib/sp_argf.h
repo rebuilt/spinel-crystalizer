@@ -23,6 +23,22 @@ extern sp_Argf sp_argf_obj;            /* defined in the generated TU */
 extern sp_StrArray *sp_argv_array_cache;
 
 sp_StrArray *sp_get_ARGV(void);
+
+/* $LOADED_FEATURES (`$"`): an Array of Strings the program reads and pushes
+   onto. It starts empty: the files the program requires were compiled into
+   it rather than loaded as it runs, so none is listed. Allocated lazily by
+   sp_get_loaded_features (lib/sp_cold.c) and marked with the runtime
+   globals, as ARGV's array is. */
+extern sp_StrArray *sp_loaded_features_cache;
+sp_StrArray *sp_get_loaded_features(void);
+
+/* $LOAD_PATH (`$:`, `$-I`): an Array of Strings the program reads and
+   changes. It starts empty: requires are resolved when the program is
+   compiled, so there is no directory to look in as it runs, and a change
+   the program makes to it looks nothing up. Allocated and marked as
+   $LOADED_FEATURES' array is. */
+extern sp_StrArray *sp_load_path_cache;
+sp_StrArray *sp_get_load_path(void);
 int sp_argf_ensure(void);
 const char *sp_argf_gets(void);
 const char *sp_argf_read(void);

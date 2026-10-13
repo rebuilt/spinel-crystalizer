@@ -19,11 +19,14 @@ They are different mechanisms and stay distinct:
 |---|---|---|
 | `require_relative "path"` | a project-local file, spliced into the program | always; a missing file is a **compile error** |
 | `require "name"` | a named **feature** (bundled stdlib, native, or -- planned -- a package) | the feature must exist, else a **compile error** |
+| `Kernel.require "name"` / `::Kernel.require "name"` | the same as the bare `require` | as above; any other receiver (`obj.require`) is an ordinary method call |
 
 `require` is *not* a runtime file load. Spinel is a whole-program
-ahead-of-time compiler, so every `require` is known at compile time and there is
-no `$LOAD_PATH` to mutate at runtime. A `require` that names something Spinel
-cannot provide is reported when you compile, not when you run.
+ahead-of-time compiler, so every `require` is known at compile time and no
+directory is searched at runtime. `$LOAD_PATH` (`$:`, `$-I`) is still an Array
+of Strings the program can read and change, but it starts empty and a change to
+it looks nothing up. A `require` that names something Spinel cannot provide is
+reported when you compile, not when you run.
 
 ## The require-gate
 
@@ -57,6 +60,7 @@ These are provided by Spinel but, like CRuby, only after their `require`:
 | `require "monitor"` | `Monitor` (`#synchronize`) | `NameError` (uninitialized constant) |
 | `require "socket"` | `TCPServer`, `TCPSocket`, `UDPSocket`, `UNIXServer`, `UNIXSocket`, `Socket`, `Addrinfo` | `NameError` (uninitialized constant) |
 | `require "pathname"` | `Pathname` | uninitialized constant |
+| `require "pathname"` | `Pathname()` (the `Kernel` conversion method) | `NoMethodError` |
 | `require "io/console"` | `IO#winsize` | `NoMethodError` |
 | `require "time"` | `Time#iso8601` | `NoMethodError` |
 | `require "bigdecimal"` | `BigDecimal`, `BigDecimal()` (a minimal subset: see `packages/bigdecimal/bigdecimal.rb`) | `NoMethodError` (`BigDecimal()`) |
@@ -119,20 +123,31 @@ A few `require`s name a capability Spinel already provides as core, and are
 
 Some stdlib ships with Spinel as Ruby source and is spliced when required --
 `set`, `forwardable`, `optparse`, `erb`, `csv`, `pathname`, `digest`, `base64`,
-`fileutils`, `tmpdir`, `zlib`, `benchmark` (CRuby's own gem, unmodified),
-`bigdecimal` (a minimal subset, see `packages/bigdecimal/bigdecimal.rb`)
+`fileutils`, `tmpdir`, `zlib`, `open3` (the capture forms), `pty` (`PTY.spawn`; not on
+wasm32-wasi, which has no fork), `fiddle` (where libffi is,
+like `ffi`),
+`benchmark` (CRuby's own gem, unmodified), `shellwords` (likewise), `find` (likewise, but for one line; see its note),
+`fileutils`, `tmpdir`, `zlib`, `logger` (a compact implementation of its API),
+`benchmark` (CRuby's own gem, unmodified),
+`bigdecimal` (a minimal subset, see `packages/bigdecimal/bigdecimal.rb`),
+`singleton` and `timeout` (compact implementations of their API; `Timeout.timeout`
+interrupts through `Thread#raise`, so not on the main thread yet)
 (plus the `stringio`/`strscan`/`json` marker shims for their C-backed
 features). `net/http` and `uri` are there, and so
 is `openssl` -- the one that is conditional: it is glue over the system libssl, so it exists only where those
 headers did at build time, and `require "openssl"` is otherwise the
-unsatisfiable require it is for any library Spinel does not carry. Each lives as an ordinary
+unsatisfiable require it is for any library Spinel does not carry. Where the
+build found a keg-only OpenSSL (Homebrew's `openssl@3`), the compiler records
+that library directory and links a program's `-lssl -lcrypto` against it, so
+no `LIBRARY_PATH` is needed after `make`. Each lives as an ordinary
 spinelgem under `packages/<name>/` beside the compiler (`packages/set/set.rb` with
 its `spin.toml`); `lib/` holds only the C runtime. The `require` pulls in
 the package's file like any other package -- pre-installed just means no fetch.
 
 Two of these are also spliced **implicitly**, because CRuby provides them with
-no require at all: a program that references `Set` (or calls `.to_set`) gets
-`require "set"` prepended, and one that references `IO::Buffer` gets
+no require at all: a program that references `Set` (or calls `.to_set`)
+anywhere, in the entry file or in a file it requires, gets `require "set"`
+prepended, and one that references `IO::Buffer` gets
 `require "io/buffer"` (packages/io) the same way. Writing the require
 explicitly is fine too -- the splice only fills it in when absent.
 
@@ -145,6 +160,8 @@ feature search root, then a `require` resolves against it:
 ```sh
 spinel -I mylibs main.rb
 ```
+
+The `-I` roots are searched before the packages bundled with the compiler (`packages/`), so a project's own package of the same name as a bundled one (an `openssl` of its own, say) is the one a `require` reaches. The compiler's `lib/` comes first and is not shadowed.
 
 A feature name is a path, looked up in each `-I` root in two forms:
 

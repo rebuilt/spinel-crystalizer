@@ -1,18 +1,22 @@
 /* sp_format.c -- cold value-type display helpers (see sp_format.h).
    Self-contained: the shared value types (sp_types.h) + string allocator
-   (sp_alloc.h) + libc formatting only. */
+   (sp_alloc.h) + libc formatting, and sp_time.c's Time renderer. */
 #include "sp_format.h"
 #include "sp_alloc.h"   /* sp_str_alloc_raw, sp_raise_cls, <math.h> for cos/sin/sqrt */
 #include "sp_dtoa.h"    /* sp_format_float (locale-independent %g) */
 #include <stdio.h>
 #include <string.h>
-#include <time.h>       /* gmtime / strftime for sp_Time_inspect */
+#include "sp_time.h"   /* sp_time_inspect_v / sp_time_to_s_v */
+#include "sp_range.h"  /* sp_range_inspect */
 
 /* Format a non-negative Complex-component magnitude the way MRI does: infinite
    and NaN values become the Ruby names Infinity/NaN (not C's inf/nan), a
    Float-classed component (is_f) renders Ruby-float style ("2.0"), a whole
-   Integer-classed value stays integer-looking, else %g. Returns the length. */
-static int sp_complex_mag(char *out, size_t sz, sp_float v, int is_f) {SP_GC_ROOT_STR(out);
+   Integer-classed value stays integer-looking, else %g. Returns the length.
+   `out` is the caller's stack buffer, not a String: it is not rooted (the
+   collector's mark read the byte before the array for a tag, and could have
+   taken a neighbouring local's byte for one). */
+static int sp_complex_mag(char *out, size_t sz, sp_float v, int is_f) {
   if (isinf(v)) return snprintf(out, sz, "Infinity");
   if (isnan(v)) return snprintf(out, sz, "NaN");
   if (is_f) return snprintf(out, sz, "%s", sp_float_to_s(v));
@@ -25,7 +29,7 @@ static int sp_complex_mag(char *out, size_t sz, sp_float v, int is_f) {SP_GC_ROO
 /* Append the imaginary part ("+<mag>i" / "-<mag>i") to buf. MRI inserts a `*`
    before a non-numeric magnitude (Infinity/NaN) so `Infinity*i` stays readable,
    while a plain number is written as `10i`. */
-static int sp_complex_imag(char *buf, int n, size_t sz, sp_float im, int is_f) {SP_GC_ROOT_STR(buf);
+static int sp_complex_imag(char *buf, int n, size_t sz, sp_float im, int is_f) {   /* buf: a stack buffer, as above */
   if (n < 0 || (size_t)n >= sz) return 0;
   char mag[64];
   sp_complex_mag(mag, sizeof mag, im < 0 ? -im : im, is_f);
@@ -79,36 +83,18 @@ const char *sp_rational_to_s(sp_Rational r) {
   return o;
 }
 
-const char *sp_Range_inspect(sp_Range *r) {SP_GC_ROOT(r);
-  /* "first..last" / "first...last" form. Buffer sized for two int64s + dots. */
-  char *buf = sp_str_alloc_raw(48);
-  snprintf(buf, 48, r->excl ? "%lld...%lld" : "%lld..%lld", (long long)r->first, (long long)r->last);
-  return buf;
+/* A boxed Range renders as the typed one does: an open side is left out
+   ("..3", "1.."). */
+const char *sp_Range_inspect(sp_Range *r) {
+  return sp_range_inspect(*r);
 }
 
-/* "YYYY-MM-DD HH:MM:SS UTC" via gmtime: the spinel runtime keeps Time
-   timezone-naive, so UTC is the unambiguous choice that needs no tzdata. */
-static const char *sp_Time_fmt(sp_Time *t, int frac) {SP_GC_ROOT(t);
-  char *buf = sp_str_alloc_raw(48);
-  time_t sec = (time_t)t->tv_sec;
-  struct tm *tm_ = gmtime(&sec);
-  if (tm_) {
-    size_t n = strftime(buf, 48, "%Y-%m-%d %H:%M:%S", tm_);
-    if (frac && t->tv_nsec != 0) {
-      /* fractional seconds, trailing zeros trimmed (matches sp_time_inspect_v) */
-      n += (size_t)snprintf(buf + n, 48 - n, ".%09d", (int)t->tv_nsec);
-      while (buf[n - 1] == '0') buf[--n] = 0;
-    }
-    snprintf(buf + n, 48 - n, " UTC");
-  }
-  else {
-    snprintf(buf, 48, "Time(%lld)", (long long)t->tv_sec);
-  }
-  return buf;
-}
-/* Time#inspect renders fractional seconds; Time#to_s does not. */
-const char *sp_Time_inspect(sp_Time *t) {SP_GC_ROOT(t); return sp_Time_fmt(t, 1); }
-const char *sp_Time_to_s(sp_Time *t)    {SP_GC_ROOT(t); return sp_Time_fmt(t, 0); }
+/* A boxed Time renders as an unboxed one does (lib/sp_time.c): its own
+   zone kind and offset, the year in Ruby's form. A gmtime + strftime
+   rendering here called every Time UTC, and C's %Y left a year below 1000
+   unpadded on glibc. */
+const char *sp_Time_inspect(sp_Time *t) {SP_GC_ROOT(t); return sp_time_inspect_v(*t); }
+const char *sp_Time_to_s(sp_Time *t)    {SP_GC_ROOT(t); return sp_time_to_s_v(*t); }
 
 /* ---- Complex arithmetic ---- */
 /* Component-class (fl) propagation mirrors CRuby's numeric tower: add/sub act
@@ -189,46 +175,22 @@ sp_Complex sp_complex_pow_rational(sp_Complex z, sp_Rational w) {
    Intermediate products use a wider type; a result that does not fit back into
    sp_int raises RangeError (mruby promotes to Bigint -- a later phase can too).
    A 128-bit integer covers the 64-bit build (see sp_rat_wide below); int64 covers two int32 operands losslessly. */
-static sp_int sp_rational_gcd_i(sp_int a, sp_int b) {
-  if (a < 0) a = -a;
-  if (b < 0) b = -b;
-  while (b) { sp_int t = b; b = a % b; a = t; }
-  return a;
-}
 sp_Rational sp_rational_new(sp_int n, sp_int d) {
   sp_Rational r;
   if (d == 0) { r.num = n; r.den = 0; return r; }
-  if (d < 0) { n = -n; d = -d; }
-  sp_int g = sp_rational_gcd_i(n, d);
-  if (g <= 0) g = 1;
-  r.num = n / g;
-  r.den = d / g;
+  /* reduced over the magnitudes, taken unsigned, before the sign moves to
+     the numerator: negating a -2**63 end first overflowed */
+  uintptr_t a = n < 0 ? (uintptr_t)0 - (uintptr_t)n : (uintptr_t)n;
+  uintptr_t b = d < 0 ? (uintptr_t)0 - (uintptr_t)d : (uintptr_t)d;
+  uintptr_t g = a, h = b;
+  while (h) { uintptr_t t = h; h = g % h; g = t; }
+  a /= g; b /= g;
+  uintptr_t neg = (n < 0) != (d < 0);
+  if (b > (uintptr_t)INTPTR_MAX || a > (uintptr_t)INTPTR_MAX + neg)
+    sp_raise_cls("RangeError", "Rational out of sp_int range");
+  r.num = (sp_int)(neg ? (uintptr_t)0 - a : a);
+  r.den = (sp_int)b;
   return r;
-}
-/* String#to_r: parse a leading numeric of the form [ws][sign]digits[.digits][/digits],
-   stopping at the first non-numeric byte; an unparseable string is 0/1 (MRI). */
-sp_Rational sp_str_to_r(const char *s) {SP_GC_ROOT_STR(s);
-  if (!s) return sp_rational_new(0, 1);
-  const char *p = s;
-  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
-  sp_int sign = 1;
-  if (*p == '+') p++;
-  else if (*p == '-') { sign = -1; p++; }
-  sp_int num = 0, den = 1;
-  int any = 0;
-  while (*p >= '0' && *p <= '9') { num = num * 10 + (*p - '0'); p++; any = 1; }
-  if (*p == '.') {
-    p++;
-    while (*p >= '0' && *p <= '9') { num = num * 10 + (*p - '0'); den *= 10; p++; any = 1; }
-  }
-  if (*p == '/') {
-    p++;
-    sp_int d2 = 0; int anyd = 0;
-    while (*p >= '0' && *p <= '9') { d2 = d2 * 10 + (*p - '0'); p++; anyd = 1; }
-    if (anyd) { if (d2 == 0) sp_raise_cls("ZeroDivisionError", "divided by 0"); den *= d2; }
-  }
-  if (!any) return sp_rational_new(0, 1);
-  return sp_rational_new(sign * num, den);
 }
 /* Kernel#Rational(String): unlike String#to_r, the whole string must be a
    rational literal -- trailing text, an empty string and a second `/` are all
@@ -281,11 +243,13 @@ sp_Rational sp_str_to_r_strict(const char *s) {SP_GC_ROOT_STR(s);
    type would, for an intermediate the reduction would have brought back. */
 #if INTPTR_MAX > 0x7fffffff && SP_HAVE_INT128
 typedef sp_int128 sp_rat_wide;
+typedef sp_uint128 sp_rat_uwide;
 # define SP_RAT_MUL(a, b) ((sp_rat_wide)(a) * (b))
 # define SP_RAT_ADD(a, b) ((a) + (b))
 # define SP_RAT_SUB(a, b) ((a) - (b))
 #elif INTPTR_MAX > 0x7fffffff
 typedef long long sp_rat_wide;
+typedef unsigned long long sp_rat_uwide;
 static void sp_rat_ovf(void) { sp_raise_cls("RangeError", "Rational out of sp_int range"); }
 static sp_rat_wide sp_rat_mul_ck(sp_rat_wide a, sp_rat_wide b) {
   intptr_t r; if (sp_ckd_mul_iptr((intptr_t)a, (intptr_t)b, &r)) sp_rat_ovf(); return r;
@@ -301,12 +265,15 @@ static sp_rat_wide sp_rat_sub_ck(sp_rat_wide a, sp_rat_wide b) {
 # define SP_RAT_SUB(a, b) sp_rat_sub_ck(a, b)
 #else
 typedef long long sp_rat_wide;
+typedef unsigned long long sp_rat_uwide;
 # define SP_RAT_MUL(a, b) ((sp_rat_wide)(a) * (b))
 # define SP_RAT_ADD(a, b) ((a) + (b))
 # define SP_RAT_SUB(a, b) ((a) - (b))
 #endif
+/* -2**63 fits (a numerator or an answer of exactly that value, as CRuby);
+   the negations below raise for it rather than overflow */
 static sp_int sp_rat_fit(sp_rat_wide v) {
-  if (v > (sp_rat_wide)INTPTR_MAX || v < (sp_rat_wide)(-INTPTR_MAX))
+  if (v > (sp_rat_wide)INTPTR_MAX || v < (sp_rat_wide)INTPTR_MIN)
     sp_raise_cls("RangeError", "Rational out of sp_int range");
   return (sp_int)v;
 }
@@ -317,16 +284,179 @@ static sp_int sp_rat_fit(sp_rat_wide v) {
 sp_Rational sp_rational_new_i64(int64_t n, int64_t d);
 static sp_Rational sp_rational_new_wide(sp_rat_wide n, sp_rat_wide d) {
   if (d == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
-  if (d < 0) { n = -n; d = -d; }
-  sp_rat_wide a = n < 0 ? -n : n, b = d;
-  while (b) { sp_rat_wide t = b; b = a % b; a = t; }
-  if (a <= 0) a = 1;
+  /* reduced over the magnitudes, taken unsigned in sp_rat_wide's full width
+     (a 128-bit product is not cut to its low 64 bits, and |-2**63| is no
+     long long), before the sign moves to the numerator */
+  sp_rat_uwide a = n < 0 ? (sp_rat_uwide)0 - (sp_rat_uwide)n : (sp_rat_uwide)n;
+  sp_rat_uwide b = d < 0 ? (sp_rat_uwide)0 - (sp_rat_uwide)d : (sp_rat_uwide)d;
+  sp_rat_uwide g = a, h = b;
+  while (h) { sp_rat_uwide t = h; h = g % h; g = t; }
+  a /= g; b /= g;
+  int neg = (n < 0) != (d < 0);
+  if (b > (sp_rat_uwide)INTPTR_MAX || a > (sp_rat_uwide)INTPTR_MAX + (sp_rat_uwide)neg)
+    sp_raise_cls("RangeError", "Rational out of sp_int range");
   sp_Rational r;
-  r.num = sp_rat_fit(n / a);
-  r.den = sp_rat_fit(d / a);
+  r.num = (sp_int)(neg ? (uintptr_t)0 - (uintptr_t)a : (uintptr_t)a);
+  r.den = (sp_int)b;
   return r;
 }
 sp_Rational sp_rational_new_i64(int64_t n, int64_t d) { return sp_rational_new_wide((sp_rat_wide)n, (sp_rat_wide)d); }
+/* ---- String#to_r ----
+   A number is read as CRuby's read_num reads it: digits, an optional `.` and
+   digits, an optional exponent (`e`, a sign, digits), a single `_` allowed
+   between two digits (and after the zeros that begin a run); a `.` with no
+   digit after it is consumed, and so are an `e` and its sign with no digit
+   after them. The text is [ws][sign]number[/number]; it stops at the first
+   byte that fits nothing, and an unparseable String is 0/1.
+
+   A number is kept as a magnitude m in the wide type and a power of ten e,
+   the trailing zeros of its digits counted into e rather than multiplied in,
+   so 1.000000000000000000000 and 1000000000000000000000e-21 are 1. The two
+   sides meet as (m1/m2) * 10^(e1 - e2) with the gcd of the magnitudes taken
+   first and the powers of 2 and 5 of the ten cancelled against the side they
+   divide, so 5e40/1e40 is 5 and 5e-19 is 1/(2*10^18). A magnitude past the
+   wide type, an exponent past a quarter of it and a result that does not fit
+   64 bits are a RangeError (CRuby answers a Bignum Rational or a Float, or
+   raises for an exponent it cannot use), raised unless the other side is
+   zero: 0/<huge> is 0/1 and <huge>/0 is a ZeroDivisionError. */
+#define SP_RATW_TOP ((sp_rat_wide)1 << (sizeof(sp_rat_wide) * 8 - 2))
+#define SP_RATW_MAX (SP_RATW_TOP - 1 + SP_RATW_TOP)
+typedef struct { sp_rat_wide m; sp_rat_wide e; int ovf; } sp_str_to_r_q;
+static sp_rat_wide sp_str_to_r_step(sp_rat_wide m, sp_int add, sp_int mul, int *ovf) {
+  if (*ovf) return m;
+  if (m > (SP_RATW_MAX - add) / mul) { *ovf = 1; return m; }
+  return m * mul + add;
+}
+static sp_rat_wide sp_str_to_r_gcd(sp_rat_wide a, sp_rat_wide b) {
+  while (b) { sp_rat_wide t = a % b; a = b; b = t; }
+  return a;
+}
+/* a run of digits into the magnitude *m, trailing zeros held back in *z */
+static const char *sp_str_to_r_run(const char *p, sp_rat_wide *m, sp_int *z, sp_int *nd, int *ovf) {
+  if (*p == '0') {
+    /* the zeros that begin a run, and a `_` between them, are read together
+       (CRuby squeezes them at the start of the integer, the fraction and the
+       exponent alike) */
+    int us = 0;
+    while (*p == '0' || *p == '_') {
+      if (*p == '_') {
+        if (++us >= 2) break;
+      }
+      else {
+        us = 0;
+        (*nd)++;
+        if (*m != 0) (*z)++;
+      }
+      p++;
+    }
+  }
+  while (*p >= '0' && *p <= '9') {
+    sp_int d = (sp_int)(*p - '0');
+    if (d == 0) {
+      if (*m != 0) (*z)++;
+    }
+    else {
+      for (; *z > 0 && !*ovf; (*z)--) *m = sp_str_to_r_step(*m, 0, 10, ovf);
+      *z = 0;
+      *m = sp_str_to_r_step(*m, d, 10, ovf);
+    }
+    (*nd)++; p++;
+    if (*p == '_' && p[1] >= '0' && p[1] <= '9') p++;
+  }
+  return p;
+}
+static int sp_str_to_r_number(const char **pp, sp_str_to_r_q *q) {
+  const char *p = *pp;
+  sp_rat_wide m = 0;
+  sp_int z = 0, nd = 0, fd = 0;
+  sp_rat_wide e = 0;
+  int ovf = 0, eneg = 0, ehuge = 0;
+  if (*p != '.') {
+    p = sp_str_to_r_run(p, &m, &z, &nd, &ovf);
+    if (!nd) return 0;
+  }
+  if (*p == '.') {
+    p++;
+    p = sp_str_to_r_run(p, &m, &z, &fd, &ovf);
+    if (!fd) goto scaled;
+  }
+  if ((*p == 'e' || *p == 'E') && p[1]) {
+    p++;
+    if (*p == '+') p++;
+    else if (*p == '-') { eneg = 1; p++; }
+    sp_rat_wide ev = 0;
+    sp_int ez = 0, ed = 0;
+    int eovf = 0;
+    const char *t = sp_str_to_r_run(p, &ev, &ez, &ed, &eovf);
+    if (ed) {
+      p = t;
+      for (; ez > 0 && !eovf; ez--) ev = sp_str_to_r_step(ev, 0, 10, &eovf);
+      if (eovf || ev > (SP_RATW_TOP >> 1)) {
+        ehuge = 1;
+      }
+      else {
+        e = ev;
+      }
+    }
+  }
+scaled:
+  *pp = p;
+  q->m = 0; q->e = 0; q->ovf = 0;
+  if (m == 0 && !ovf) return 1;
+  if (ovf || ehuge) { q->ovf = 1; return 1; }
+  q->m = m;
+  q->e = (sp_rat_wide)z - fd + (eneg ? -e : e);
+  return 1;
+}
+sp_Rational sp_str_to_r(const char *s) {SP_GC_ROOT_STR(s);
+  if (!s) return sp_rational_new(0, 1);
+  const char *p = s;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
+  int neg = 0;
+  if (*p == '+') p++;
+  else if (*p == '-') { neg = 1; p++; }
+  sp_str_to_r_q a, b;
+  int hb = 0;
+  if (!sp_str_to_r_number(&p, &a)) return sp_rational_new(0, 1);
+  if (*p == '/') { const char *t = p + 1; hb = sp_str_to_r_number(&t, &b); }
+  if (hb && !b.ovf && b.m == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
+  if (!a.ovf && a.m == 0) return sp_rational_new(0, 1);
+  if (a.ovf || (hb && b.ovf)) sp_raise_cls("RangeError", "Rational out of sp_int range");
+  sp_rat_wide n = a.m, d = 1;
+  sp_rat_wide k = a.e;
+  if (hb) {
+    sp_rat_wide g = sp_str_to_r_gcd(n, b.m);
+    n /= g;
+    d = b.m / g;
+    k -= b.e;
+  }
+  int ovf = 0;
+  sp_rat_wide c2 = 0, c5 = 0;
+  if (k >= 0) {
+    while (c2 < k && d % 2 == 0) { d /= 2; c2++; }
+    while (c5 < k && d % 5 == 0) { d /= 5; c5++; }
+    for (sp_rat_wide i = c2; i < k && !ovf; i++) n = sp_str_to_r_step(n, 0, 2, &ovf);
+    for (sp_rat_wide i = c5; i < k && !ovf; i++) n = sp_str_to_r_step(n, 0, 5, &ovf);
+  }
+  else {
+    sp_rat_wide kk = -k;
+    while (c2 < kk && n % 2 == 0) { n /= 2; c2++; }
+    while (c5 < kk && n % 5 == 0) { n /= 5; c5++; }
+    for (sp_rat_wide i = c2; i < kk && !ovf; i++) d = sp_str_to_r_step(d, 0, 2, &ovf);
+    for (sp_rat_wide i = c5; i < kk && !ovf; i++) d = sp_str_to_r_step(d, 0, 5, &ovf);
+  }
+  if (ovf) sp_raise_cls("RangeError", "Rational out of sp_int range");
+  /* -INTPTR_MAX - 1 fits sp_int but not sp_rat_fit's symmetric range */
+  sp_Rational r;
+  if (sizeof(sp_rat_wide) > sizeof(sp_int) && neg && n - 1 == (sp_rat_wide)INTPTR_MAX) {
+    if (d > (sp_rat_wide)INTPTR_MAX) sp_raise_cls("RangeError", "Rational out of sp_int range");
+    r.num = (sp_int)(-INTPTR_MAX - 1); r.den = (sp_int)d;
+    return r;
+  }
+  if (n > (sp_rat_wide)INTPTR_MAX || d > (sp_rat_wide)INTPTR_MAX) sp_raise_cls("RangeError", "Rational out of sp_int range");
+  r.num = neg ? -(sp_int)n : (sp_int)n; r.den = (sp_int)d;
+  return r;
+}
 sp_Rational sp_rational_add(sp_Rational a, sp_Rational b) {
   return sp_rational_new_wide(SP_RAT_ADD(SP_RAT_MUL(a.num, b.den), SP_RAT_MUL(b.num, a.den)),
                               SP_RAT_MUL(a.den, b.den));
@@ -342,8 +472,8 @@ sp_Rational sp_rational_div(sp_Rational a, sp_Rational b) {
   if (b.num == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
   return sp_rational_new_wide(SP_RAT_MUL(a.num, b.den), SP_RAT_MUL(a.den, b.num));
 }
-sp_Rational sp_rational_neg(sp_Rational a) { a.num = -a.num; return a; }
-sp_Rational sp_rational_abs(sp_Rational a) { if (a.num < 0) a.num = -a.num; return a; }
+sp_Rational sp_rational_neg(sp_Rational a) { if (a.num == INTPTR_MIN) sp_raise_cls("RangeError", "Rational out of sp_int range"); a.num = -a.num; return a; }
+sp_Rational sp_rational_abs(sp_Rational a) { if (a.num == INTPTR_MIN) sp_raise_cls("RangeError", "Rational out of sp_int range"); if (a.num < 0) a.num = -a.num; return a; }
 sp_int sp_rational_cmp(sp_Rational a, sp_Rational b) {
   sp_rat_wide l = SP_RAT_MUL(a.num, b.den), r = SP_RAT_MUL(b.num, a.den);
   return l < r ? -1 : (l > r ? 1 : 0);

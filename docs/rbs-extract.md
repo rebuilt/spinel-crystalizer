@@ -7,6 +7,9 @@ line-oriented seed file, passes it to the compiler through the
 `SPINEL_RBS_SEED` environment variable, and the analyzer applies it
 before the inference fixpoint.
 
+The same signatures can be written as comments in the Ruby source;
+see [inline-rbs.md](inline-rbs.md). They pin the same slots.
+
 A signature that spinel cannot represent is dropped, and dropping is
 harmless: the seed line isn't emitted and the analyzer falls back to its
 normal inference for that method or ivar. The rest of this document is
@@ -82,7 +85,9 @@ Everything else is left alone on purpose:
 - `nil` is legal in every slot.
 - `Integer` and a bignum convert at the boundary.
 - A by-value object (`Range`, `Time`, `Complex`, `Rational`) is a struct,
-  not a pointer, so the families do not apply.
+  not a pointer, so the families do not apply -- except at a return, where
+  a `Time` or a `Range` is a family of its own: the function returns it by
+  value, and nothing converts it into another declared type.
 - A value that is `poly` or not yet inferred makes no static claim. That
   is the dynamic case, and it is what `-DSP_RBS_CHECK` is for.
 
@@ -186,7 +191,7 @@ the field layouts coincide by construction.
 | `TrueClass`, `FalseClass`              | `bool`                                |
 | `NilClass`, `nil`                      | `nil`                                 |
 | `bool`                                 | `bool`                                |
-| `void` (return only)                   | `nil`                                 |
+| `void` (return only)                   | `-` (no pin: unused, not typed)       |
 | `Foo`, `Foo::Bar` (nominal)            | `obj_Foo`, `obj_Foo_Bar`              |
 | `Array[Integer]`                       | `int_array`                           |
 | `Array[Float]`                         | `float_array`                         |
@@ -264,6 +269,7 @@ so the boxed fallback is never silent.
 - `def self.name: (...) -> R` -- class method (`cmeth`)
 - `def self?.name: (...) -> R` -- emits both `meth` and `cmeth`
 - `attr_accessor`, `attr_reader`, `attr_writer` -- emits `ivar`
+- `@name: T` instance variable declarations -- emits `ivar`
 
 ### Unqualified type resolution
 
@@ -278,8 +284,13 @@ not implemented.
 
 ### Method signature shapes
 
-- Multiple overloads -- only the first overload is considered; if the
-  first is itself out-of-subset the whole method is skipped.
+- Overloaded methods -- several `|`-separated signatures, or one that
+  adds to another declaration with `| ...` (in any file of the
+  directory). A seed pins one signature, and the method takes what every
+  overload takes, so seeding any single overload would pin it narrower
+  than its calls: `Array.wrap: (nil) -> Array[untyped] | ...` would pin
+  its parameter to nil. The method is left to inference, as an
+  overloaded inline signature is (see [inline-rbs.md](inline-rbs.md)).
 - Optional positional params (`?String`)
 - Rest positional params (`*args`)
 - Trailing positional params
@@ -317,7 +328,7 @@ than emitted partially.
 - `include`, `extend`, `prepend` -- mixin ancestry not modeled
 - `public`, `private`
 - `alias`
-- `@ivar` / `@@cvar` declarations (use `attr_*` for ivars)
+- `@@cvar` declarations
 
 ## Seed file format
 
@@ -330,6 +341,9 @@ class <QualifiedName>           # enter class scope; nested names use `_`
 meth <name> <ret> <ptypes>      # `-` means "leave alone"; ptypes is
 cmeth <name> <ret> <ptypes>     # comma-separated, or `-` for nullary
 ivar <name> <type>
+src <file>:<line>               # --positions only: the .rbs line the next
+                                # seed is from (named when an inline RBS
+                                # annotation disagrees with it)
 ```
 
 Lines whose first token isn't a keyword are treated as comments.
@@ -341,18 +355,19 @@ type's C slot still has an inhabitant left to spell nil with:
 
 | Token                         | Pinned to        | nil is        |
 |-------------------------------|------------------|---------------|
-| `int?`                        | `sp_int`        | `SP_INT_NIL`  |
-| `float?`                      | `sp_float`      | a NaN payload |
+| `int?`                        | `sp_oint`       | the `nil` flag beside the word |
+| `float?`                      | `sp_ofloat`     | the `nil` flag beside the word |
 | `string?`, `obj_X?`, `*_array?`, `*_hash?` | the pointer | `NULL`   |
 | `bool?`, `symbol?`            | `sp_RbVal`       | `SP_TAG_NIL`  |
 
-`sp_bool` and `sp_sym` have no spare inhabitant -- `0` is `false`, and
-symbol `0` is a real symbol -- so `bool?` and `Symbol?` pin to the boxed
+`sp_int` and `sp_float` keep every bit pattern as a value (`INT64_MIN`, a
+NaN of any payload), so `int?` and `float?` carry their nil out of band in
+a flag. `sp_bool` and `sp_sym` have no spare inhabitant -- `0` is `false`,
+and symbol `0` is a real symbol -- so `bool?` and `Symbol?` pin to the boxed
 tagged union rather than collapsing nil onto `false` / `:""` (#3412).
-A poly value narrowed into one of the sentinel-carrying slots goes
-through `sp_poly_as_int_or_nil` / `sp_poly_as_float_or_nil`, which map
-the nil tag to the sentinel instead of reading the zero payload beneath
-it.
+A poly value narrowed into a flagged slot goes through `sp_unbox_oint`
+(and its Float counterpart), which maps the nil tag to the flag instead of
+reading the zero payload beneath it.
 
 ## Follow-up
 

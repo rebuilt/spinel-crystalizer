@@ -19,9 +19,10 @@
 # * no proxy support, no cookie jar, no automatic redirect following
 #   (#get_response hands back the 3xx and its Location, as CRuby's does)
 # * no streaming body block on #request; the body is read whole
-# * chunked transfer decoding is here; content-encoding (gzip) is not
+# * a gzip or deflate body is inflated whole once it is read; not streamed
 require "socket"
 require "uri"
+require "zlib"
 
 module Timeout
   # CRuby's base for both of the timeouts below, so `rescue Timeout::Error`
@@ -31,7 +32,39 @@ module Timeout
 end
 
 module Net
-  class HTTPError < StandardError
+  # The part of CRuby's protocol error tree the HTTP errors sit under, so a
+  # `rescue Net::ProtocolError` catches what it catches there.
+  class ProtocolError < StandardError; end
+  class ProtoFatalError < ProtocolError; end
+  class ProtoServerError < ProtocolError; end
+  class ProtoRetriableError < ProtocolError; end
+
+  # The response an HTTP error came from, as CRuby carries it. The package
+  # also raises HTTPError itself with a message alone (no status line at
+  # all), so the response is optional here.
+  module HTTPExceptions
+    def initialize(msg, res = nil)
+      super(msg)
+      @response = res
+    end
+
+    attr_reader :response
+  end
+
+  class HTTPError < ProtocolError
+    include HTTPExceptions
+  end
+
+  class HTTPRetriableError < ProtoRetriableError
+    include HTTPExceptions
+  end
+
+  class HTTPClientException < ProtoServerError
+    include HTTPExceptions
+  end
+
+  class HTTPFatalError < ProtoFatalError
+    include HTTPExceptions
   end
 
   # Raised when the peer accepts the connection and then says nothing for
@@ -71,36 +104,89 @@ module Net
       nil
     end
 
+    # The media type alone, as CRuby answers it: `text/html; charset=utf-8`
+    # reads `text/html`. The whole header made a type check written against
+    # CRuby (`res.content_type == "text/html"`) fail for nearly every real
+    # server, which sends the charset. Case is kept, as CRuby keeps it, and
+    # so is CRuby's main_type/sub_type split: a third `/` part is dropped and
+    # an empty subtype leaves the main type alone (`text/` reads `text`).
     def content_type
-      @headers["content-type"]
+      v = @headers["content-type"]
+      return nil if v.nil?
+      parts = v.split(";", 2)[0].to_s.split("/")
+      main = parts[0].to_s.strip
+      return main if parts.length < 2
+      main + "/" + parts[1].to_s.strip
+    end
+
+    # Raises unless the response is a 2xx, as CRuby's does. The message is the
+    # code and the quoted reason (`404 "Not Found"`), the class comes from the
+    # family (error_type below) and the exception carries the response.
+    def value
+      error! unless is_a?(HTTPSuccess)
+    end
+
+    def error!
+      message = @code
+      message = "#{message} #{@message.dump}" unless @message.nil?
+      raise error_type.new(message, self)
+    end
+
+    # CRuby's EXCEPTION_TYPE of the family: a 3xx is retriable, a 4xx the
+    # client's error, a 5xx fatal, and anything else a plain HTTPError.
+    def error_type
+      HTTPError
     end
   end
 
   # The response family. CRuby's success test is `res.is_a?(Net::HTTPSuccess)`
   # rather than a predicate on the code, so the classes have to exist for that
   # line to compile. The families are all here; of the per-code classes only
-  # the ones a client actually names are, which is the usual subset rule.
+  # the ones a client actually names are, which is the usual subset rule:
+  # the common ones, and those an API client branches on (202, 304, the
+  # 307/308 redirects, 405, 409, 410, 422, 429, 502, 503, 504).
   class HTTPInformation < HTTPResponse; end
   class HTTPSuccess < HTTPResponse; end
-  class HTTPRedirection < HTTPResponse; end
-  class HTTPClientError < HTTPResponse; end
-  class HTTPServerError < HTTPResponse; end
+
+  class HTTPRedirection < HTTPResponse
+    def error_type = HTTPRetriableError
+  end
+
+  class HTTPClientError < HTTPResponse
+    def error_type = HTTPClientException
+  end
+
+  class HTTPServerError < HTTPResponse
+    def error_type = HTTPFatalError
+  end
 
   class HTTPOK < HTTPSuccess; end
   class HTTPCreated < HTTPSuccess; end
+  class HTTPAccepted < HTTPSuccess; end
   class HTTPNoContent < HTTPSuccess; end
   class HTTPMovedPermanently < HTTPRedirection; end
   class HTTPFound < HTTPRedirection; end
+  class HTTPNotModified < HTTPRedirection; end
+  class HTTPTemporaryRedirect < HTTPRedirection; end
+  class HTTPPermanentRedirect < HTTPRedirection; end
   class HTTPBadRequest < HTTPClientError; end
   class HTTPUnauthorized < HTTPClientError; end
   class HTTPForbidden < HTTPClientError; end
   class HTTPNotFound < HTTPClientError; end
+  class HTTPMethodNotAllowed < HTTPClientError; end
+  class HTTPConflict < HTTPClientError; end
+  class HTTPGone < HTTPClientError; end
+  class HTTPUnprocessableEntity < HTTPClientError; end
+  class HTTPTooManyRequests < HTTPClientError; end
   class HTTPInternalServerError < HTTPServerError; end
+  class HTTPBadGateway < HTTPServerError; end
+  class HTTPServiceUnavailable < HTTPServerError; end
+  class HTTPGatewayTimeout < HTTPServerError; end
 
   # A request. CRuby builds these as Net::HTTP::Get.new(path) and friends;
   # the same shape is here so the same code compiles.
   class HTTPRequest
-    attr_reader :method, :path
+    attr_reader :method, :path, :decode_content
     attr_accessor :body
 
     # `path` is a request path, or a URI -- CRuby takes either, and
@@ -123,6 +209,7 @@ module Net
       @headers = {}
       @header_names = {}
       @body = ""
+      @decode_content = false
       # CRuby's initheader half strips the value before it looks at it, and
       # so raises NoMethodError for anything without `strip`; this package
       # strips a String and lets the other shapes through to `#[]=`, as it
@@ -138,6 +225,20 @@ module Net
           self[k] = v
         end
       end
+      # A caller's Accept-Encoding or Range, even set to nil, leaves the body
+      # as it comes. Otherwise the request asks for gzip and deflate and
+      # decodes them.
+      explicit_encoding = initheader && initheader.keys.any? do |k|
+        name = k.to_s.downcase
+        name == "accept-encoding" || name == "range"
+      end
+      unless explicit_encoding
+        self["Accept-Encoding"] = "gzip;q=1.0,deflate;q=0.6,identity;q=0.3"
+        @decode_content = @method != "HEAD"
+      end
+      # The two headers CRuby's request carries unless the caller set them.
+      self["Accept"] = "*/*" unless key?("accept")
+      self["User-Agent"] = "Ruby" unless key?("user-agent")
     end
 
     # Header names are case-insensitive on the wire, and CRuby's
@@ -153,6 +254,15 @@ module Net
     # used to do, sending both and leaving the server to pick.
     def []=(name, value)
       k = name.to_s.downcase
+      # An Accept-Encoding set later also leaves the body to the caller.
+      @decode_content = false if k == "accept-encoding"
+      # nil removes the header, as CRuby's Net::HTTPHeader#[]= does: a Host
+      # set to nil lets the default one go out again instead of an empty one.
+      if value.nil?
+        @headers.delete(k)
+        @header_names.delete(k)
+        return nil
+      end
       # An Array joins with ", ", the way CRuby serves a multi-valued header:
       # `req["Accept"] = %w[a b]` reads back "a, b" and goes out as one line.
       # `to_s` on an Array is its INSPECT form, so without this the wire got
@@ -173,12 +283,23 @@ module Net
       value
     end
 
+    # A copy, as CRuby's `@header[key].join(", ")` is a new String: appending
+    # to what `[]` answers leaves the stored value alone (and the stored one
+    # may be a frozen literal).
     def [](name)
-      @headers[name.to_s.downcase]
+      v = @headers[name.to_s.downcase]
+      v ? v.dup : nil
     end
 
     def key?(name)
       @headers.key?(name.to_s.downcase)
+    end
+
+    # Whether this kind of request carries a body, CRuby's REQUEST_HAS_BODY.
+    # Decided by the method rather than per class, since `Net::HTTP#post` and
+    # `Net::HTTP.post_form` build a plain HTTPRequest with the method name.
+    def request_body_permitted?
+      @method == "POST" || @method == "PUT" || @method == "PATCH"
     end
 
     # Yields the spelling the caller wrote, not the downcased key: for a
@@ -231,6 +352,12 @@ module Net
       end
     end
 
+    class Patch < HTTPRequest
+      def initialize(path, initheader = nil)
+        super("PATCH", path, initheader)
+      end
+    end
+
     class Delete < HTTPRequest
       def initialize(path, initheader = nil)
         super("DELETE", path, initheader)
@@ -253,6 +380,14 @@ module Net
     # compiles and reads back what it wrote. The handshake is bounded by the
     # connect path's own timeouts, as before.
     attr_accessor :ssl_timeout
+
+    # CRuby's keep_alive_timeout is how long an idle connection may be reused
+    # before `begin_transport` opens a new one. Every request here goes out
+    # with `Connection: close`, so no connection is ever idle-reused and there
+    # is nothing for it to govern; it is held so a program that sets it (a
+    # connection pool does) compiles and reads back what it wrote. CRuby's
+    # default is 2.
+    attr_accessor :keep_alive_timeout
 
     # The address to CONNECT to, when it differs from the address the request
     # is addressed to. An application that resolves a hostname itself and then
@@ -283,6 +418,7 @@ module Net
       @open_timeout = 60
       @read_timeout = 60
       @ssl_timeout = nil
+      @keep_alive_timeout = 2
       @socket = nil
       @tls = nil
       @fresh = false
@@ -300,16 +436,14 @@ module Net
     # Net::HTTP.start(host, port, use_ssl: true) { |http| ... }
     # `ipaddr:` is the connect target; `Host:` and the TLS hostname stay
     # `address`. `nil` reads as unset, which is what CRuby's default is.
-    def self.start(address, port = 80, use_ssl: false, ipaddr: nil)
+    def self.start(address, port = 80, use_ssl: false, ipaddr: nil,
+                   open_timeout: 60, read_timeout: 60)
       http = HTTP.new(address, port)
       http.use_ssl = use_ssl
       http.ipaddr = ipaddr.to_s
-      http.start
-      begin
-        yield http
-      ensure
-        http.finish
-      end
+      http.open_timeout = open_timeout
+      http.read_timeout = read_timeout
+      http.start { |h| yield h }
     end
 
     # Net::HTTP.get(uri) -> the body String.
@@ -323,12 +457,7 @@ module Net
       https = u.scheme == "https"
       http = HTTP.new(u.host, u.port)
       http.use_ssl = https
-      http.start
-      begin
-        http.request(HTTPRequest.new("GET", u.request_uri))
-      ensure
-        http.finish
-      end
+      http.start { |h| h.request(HTTPRequest.new("GET", u.request_uri)) }
     end
 
     def self.post_form(uri, params)
@@ -337,21 +466,36 @@ module Net
       req.set_form_data(params)
       http = HTTP.new(u.host, u.port)
       http.use_ssl = (u.scheme == "https")
-      http.start
-      begin
-        http.request(req)
-      ensure
-        http.finish
+      http.start { |h| h.request(req) }
+    end
+
+    # With a block, the session lasts for the block: CRuby opens it, yields
+    # self, closes it in an ensure and answers the block's value. Without
+    # one, the session stays open until `finish`.
+    def start
+      if block_given?
+        begin
+          connect
+          @started = true
+          yield self
+        ensure
+          do_finish
+        end
+      else
+        connect
+        @started = true
+        self
       end
     end
 
-    def start
-      open_connection
-      @started = true
-      self
-    end
-
-    def open_connection
+    # CRuby's names for the connection lifecycle, and private as they are
+    # there: `connect` opens the socket (and the TLS session), and
+    # `begin_transport(req)` runs before each request is written, connecting
+    # again when the last one was closed. A subclass -- or a module included
+    # into one -- may override either and call super to follow a connection
+    # through its stages; a pool does, to tell a dead idle connection (a
+    # failure before the write) from a request the server may have.
+    def connect
       @socket = connect_with_timeout
       if @use_ssl
         begin
@@ -367,7 +511,16 @@ module Net
       nil
     end
 
+    # Closes the session, and raises IOError when none is open, as CRuby's
+    # does. The package's own teardown goes through do_finish instead, which
+    # is silent: a start whose connect failed has nothing open, and a block
+    # given to Net::HTTP.start may have finished the session itself.
     def finish
+      raise IOError, "HTTP session not yet started" unless started?
+      do_finish
+    end
+
+    def do_finish
       @tls.sysclose unless @tls.nil?
       @socket.close unless @socket.nil?
       @tls = nil
@@ -376,6 +529,7 @@ module Net
       @started = false
       nil
     end
+    private :do_finish
 
     # open_timeout, honoured rather than stored: a non-blocking connect and a
     # bounded wait for writability. A timeout of 0 or less means "no limit",
@@ -419,22 +573,36 @@ module Net
     end
 
     def get(path, headers = nil)
-      req = HTTPRequest.new("GET", path)
-      headers.each { |k, v| req[k] = v } unless headers.nil?
+      req = HTTPRequest.new("GET", path, headers)
       request(req)
     end
 
     def head(path, headers = nil)
-      req = HTTPRequest.new("HEAD", path)
-      headers.each { |k, v| req[k] = v } unless headers.nil?
+      req = HTTPRequest.new("HEAD", path, headers)
       request(req)
     end
 
     def post(path, body, headers = nil)
-      req = HTTPRequest.new("POST", path)
+      req = HTTPRequest.new("POST", path, headers)
       req.body = body
-      headers.each { |k, v| req[k] = v } unless headers.nil?
       request(req)
+    end
+
+    def put(path, body, headers = nil)
+      req = Put.new(path, headers)
+      req.body = body
+      request(req)
+    end
+
+    def patch(path, body, headers = nil)
+      req = Patch.new(path, headers)
+      req.body = body
+      request(req)
+    end
+
+    # Sends Depth: Infinity unless headers are given, as in CRuby.
+    def delete(path, headers = { "Depth" => "Infinity" })
+      request(Delete.new(path, headers))
     end
 
     # A block gets the response, as CRuby's does. CRuby streams the body to it;
@@ -461,15 +629,16 @@ module Net
       # where the request is sent. Doing that here rather than raising keeps
       # the two spellings interchangeable, as they are there.
       unless @started
-        # `start` is INSIDE the begin: `open_connection` assigns @socket and
+        # `start` is INSIDE the begin: `connect` assigns @socket and
         # only then completes the TLS handshake, so a handshake failure raises
-        # with a live socket that nothing else will close. `finish` is a no-op
-        # when there is nothing open, which is the other way start can fail.
+        # with a live socket that nothing else will close. `do_finish` is a
+        # no-op when there is nothing open, which is the other way start can
+        # fail.
         begin
           start
           return perform(req)
         ensure
-          finish
+          do_finish
         end
       end
       # Every request goes out with `Connection: close`, so the server hangs
@@ -478,19 +647,23 @@ module Net
       # `start { |http| http.get("/a"); http.get("/b") }` -- which is the
       # idiom -- has no reason to know. This is one connection per request
       # rather than keep-alive; what it is not is a failure on the second one.
-      reconnect unless @fresh
-      @fresh = false
+      begin_transport(req)
       write_request(req)
-      read_response(req.method)
+      read_response(req.method, req.decode_content)
     end
 
-    def reconnect
-      @tls.sysclose unless @tls.nil?
-      @socket.close unless @socket.nil?
-      @tls = nil
-      @socket = nil
-      open_connection
+    def begin_transport(req)
+      unless @fresh
+        @tls.sysclose unless @tls.nil?
+        @socket.close unless @socket.nil?
+        @tls = nil
+        @socket = nil
+        connect
+      end
+      @fresh = false
+      nil
     end
+    private :connect, :begin_transport
 
     # ---- the wire ----
 
@@ -518,24 +691,30 @@ module Net
     def write_request(req)
       out = String.new
       out << "#{req.method} #{req.path} HTTP/1.1\r\n"
-      # The port belongs in Host unless it is the scheme's default, which is
-      # what a virtual host on a non-standard port depends on.
-      default = @use_ssl ? 443 : 80
-      out << (@port == default ? "Host: #{@address}\r\n" : "Host: #{@address}:#{@port}\r\n")
+      # The default Host goes out only when the request carries none, as
+      # CRuby's `req['host'] ||= addr_port`. The port belongs in it unless it
+      # is the scheme's default, which is what a virtual host on a
+      # non-standard port depends on.
+      unless req.key?("host")
+        default = @use_ssl ? 443 : 80
+        out << (@port == default ? "Host: #{@address}\r\n" : "Host: #{@address}:#{@port}\r\n")
+      end
       have_len = false
       req.each_header do |k, v|
         have_len = true if k.downcase == "content-length"
         out << "#{k}: #{v}\r\n"
       end
       body = req.body.to_s
-      out << "Content-Length: #{body.bytesize}\r\n" if !have_len && !body.empty?
+      # A request that carries a body states its length even when it is
+      # zero, as CRuby's does; some servers answer 411 without it.
+      out << "Content-Length: #{body.bytesize}\r\n" if !have_len && (req.request_body_permitted? || !body.empty?)
       out << "Connection: close\r\n"
       out << "\r\n"
       out << body
       wire_write(out)
     end
 
-    def read_response(method)
+    def read_response(method, decode_content)
       wait_for_response
       version = ""
       code = ""
@@ -582,7 +761,31 @@ module Net
           wire_read_all.to_s
         end
 
+      body = decode_body(headers, body) if decode_content && !bodyless
       build_response(version, code, message, headers, body)
+    end
+
+    # Inflates a gzip or deflate body once it is read whole. A Content-Range
+    # answer is a slice of the encoded body, so it stays as it came.
+    def decode_body(headers, body)
+      return body if headers.key?("content-range")
+      encoding = headers["content-encoding"].to_s.downcase
+      case encoding
+      when "gzip", "x-gzip", "deflate"
+        unless body.empty?
+          inflater = Zlib::Inflate.new(32 + Zlib::MAX_WBITS)
+          begin
+            body = inflater.inflate(body)
+          ensure
+            inflater.close
+          end
+        end
+        headers.delete("content-encoding")
+        headers["content-length"] = body.bytesize.to_s if headers.key?("content-length")
+      when "identity", "none"
+        headers.delete("content-encoding")
+      end
+      body
     end
 
     # The class a status code names. Specific first, then the family by its
@@ -592,14 +795,26 @@ module Net
       case code
       when "200" then return HTTPOK.new(version, code, message, headers, body)
       when "201" then return HTTPCreated.new(version, code, message, headers, body)
+      when "202" then return HTTPAccepted.new(version, code, message, headers, body)
       when "204" then return HTTPNoContent.new(version, code, message, headers, body)
       when "301" then return HTTPMovedPermanently.new(version, code, message, headers, body)
       when "302" then return HTTPFound.new(version, code, message, headers, body)
+      when "304" then return HTTPNotModified.new(version, code, message, headers, body)
+      when "307" then return HTTPTemporaryRedirect.new(version, code, message, headers, body)
+      when "308" then return HTTPPermanentRedirect.new(version, code, message, headers, body)
       when "400" then return HTTPBadRequest.new(version, code, message, headers, body)
       when "401" then return HTTPUnauthorized.new(version, code, message, headers, body)
       when "403" then return HTTPForbidden.new(version, code, message, headers, body)
       when "404" then return HTTPNotFound.new(version, code, message, headers, body)
+      when "405" then return HTTPMethodNotAllowed.new(version, code, message, headers, body)
+      when "409" then return HTTPConflict.new(version, code, message, headers, body)
+      when "410" then return HTTPGone.new(version, code, message, headers, body)
+      when "422" then return HTTPUnprocessableEntity.new(version, code, message, headers, body)
+      when "429" then return HTTPTooManyRequests.new(version, code, message, headers, body)
       when "500" then return HTTPInternalServerError.new(version, code, message, headers, body)
+      when "502" then return HTTPBadGateway.new(version, code, message, headers, body)
+      when "503" then return HTTPServiceUnavailable.new(version, code, message, headers, body)
+      when "504" then return HTTPGatewayTimeout.new(version, code, message, headers, body)
       end
       case code[0, 1]
       when "1" then HTTPInformation.new(version, code, message, headers, body)

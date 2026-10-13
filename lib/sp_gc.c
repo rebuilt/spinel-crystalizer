@@ -65,6 +65,10 @@ size_t sp_gc_old_bytes = 0;
 int sp_gc_cycle = 0;
 void (*sp_gc_mark_suspended_fibers_hook)(void) = NULL;
 void (*sp_gc_mark_globals_hook)(void) = NULL;
+#ifdef SP_CEXT
+void (*sp_gc_mark_cext_hook)(void) = NULL;
+void (*sp_gc_sweep_cext_hook)(int full) = NULL;
+#endif
 void (*sp_gc_str_sweep_hook)(void) = NULL;
 int (*sp_gc_str_major_due_hook)(void) = NULL;
 int sp_gc_root_phase = 0;   /* the mark is walking the C roots (see sp_gc_mark_all) */
@@ -96,6 +100,8 @@ const char *(*sp_obj_to_str_fn)(int cls_id, void *p) = NULL;
 const char *(*sp_obj_to_path_fn)(int cls_id, void *p) = NULL;
 int (*sp_obj_conv_fn)(int cls_id, void *p, int which, sp_RbVal *out) = NULL;
 const char *(*sp_obj_cls_name_fn)(int cls_id) = NULL;
+int (*sp_bsub_cls_fn)(sp_RbVal v) = NULL;
+int (*sp_cls_visible_fn)(int cls_id) = NULL;
 int (*sp_class_le_id_fn)(int sub, int super) = NULL;
 sp_RbVal (*sp_class_cmp_fn)(sp_RbVal a, sp_RbVal b) = NULL;
 int (*sp_class_kind_of_name_fn)(int cls, const char *name) = NULL;
@@ -114,7 +120,7 @@ int sp_gc_conc_promote = 0;      /* this cycle's mark promotes what it marks (th
 size_t sp_gc_mk_bytes = 0, sp_gc_mk_young_bytes = 0;   /* bytes the mark reached, and of those the young ones */
 SP_TLS int sp_gc_in_sweeper = 0; /* a sweeper thread: finalizers skip the per-worker byte accounting */
 /* ---- Collector-private globals ---- */
-static int sp_gc_verify = 0;
+static int sp_gc_verify = 0;      /* 1: SPINEL_GC_VERIFY; 2: only its membership test on the mark path (SPINEL_GC_STRESS=2) */
 static sp_gc_hdr *sp_gc_old_heap = NULL;
 /* The mark stack grows on demand: overflowing it used to drop the walk into
    recursive scanning, and a live set of a few hundred thousand containers
@@ -201,6 +207,24 @@ int sp_gc_verify_on(void) { return sp_gc_verify; }
 const char *sp_gc_dbg_phase = "?";
 void *sp_gc_dbg_ctx = NULL;
 static void sp_gc_verify_fail(void *obj, sp_gc_hdr *h){
+  /* SPINEL_GC_STRESS=2: the slot was freed and the quarantine still holds
+     it, so the reference outlived a collection that could not see it. ctx is
+     the root-stack entry in the root phase, and the object whose scan found
+     the reference in the scan, remembered and pinned phases. */
+  if (sp_slab_is_quarantined(h)) {
+    const char *ph = sp_gc_dbg_phase;
+    fprintf(stderr, "\n*** SPINEL_GC_STRESS: the mark reached a freed slot ***\n"
+      "  obj = %p   phase = %s   ctx = %p\n", obj, ph, sp_gc_dbg_ctx);
+    sp_slab_describe(h);
+    if (sp_gc_verify == 1) sp_slab_history(h);
+    if (!sp_slab_is_str(h)) fprintf(stderr, "  freed: scan=%p size=%zu\n", (void *)(uintptr_t)h->scan, (size_t)h->size);
+    if (sp_gc_dbg_ctx && (ph[0] == 's' || ph[0] == 'p' || (ph[0] == 'r' && ph[1] == 'e'))) {
+      sp_gc_hdr *hc = (sp_gc_hdr *)((char *)sp_gc_dbg_ctx - sizeof(sp_gc_hdr));
+      fprintf(stderr, "  holder: scan=%p size=%zu old=%d\n", (void *)(uintptr_t)hc->scan, (size_t)hc->size, (int)hc->old);
+    }
+    fflush(stderr);
+    abort();
+  }
   fprintf(stderr, "  [phase=%s ctx=%p]\n", sp_gc_dbg_phase, sp_gc_dbg_ctx);
   sp_slab_describe(h);
   if (sp_gc_dbg_ctx) sp_slab_describe((char*)sp_gc_dbg_ctx - sizeof(sp_gc_hdr));
@@ -229,7 +253,7 @@ static void sp_gc_verify_fail(void *obj, sp_gc_hdr *h){
    Name the root slot the collector was walking, which is what turns an
    unreproducible crash into a variable. Re-raises so the core dump is still
    produced. */
-static void sp_gc_fault_report(int sig) {
+void sp_gc_fault_report(int sig) {
   static const char hex[] = "0123456789abcdef";
   char buf[256]; size_t o = 0;
   const char *m1 = "\n*** SPINEL_GC_VERIFY: fault on the GC mark path (signal ";
@@ -245,11 +269,25 @@ static void sp_gc_fault_report(int sig) {
   const char *m4 = "\n  The slot's value is the pointer the collector could not read.\n";
   for (const char *p = m4; *p; p++) buf[o++] = *p;
   ssize_t wr = write(2, buf, o); (void)wr;
+  if (sp_slab_quar_on) {
+    static const char q[] = "  SPINEL_GC_STRESS=2: with phase = ? the fault is the program's own, and a\n"
+                            "  pointer read out of a freed slot is all 0xdb bytes.\n";
+    wr = write(2, q, sizeof q - 1); (void)wr;
+  }
   signal(sig, SIG_DFL);
   raise(sig);
 }
+/* The collector's boot-time modes, read from the environment once, before
+   main. */
 SP_CONSTRUCTOR static void sp_gc_debug_env(void){
   const char *v=getenv("SPINEL_GC_VERIFY"); sp_gc_verify=(v&&*v&&*v!='0');
+  /* SPINEL_GC_STRESS=2 keeps what a sweep frees poisoned and out of reuse
+     (lib/sp_slab.c), and what stops a mark that reaches such a slot is the
+     verifier's membership test. Only that: the verifier's walks of the whole
+     heap (the bitmaps, the remembered set) are per collection, and here a
+     collection is per allocation; SPINEL_GC_VERIFY=1 beside it adds them.
+     The thresholds are sp_alloc.c's to set. */
+  { const char *st=getenv("SPINEL_GC_STRESS"); if(st&&atoi(st)>=2){ if(!sp_gc_verify)sp_gc_verify=2; sp_slab_quar_on=1; } }
   { const char *ph=getenv("SPINEL_GC_PHASES"); sp_gc_ph_on=(ph&&*ph&&*ph!='0'); }
   { const char *fi=getenv("SPINEL_GC_FULL_INTERVAL");
     if(fi&&*fi){ int n=atoi(fi); if(n>0&&n<=4096){ sp_gc_full_interval=n; sp_gc_full_interval_fixed=1; } } }
@@ -287,6 +325,13 @@ SP_CONSTRUCTOR static void sp_gc_debug_env(void){
     sp_gc_obj_budget_fixed = (ob && strcmp(ob, "fixed") == 0);
     const char *sb = getenv("SPINEL_GC_STR_BUDGET");
     sp_gc_str_budget_fixed = (sb && strcmp(sb, "fixed") == 0);
+    /* The share of the object heap is gated by DEFAULT, as the object
+       budget's widening is, and for the same reason both ends are kept: `str`
+       is the way back to a string budget that sees the string heap alone,
+       `walk` carries the share whatever the last collection cost. */
+    sp_gc_str_budget_mode = (sb && strcmp(sb, "str") == 0)  ? 0
+                          : (sb && strcmp(sb, "walk") == 0) ? 1
+                          : 2;
     /* The schedule is the DEFAULT. `size` is the escape hatch back to the gate
        that shipped before it -- a size test re-aimed from its own leftover --
        for anyone the change costs more than it saves. `fixed` pins both the
@@ -297,11 +342,11 @@ SP_CONSTRUCTOR static void sp_gc_debug_env(void){
   if (sp_gc_verify) { signal(SIGSEGV, sp_gc_fault_report); signal(SIGBUS, sp_gc_fault_report); }
 }
 
-/* Tag byte preceding `obj`: 0xfe heap-unmarked -> 0xfc; 0xfc/0xff/0xfd/0xf1/
- * 0xfb skipped; else a real GC object reached through its scan hook. 0xfb is
- * the static header-bearing table (the 1-byte binary substrings): nothing
- * before it is an sp_gc_hdr, so reaching for one and calling its scan hook
- * jumps into the payload byte. */
+/* Tag byte preceding `obj`: 0xfe heap-unmarked -> 0xfc, 0xfa -> 0xf8;
+ * 0xfc/0xf8/0xff/0xfd/0xf1/0xfb skipped; else a real GC object reached
+ * through its scan hook. 0xfb is the static header-bearing table (the
+ * 1-byte binary substrings): nothing before it is an sp_gc_hdr, so reaching
+ * for one and calling its scan hook jumps into the payload byte. */
 
 static double sp_gc_stat_now(void);
 #ifdef SP_THREADS
@@ -426,7 +471,7 @@ size_t sp_gc_mk_promo_bytes = 0;
    chunk, and the bit is also the "already marked" test: the marker byte
    stays 0xfe, since nothing resets a byte the sweep does not touch. A
    string that fell back to malloc keeps the byte protocol (0xfe -> 0xfc,
-   reset by the list sweep that frees or promotes it). */
+   0xfa -> 0xf8, reset by the list sweep that frees or promotes it). */
 void sp_gc_mark_str(const char *s) {
   sp_str_hdr *h = ((sp_str_hdr *)(s - 1)) - 1;
   if (sp_slab_owns(h)) {
@@ -440,14 +485,16 @@ void sp_gc_mark_str(const char *s) {
     if (wy) sp_gc_mkl_str_young += sz;
     return;
   }
+  /* 0xf8 too: a parallel marker may have got here first */
+  unsigned char m = (unsigned char)s[-1], mk = (m == 0xfa || m == 0xf8) ? 0xf8 : 0xfc;
 #ifdef SP_THREADS
-  SP_ATOMIC_STORE((unsigned char *)s - 1, (unsigned char)0xfc, __ATOMIC_RELAXED);   /* several markers may set it; a plain byte store, spelled so TSan reads it as intended */
+  SP_ATOMIC_STORE((unsigned char *)s - 1, mk, __ATOMIC_RELAXED);   /* several markers may set it; a plain byte store, spelled so TSan reads it as intended */
 #else
-  ((char *)s)[-1] = (char)0xfc;
+  ((unsigned char *)s)[-1] = mk;
 #endif
 }
-void sp_gc_mark(void*obj){if(!obj)return;unsigned char pm=((unsigned char*)obj)[-1];if(pm==0xfe){sp_gc_mark_str((const char*)obj);return;}
-  if(pm==0xfc||pm==0xff||pm==0xfd||pm==0xf1||pm==0xfb)return;sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(sp_gc_verify&&!sp_gc_obj_registered(h))sp_gc_verify_fail(obj,h);if(sp_gc_verify_probe_on){if(!h->old&&h->marked==sp_gc_verify_probe)sp_gc_verify_probe_hit=1;return;}if(sp_gc_young_probe_on){if(!h->old)sp_gc_young_probe_hit=1;return;}if(sp_gc_root_phase&&!h->old)h->aged=1;
+void sp_gc_mark(void*obj){if(!obj)return;unsigned char pm=((unsigned char*)obj)[-1];if((pm|0x04)==0xfe){sp_gc_mark_str((const char*)obj);return;}
+  if(pm==0xfc||pm==0xff||pm==0xfd||pm==0xf1||pm==0xfb||pm==0xf8)return;sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(sp_gc_verify&&!sp_gc_obj_registered(h))sp_gc_verify_fail(obj,h);if(sp_gc_verify_probe_on){if(!h->old&&h->marked==sp_gc_verify_probe)sp_gc_verify_probe_hit=1;return;}if(sp_gc_young_probe_on){if(!h->old)sp_gc_young_probe_hit=1;return;}if(sp_gc_root_phase&&!h->old)h->aged=1;
   int was_young=0;
 #ifdef SP_THREADS
   if(sp_gc_par_mark){
@@ -551,6 +598,9 @@ else{void*obj=*e;if(obj)sp_gc_mark(obj);}}
   sp_gc_root_phase=0;
   SP_GC_MK_PH(sp_gc_ph_mk_fibers);
   if(vd)sp_gc_dbg_phase="globals";if(sp_gc_mark_globals_hook)sp_gc_mark_globals_hook();
+#ifdef SP_CEXT
+  if(sp_gc_mark_cext_hook)sp_gc_mark_cext_hook();
+#endif
   SP_GC_MK_PH(sp_gc_ph_mk_globals);
   sp_gc_mark_drain_all();
   sp_gc_mkl_fold();
@@ -600,7 +650,7 @@ void sp_gc_pin_remembered_slow(void *obj) {
   if (!obj) return;
   { unsigned char pm = ((unsigned char *)obj)[-1];
     if (pm == 0xfd || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
-        pm == 0xfe || pm == 0xfc || pm == 0xfb) return; }
+        pm == 0xfe || pm == 0xfc || pm == 0xfb || pm == 0xfa || pm == 0xf8) return; }
   sp_gc_hdr *h = (sp_gc_hdr *)obj - 1;
   if (h->pinned) return;
   /* The slot is claimed BEFORE the bit goes up, which is the opposite order to
@@ -633,7 +683,7 @@ void sp_gc_wb_slow(void *obj) {
      literal or a frozen string is not a GC allocation either. */
   { unsigned char pm = ((unsigned char *)obj)[-1];
     if (pm == 0xfd || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
-        pm == 0xfe || pm == 0xfc || pm == 0xfb) return; }
+        pm == 0xfe || pm == 0xfc || pm == 0xfb || pm == 0xfa || pm == 0xf8) return; }
   sp_gc_hdr *h = (sp_gc_hdr *)obj - 1;
   if (!h->old || h->dirty) return;
   /* The bit goes up before the entry goes in, so between here and the push an
@@ -864,6 +914,8 @@ void sp_gc_sweep_chunks(int wid,int full){
 }
 /* the form the stop-the-world parallel sweep (sp_sched.c) runs per slot */
 void sp_gc_sweep_chunks_slot(int wid){ sp_gc_sweep_chunks(wid,sp_gc_sweep_full_now); }
+static int sp_ivt_n;   /* the ivar tables of builtin values (sp_ivtbl_put, below) */
+static void sp_ivt_mark(int full, void (*drain)(void));
 static sp_gc_hdr **sp_gc_vg_cand; static size_t sp_gc_vg_n, sp_gc_vg_cap; static unsigned sp_gc_vg_gen;
 static void sp_gc_vg_cand_cb(void *hp,void *arg){
   (void)arg; sp_gc_hdr *h=(sp_gc_hdr*)hp;
@@ -924,6 +976,8 @@ static SP_NOINLINE void sp_gc_verify_gen_run(void) {
       if(ph->scan) ph->scan(sp_gc_pinned[pi]);
     }
     sp_gc_mark_drain();
+    /* the sweep keeps what this mark reached: the ivar tables too */
+    if (sp_ivt_n) sp_ivt_mark(0, sp_gc_mark_drain);
     size_t str_leaked = sp_str_verify_end();
     if(str_leaked){
       fprintf(stderr,"spinel: GC generational check: %zu young STRING(s) reachable only "
@@ -1043,6 +1097,257 @@ static void sp_gc_trim_request(void){
 #endif
   }
 }
+/* ---- ObjectSpace.define_finalizer ----
+ * A finalizer is a Ruby callable run after its object dies. The callable is
+ * kept (and marked) on the Ruby side, in ObjectSpace's table, under an index;
+ * this registry holds only the object's identity and that index, and so does
+ * not keep the object alive. After a cycle's mark, an entry whose object the
+ * cycle will free moves to the pending list, and the pending finalizers run
+ * at the program's next safe point (SP_FIN_POLL in sp_gc.h) -- never inside
+ * the collection, nor inside the allocation that set it off -- through the
+ * runner the Ruby side installed. What is still registered at exit runs then, as in
+ * CRuby. A threaded build guards the lists with a lock (never held across a
+ * callback); the mark-time scan runs with the world stopped, and no mutator
+ * stops inside a locked region, which allocates nothing. */
+typedef struct { void *obj; int tag; uint64_t bits; sp_int idx; } sp_fin_ent;
+static sp_fin_ent *sp_fin_tab; static int sp_fin_n, sp_fin_cap;
+static sp_int *sp_fin_pend; static int sp_fin_pn, sp_fin_pcap;
+static void (*sp_fin_runner)(int64_t);
+volatile int sp_fin_pending_flag;   /* sp_gc.h: SP_FIN_POLL */
+static int sp_fin_running, sp_fin_exit_armed;
+#ifdef SP_THREADS
+static pthread_mutex_t sp_fin_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SP_FIN_LOCK() pthread_mutex_lock(&sp_fin_lock)
+#define SP_FIN_UNLOCK() pthread_mutex_unlock(&sp_fin_lock)
+#else
+#define SP_FIN_LOCK() ((void)0)
+#define SP_FIN_UNLOCK() ((void)0)
+#endif
+
+static void sp_fin_push_pending(sp_int idx) {
+  if (sp_fin_pn == sp_fin_pcap) {
+    sp_fin_pcap = sp_fin_pcap ? sp_fin_pcap * 2 : 16;
+    sp_fin_pend = realloc(sp_fin_pend, sizeof(sp_int) * (size_t)sp_fin_pcap);
+    if (!sp_fin_pend) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  sp_fin_pend[sp_fin_pn++] = idx;
+  SP_ATOMIC_STORE(&sp_fin_pending_flag, 1, __ATOMIC_RELAXED);
+}
+
+void sp_fin_run_pending(void) {
+  SP_FIN_LOCK();
+  if (sp_fin_running || !sp_fin_runner || sp_fin_pn == 0) { SP_FIN_UNLOCK(); return; }
+  sp_fin_running = 1;
+  /* in the order the objects were registered, as CRuby runs them; a
+     finalizer that frees more (or registers more) lands in the next batch */
+  while (sp_fin_pn > 0) {
+    int n = sp_fin_pn;
+    sp_int *batch = malloc(sizeof(sp_int) * (size_t)n);
+    if (!batch) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    memcpy(batch, sp_fin_pend, sizeof(sp_int) * (size_t)n);
+    sp_fin_pn = 0;
+    SP_ATOMIC_STORE(&sp_fin_pending_flag, 0, __ATOMIC_RELAXED);
+    SP_FIN_UNLOCK();
+    for (int i = 0; i < n; i++) sp_fin_runner((int64_t)batch[i]);
+    free(batch);
+    SP_FIN_LOCK();
+  }
+  sp_fin_running = 0;
+  SP_FIN_UNLOCK();
+}
+
+static void sp_fin_at_exit(void) {
+  SP_FIN_LOCK();
+  for (int i = 0; i < sp_fin_n; i++) sp_fin_push_pending(sp_fin_tab[i].idx);
+  sp_fin_n = 0;
+  SP_FIN_UNLOCK();
+  sp_fin_run_pending();
+}
+
+/* The program is ending: run what is still registered. Called where the
+   program ends in Ruby terms (main's return, exit, an uncaught raise) --
+   before the C exit handlers run, which is where a library's own teardown
+   happens. The atexit registration is only the fallback for a path that
+   leaves some other way. */
+void sp_fin_run_exit(void) {
+  if (sp_fin_n || sp_fin_pn) sp_fin_at_exit();
+}
+
+void sp_fin_set_runner(void (*f)(int64_t)) {
+  sp_fin_runner = f;
+  if (!sp_fin_exit_armed) { sp_fin_exit_armed = 1; atexit(sp_fin_at_exit); }
+}
+
+/* An object with a collector header is watched by address; any other value
+   (an immediate, a string on the string heap) is matched by its bits and
+   keeps its finalizer until exit, which is when its storage goes too. */
+static void sp_fin_ident(sp_RbVal obj, void **p, int *tag, uint64_t *bits) {
+  *p = (obj.tag == SP_TAG_OBJ) ? obj.v.p : NULL;
+  *tag = (int)obj.tag;
+  *bits = 0;
+  memcpy(bits, &obj.v, sizeof obj.v < sizeof *bits ? sizeof obj.v : sizeof *bits);
+}
+
+void sp_fin_register(sp_RbVal obj, sp_int idx) {
+  void *p; int tag; uint64_t bits;
+  sp_fin_ident(obj, &p, &tag, &bits);
+  SP_FIN_LOCK();
+  if (sp_fin_n == sp_fin_cap) {
+    sp_fin_cap = sp_fin_cap ? sp_fin_cap * 2 : 16;
+    sp_fin_tab = realloc(sp_fin_tab, sizeof(sp_fin_ent) * (size_t)sp_fin_cap);
+    if (!sp_fin_tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  sp_fin_tab[sp_fin_n].obj = p;
+  sp_fin_tab[sp_fin_n].tag = tag;
+  sp_fin_tab[sp_fin_n].bits = bits;
+  sp_fin_tab[sp_fin_n].idx = idx;
+  sp_fin_n++;
+  SP_FIN_UNLOCK();
+}
+
+/* Drops one registration of `obj` and answers its index (the Ruby side then
+   releases the callable), or -1 when none is left. */
+sp_int sp_fin_unregister_one(sp_RbVal obj) {
+  void *p; int tag; uint64_t bits;
+  sp_fin_ident(obj, &p, &tag, &bits);
+  sp_int r = -1;
+  SP_FIN_LOCK();
+  for (int i = 0; i < sp_fin_n; i++) {
+    sp_fin_ent *e = &sp_fin_tab[i];
+    if (p ? e->obj == p : (!e->obj && e->tag == tag && e->bits == bits)) {
+      r = e->idx;
+      memmove(e, e + 1, sizeof(sp_fin_ent) * (size_t)(sp_fin_n - i - 1));
+      sp_fin_n--;
+      break;
+    }
+  }
+  SP_FIN_UNLOCK();
+  return r;
+}
+
+/* After the mark, before any sweep: which watched objects does this cycle
+   free? A full cycle frees anything unmarked; a minor one only the young. */
+static void sp_fin_after_mark(int full) {
+  int keep = 0;
+  for (int i = 0; i < sp_fin_n; i++) {
+    void *p = sp_fin_tab[i].obj;
+    int live = 1;
+    if (p) {
+      sp_gc_hdr *h = (sp_gc_hdr *)p - 1;
+      live = full ? (h->marked == sp_gc_mark_gen) : (h->old || h->marked == sp_gc_mark_gen);
+    }
+    if (live) sp_fin_tab[keep++] = sp_fin_tab[i];
+    else sp_fin_push_pending(sp_fin_tab[i].idx);
+  }
+  sp_fin_n = keep;
+}
+
+/* ---- the ivar tables of builtin values ----
+ * CRuby keeps an ivar of an Array, a Hash or a Random in a table keyed by
+ * the object, which does not keep the object alive. This is that table: a
+ * dense array of (object, ivar table) entries and an open-addressing index
+ * into it, both malloc'd. An ivar table is an ordinary GC object, made and
+ * written by the TU (sp_bivar_set). After the mark, the tables of the
+ * objects the cycle keeps are marked, again until nothing new is reached
+ * (a table can hold another keyed object); then, with the marks final, the
+ * entries of objects the cycle frees are dropped, where the finalizer
+ * registry drops its own. The lock is the finalizer registry's rule: never
+ * held across an allocation, so no collection stops a mutator inside it. */
+typedef struct { const void *obj; void *tbl; } sp_ivt_ent;
+static sp_ivt_ent *sp_ivt; static int sp_ivt_cap;   /* and sp_ivt_n, declared above sp_gc_verify_gen_run */
+static int *sp_ivt_ix; static int sp_ivt_icap;   /* entry index + 1; 0 empty; icap a power of two */
+#ifdef SP_THREADS
+static pthread_mutex_t sp_ivt_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SP_IVT_LOCK() pthread_mutex_lock(&sp_ivt_lock)
+#define SP_IVT_UNLOCK() pthread_mutex_unlock(&sp_ivt_lock)
+#else
+#define SP_IVT_LOCK() ((void)0)
+#define SP_IVT_UNLOCK() ((void)0)
+#endif
+
+static size_t sp_ivt_hash(const void *p) {
+  uint64_t x = (uint64_t)(uintptr_t)p;
+  x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+  return (size_t)x;
+}
+/* the index slot holding obj's entry, or the empty slot where it would go */
+static int sp_ivt_slot(const void *obj) {
+  size_t m = (size_t)sp_ivt_icap - 1, i = sp_ivt_hash(obj) & m;
+  while (sp_ivt_ix[i] && sp_ivt[sp_ivt_ix[i] - 1].obj != obj) i = (i + 1) & m;
+  return (int)i;
+}
+static void sp_ivt_reindex(int icap) {
+  free(sp_ivt_ix);
+  sp_ivt_ix = (int *)calloc((size_t)icap, sizeof(int));
+  if (!sp_ivt_ix) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  sp_ivt_icap = icap;
+  for (int e = 0; e < sp_ivt_n; e++) sp_ivt_ix[sp_ivt_slot(sp_ivt[e].obj)] = e + 1;
+}
+
+const char *(*sp_ivtbl_inspect_fn)(void *tbl) = NULL;
+
+void *sp_ivtbl_get(const void *obj) {
+  void *t = NULL;
+  SP_IVT_LOCK();
+  if (sp_ivt_n && obj) { int s = sp_ivt_slot(obj); if (sp_ivt_ix[s]) t = sp_ivt[sp_ivt_ix[s] - 1].tbl; }
+  SP_IVT_UNLOCK();
+  return t;
+}
+
+void sp_ivtbl_put(const void *obj, void *tbl) {
+  if (!obj) return;
+  SP_IVT_LOCK();
+  if (sp_ivt_icap && sp_ivt_n) {
+    int s = sp_ivt_slot(obj);
+    if (sp_ivt_ix[s]) { sp_ivt[sp_ivt_ix[s] - 1].tbl = tbl; SP_IVT_UNLOCK(); return; }
+  }
+  if (sp_ivt_n == sp_ivt_cap) {
+    sp_ivt_cap = sp_ivt_cap ? sp_ivt_cap * 2 : 16;
+    sp_ivt = (sp_ivt_ent *)realloc(sp_ivt, sizeof(sp_ivt_ent) * (size_t)sp_ivt_cap);
+    if (!sp_ivt) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  sp_ivt[sp_ivt_n].obj = obj; sp_ivt[sp_ivt_n].tbl = tbl; sp_ivt_n++;
+  if ((size_t)sp_ivt_n * 2 > (size_t)sp_ivt_icap) sp_ivt_reindex(sp_ivt_icap ? sp_ivt_icap * 2 : 32);
+  else sp_ivt_ix[sp_ivt_slot(obj)] = sp_ivt_n;
+  SP_IVT_UNLOCK();
+}
+
+/* Whether this cycle keeps obj: the finalizer registry's test. A value with
+   one of the markers sp_gc_mark passes over (a static or a non-heap object)
+   is never freed, so it always lives, and so does an unaligned key, which
+   names a class rather than an object. */
+static int sp_ivt_key_live(const void *obj, int full) {
+  if ((uintptr_t)obj & 7) return 1;   /* a class's key (sp_bivar_key): no object behind it */
+  unsigned char pm = ((const unsigned char *)obj)[-1];
+  if (pm == 0xfc || pm == 0xff || pm == 0xfd || pm == 0xf1 || pm == 0xfb || pm == 0xf8) return 1;
+  const sp_gc_hdr *h = (const sp_gc_hdr *)obj - 1;
+  return full ? h->marked == sp_gc_mark_gen : (h->old || h->marked == sp_gc_mark_gen);
+}
+
+/* After the mark's drain: the tables of the live objects, as ephemerons. */
+static void sp_ivt_mark(int full, void (*drain)(void)) {
+  if (!sp_ivt_n) return;
+  unsigned char *done = (unsigned char *)calloc((size_t)sp_ivt_n, 1);
+  if (!done) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int more = 1; more; ) {
+    more = 0;
+    for (int e = 0; e < sp_ivt_n; e++)
+      if (!done[e] && sp_ivt_key_live(sp_ivt[e].obj, full)) { done[e] = 1; more = 1; sp_gc_mark(sp_ivt[e].tbl); }
+    if (more) drain();
+  }
+  free(done);
+}
+
+/* With the marks final, before any sweep: the entries of the objects this
+   cycle frees go. */
+static void sp_ivt_after_mark(int full) {
+  int keep = 0;
+  for (int e = 0; e < sp_ivt_n; e++)
+    if (sp_ivt_key_live(sp_ivt[e].obj, full)) sp_ivt[keep++] = sp_ivt[e];
+  if (keep != sp_ivt_n) { sp_ivt_n = keep; sp_ivt_reindex(sp_ivt_icap); }
+}
+static void sp_ivt_drain(void) { sp_gc_mark_drain_all(); sp_gc_mkl_fold(); }
+
 void sp_gc_collect(void){
   /* The previous cycle's sweep may still be running beside the mutators:
      finish it before anything here walks a list or reads a live total. */
@@ -1051,6 +1356,7 @@ void sp_gc_collect(void){
   /* the slab's workers hold slots claimed ahead of use: unclaimed before
      anything here reads the young bits (they would name garbage) */
   sp_slab_runs_release();
+  sp_slab_quarantine_trim();
   size_t ob_before = sp_gc_bytes;
   double stat_t0 = sp_gc_stat_now();
   double ph_t = stat_t0;
@@ -1112,7 +1418,7 @@ void sp_gc_collect(void){
   sp_gc_mk_str_bytes = 0; sp_gc_mk_str_young_bytes = 0; sp_gc_mk_promo_bytes = 0;
   /* the closed epoch is what the sweep frees from; everything allocated from
      here on is in the other parity and untouched by it (lib/sp_slab.c) */
-  if(sp_gc_verify)sp_slab_verify_all();
+  if(sp_gc_verify==1)sp_slab_verify_all();
   sp_slab_epoch_flip();
   /* This thread's string-length cache: the list sweep dropped each freed
      string from it one by one, and the bitmap sweep touches no string. Every
@@ -1146,6 +1452,8 @@ void sp_gc_collect(void){
     sp_gc_mkl_fold();
     if(sp_gc_verify){sp_gc_dbg_phase="?";sp_gc_dbg_ctx=NULL;}
   }
+  /* the ivar tables of the builtin values the cycle keeps (sp_ivt_mark) */
+  if (sp_ivt_n) sp_ivt_mark(full, sp_ivt_drain);
   sp_gc_minor = 0;
   sp_gc_conc_promote = 0;
   /* Verification: re-run the mark whole-heap and compare. Anything the full
@@ -1174,6 +1482,11 @@ void sp_gc_collect(void){
        While it is set every mark is whole-heap, so nothing is missed; once
        compaction has made room the set is authoritative again. */
     if (sp_gc_pin_overflow && keep < SP_GC_PINNED_MAX) sp_gc_pin_overflow = 0; }
+  if (sp_fin_n) sp_fin_after_mark(full);
+  if (sp_ivt_n) sp_ivt_after_mark(full);
+#ifdef SP_CEXT
+  if (sp_gc_sweep_cext_hook) sp_gc_sweep_cext_hook(full);
+#endif
   SP_GC_PH(sp_gc_ph_mark);
   sp_str_mark_settle(full);
   if(full){
@@ -1421,7 +1734,7 @@ void sp_gc_collect(void){
   }
   /* Under SPINEL_GC_VERIFY: the remembered set's invariant, dirty <=> listed,
      holds for every old object once the array is not overflowed. */
-  if(sp_gc_verify&&!sp_gc_rem_overflow){
+  if(sp_gc_verify==1&&!sp_gc_rem_overflow){
     sp_slab_each_object(0,1,sp_gc_rem_invariant_cb,&full);
     for(sp_gc_hdr*h=sp_gc_old_heap;h;h=h->next){
       void *o=(char*)h+sizeof(sp_gc_hdr); int listed=0;
@@ -1482,6 +1795,9 @@ void sp_gc_collect(void){
   if(full)sp_gc_stat_fulls++;
   sp_gc_stat_seconds+=sp_gc_stat_now()-stat_t0;
   if(sp_gc_obj_retune_hook)sp_gc_obj_retune_hook(ob_before);
+  /* the finalizers of what this collection freed wait for the program's
+     next safe point (SP_FIN_POLL): the allocation that brought us here may
+     be in the middle of an operation one of them can reach */
 }
 
 /* Issue #1302: optional RSS ceiling via SPINEL_MAX_HEAP_MB; checked only

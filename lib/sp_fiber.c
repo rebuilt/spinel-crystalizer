@@ -80,10 +80,17 @@ static size_t sp_fiber_guard(void) {
    (W^X-safe) and issues no syscall. See sp_fiber_ctx.h for sp_ctx_make and the
    stack layout it must mirror. */
 #if SP_FIBER_ASM
-#if defined(__APPLE__)
-  #define SP_CTX_SYM "_sp_ctx_swap"
+/* Under AddressSanitizer the asm is sp_ctx_swap_raw, and sp_ctx_swap (below)
+   wraps it in the sanitizer's announcements. */
+#ifdef SP_ASAN
+  #define SP_CTX_NAME "sp_ctx_swap_raw"
 #else
-  #define SP_CTX_SYM "sp_ctx_swap"
+  #define SP_CTX_NAME "sp_ctx_swap"
+#endif
+#if defined(__APPLE__)
+  #define SP_CTX_SYM "_" SP_CTX_NAME
+#else
+  #define SP_CTX_SYM SP_CTX_NAME
 #endif
 #if defined(__x86_64__)
 __asm__(
@@ -129,8 +136,39 @@ __asm__(
   "  ret\n"
 );
 #endif
+#ifdef SP_ASAN
+/* The switch, announced: the sanitizer is told the stack it goes to before
+   it, and the code that runs after it -- here, once this context is resumed,
+   or sp_ctx_entered in a fresh one -- finishes the switch and learns the
+   bounds of the stack it came from, which are written into the context that
+   was left, the one a later switch back reads. A context sp_ctx_make primed
+   has them from the start; one saved from a stack the sanitizer already
+   knew (the thread's own) has them before anything can switch back to it.
+   `from` is a thread's own, for the threaded build's workers. */
+extern void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
+extern void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
+void sp_ctx_swap_raw(sp_fiber_ctx *from, sp_fiber_ctx *to);
+static SP_TLS sp_fiber_ctx *sp_ctx_left;
+static void sp_ctx_arrived(void *fake) {
+  const void *lo; size_t size;
+  __sanitizer_finish_switch_fiber(fake, &lo, &size);
+  if (sp_ctx_left) { sp_ctx_left->asan_lo = lo; sp_ctx_left->asan_size = size; }
+}
+void sp_ctx_entered(void) { sp_ctx_arrived(NULL); }
+void sp_ctx_swap(sp_fiber_ctx *from, sp_fiber_ctx *to) {
+  void *fake = NULL;
+  sp_ctx_left = from;
+  __sanitizer_start_switch_fiber(&fake, to->asan_lo, to->asan_size);
+  sp_ctx_swap_raw(from, to);
+  sp_ctx_arrived(fake);
+}
+#define SP_CTX_ENTERED() sp_ctx_entered()
+#else
+#define SP_CTX_ENTERED() ((void)0)
+#endif
 #else  /* ucontext fallback */
 void sp_ctx_swap(sp_fiber_ctx *from, sp_fiber_ctx *to) { swapcontext(&from->uc, &to->uc); }
+#define SP_CTX_ENTERED() ((void)0)
 #endif
 
 /* ---- Reached by name in the generated TU ---- */
@@ -142,7 +180,7 @@ SP_NORETURN void sp_raise_cls(const char *cls, const char *msg);
    catch tags are saved/restored around each context switch so a raise/throw
    can't longjmp into a suspended fiber's stack frame, and an unhandled fiber
    raise is re-raised in the resumer's context rather than crossing stacks. */
-#include <setjmp.h>
+#include "sp_setjmp.h"
 void *sp_exc_ctx_new(void);
 void sp_exc_ctx_free(void *p);
 void sp_exc_ctx_save(void *p);
@@ -199,6 +237,18 @@ static void sp_FiberStore_set(sp_FiberStore *s, sp_sym k, sp_RbVal v) {SP_GC_ROO
   }
   s->keys[s->len] = k; s->vals[s->len] = v; s->len++;
 }
+/* drop key k, keeping the order of the rest */
+static void sp_FiberStore_delete(sp_FiberStore *s, sp_sym k) {
+  for (sp_int i = 0; i < s->len; i++) {
+    if (s->keys[i] != k) continue;
+    for (sp_int j = i + 1; j < s->len; j++) {
+      s->keys[j - 1] = s->keys[j];
+      s->vals[j - 1] = s->vals[j];
+    }
+    s->len--;
+    return;
+  }
+}
 static sp_FiberStore *sp_FiberStore_dup(sp_FiberStore *o) {SP_GC_ROOT(o);
   sp_FiberStore *s = sp_FiberStore_new();
   for (sp_int i = 0; i < o->len; i++) sp_FiberStore_set(s, o->keys[i], o->vals[i]);
@@ -251,13 +301,14 @@ SP_TLS sp_Fiber *sp_fiber_current = &sp_fiber_root;    /* extern: read by the ge
    workers from their startup). A no-op-shaped reset in the single-threaded build
    (sp_fiber_current already equals &sp_fiber_root). */
 /* A fault inside the current fiber's guard is a stack overflow, and it is
-   reported as one: without this the program died in ___chkstk_darwin on macOS
+   raised as one: without this the program died in ___chkstk_darwin on macOS
    or in a corrupted neighbour mapping on Linux, and nothing named the fiber
    stack (#4496). The handler runs on a per-thread alternate stack, since the
-   fiber's own is what just ran out, writes the line with write(2) only, then
-   restores the default disposition and returns so the faulting instruction
-   re-executes and the process dies the ordinary way (a core, the signal in
-   the exit status). Any other fault is left to the default just the same.
+   fiber's own is what just ran out. With no raise to make, it writes the line
+   with write(2) only, then restores the default disposition and returns so
+   the faulting instruction re-executes and the process dies the ordinary way
+   (a core, the signal in the exit status). Any other fault is left to the
+   default just the same.
    Installed once, only when nothing else has claimed the signal (the GC
    verifier's fault reporter, for one). */
 #include <signal.h>
@@ -265,6 +316,9 @@ SP_TLS sp_Fiber *sp_fiber_current = &sp_fiber_root;    /* extern: read by the ge
 #include <sys/resource.h>
 #ifdef SP_THREADS
 #include <pthread.h>    /* only where the build has it: see sp_thread_stack_bounds */
+#if defined(__OpenBSD__)
+#include <pthread_np.h> /* pthread_stackseg_np */
+#endif
 #endif
 /* Unblock signal a (and b, when nonzero) for the calling thread: a handler
    that leaves by a jump instead of a return has to, or the signal stays
@@ -279,17 +333,49 @@ void sp_sig_unblock(int a, int b) {
 }
 static void sp_fiber_fault_write(const char *s) { size_t n = strlen(s); while (n) { ssize_t w = write(2, s, n); if (w <= 0) break; s += w; n -= (size_t)w; } }
 static void sp_fiber_fault_write_num(size_t v) { char b[24]; int i = (int)sizeof b; b[--i] = 0; do { b[--i] = (char)('0' + v % 10); v /= 10; } while (v); sp_fiber_fault_write(b + i); }
+/* The handler this one stands in front of: the GC verifier's fault report,
+   which SPINEL_GC_VERIFY and SPINEL_GC_STRESS=2 install before main. Taking
+   its place only when it is that one keeps any other handler a host put
+   there; standing in front of it keeps a stack overflow SystemStackError
+   under the verifier, where the report, which runs on the stack that just
+   ran out, died of SIGILL. */
+static void (*sp_fiber_fault_chain)(int) = 0;
+/* What the program already printed is still in stdout's buffer, and neither
+   _exit nor death by a signal flushes it: a run that printed a hundred lines
+   and then overflowed would otherwise show none of them. fflush is not on
+   POSIX's async-signal-safe list, and this is a deliberate exception: the
+   buffer is stdio's, already allocated, so the flush allocates nothing and
+   is the write(2) of what is there. Only if the lock is free, though: another
+   worker holding stdout (the threaded build) would otherwise hang the dying
+   process on it. The case left is an overflow inside a stdout call on this
+   very thread, whose recursive lock this takes again: that flush can write
+   garbled output, on a path that is about to die anyway. The at_exit
+   hooks do NOT run -- they are Ruby code, and the stack they would run on is
+   the one that just ran out. */
+static void sp_fiber_fault_flush(void) {
+  if (ftrylockfile(stdout) == 0) { fflush(stdout); funlockfile(stdout); }
+}
 static void sp_fiber_fault_handler(int sig, siginfo_t *si, void *uctx) {
   (void)uctx;
   sp_Fiber *f = sp_fiber_current;
   char *a = si ? (char *)si->si_addr : NULL;
   /* The thread's own stack ran past its end: the fault lands in the OS guard
      just below it. Read as an ordinary segfault this killed the process where
-     CRuby raises SystemStackError and lets a rescue continue. The raise is
-     the generated TU's (it owns the exception stack). */
-  if (sp_stack_overflow_raise_fn && a && sp_thread_stack_lo &&
+     CRuby raises SystemStackError and lets a rescue continue. */
+  int thread_overflow = a && sp_thread_stack_lo &&
       a < sp_thread_stack_lo && a >= sp_thread_stack_lo - (ptrdiff_t)(1 << 20) &&
-      (!f || f == &sp_fiber_root || !f->stack)) {
+      (!f || f == &sp_fiber_root || !f->stack);
+  /* A green thread, Fiber or Enumerator body ran into the guard below its own
+     stack. It is the same SystemStackError, raised in that fiber: every
+     handler the exception slots hold while it runs was armed on its own stack
+     (sp_exc_ctx_load gave it its own set, and the trampoline arms the lowest
+     one), so the jump lands in one of the frames that filled it, and one the
+     body does not rescue ends the fiber the way any other raise does -- a
+     Thread's surfaces at #join / #value, a Fiber's at #resume. */
+  int fiber_overflow = f && f != &sp_fiber_root && f->stack &&
+      a >= f->stack && a < f->stack + sp_fiber_guard();
+  /* The raise is the generated TU's (it owns the exception stack). */
+  if (sp_stack_overflow_raise_fn && (thread_overflow || fiber_overflow)) {
     /* unblock the signal first: this raise does not return, and the mask it
        was entered with would otherwise stay blocked in the frame we jump to
        (on Linux longjmp does not restore it) */
@@ -302,27 +388,26 @@ static void sp_fiber_fault_handler(int sig, siginfo_t *si, void *uctx) {
       __sigreturn(NULL, 0x80000000 /* UC_RESET_ALT_STACK */, 0); }
 #endif
     sp_stack_overflow_raise_fn();   /* returns only if no handler is armed */
+  }
+  if (thread_overflow) {
     /* Nothing to rescue it: report it as the uncaught exception it is and
        leave, rather than letting the default disposition kill the process on
        a signal with nothing said. Writing a fixed string and _exit are all
        this handler may do -- the allocator is not safe to re-enter from a
        signal, and the stack a formatter would want is the one that just ran
        out. */
-    /* what the program already printed is still in stdout's buffer, and
-       _exit does not flush it: a run that printed a hundred lines and then
-       overflowed would otherwise show none of them. The at_exit hooks do NOT
-       run here -- they are Ruby code, and the stack they would run on is the
-       one that just ran out. */
-    fflush(stdout);
+    sp_fiber_fault_flush();
     sp_fiber_fault_write("stack level too deep (SystemStackError)\n");
     _exit(1);
   }
-  if (f && f != &sp_fiber_root && f->stack && a >= f->stack && a < f->stack + sp_fiber_guard()) {
+  if (fiber_overflow) {
+    sp_fiber_fault_flush();
     sp_fiber_fault_write("spinel: fiber stack overflow: a green thread, Fiber or Enumerator body ran past the ");
     sp_fiber_fault_write_num(f->stack_size / 1024);
     sp_fiber_fault_write(" KB C stack the fiber runs on (a deep call chain, a large local, or an unoptimised build "
                          "whose frames are far larger than -O2's); SPINEL_FIBER_STACK=<bytes> in the environment gives it more\n");
   }
+  if (sp_fiber_fault_chain) { sp_fiber_fault_chain(sig); return; }   /* the verifier's report */
   signal(sig, SIG_DFL);
 }
 void (*sp_stack_overflow_raise_fn)(void) = 0;
@@ -350,6 +435,13 @@ static void sp_thread_stack_bounds(char *here) {
   size_t sz = pthread_get_stacksize_np(self);
   sp_thread_stack_hi = hi;
   sp_thread_stack_lo = hi - sz;
+#elif defined(__OpenBSD__)
+  /* no pthread_getattr_np; ss_sp is the HIGH end, as on macOS */
+  stack_t ss;
+  if (pthread_stackseg_np(self, &ss) == 0) {
+    sp_thread_stack_hi = (char *)ss.ss_sp;
+    sp_thread_stack_lo = (char *)ss.ss_sp - ss.ss_size;
+  }
 #else
   pthread_attr_t at;
   void *base = 0; size_t sz = 0;
@@ -379,13 +471,26 @@ static void sp_thread_stack_bounds(char *here) {
 }
 
 static SP_TLS int sp_fiber_fault_armed = 0;
+/* this thread's sigaltstack buffer; external, so the store is not optimized away */
+SP_TLS void *sp_fiber_altstack;
 static void sp_fiber_fault_arm(void) {
+#ifdef SP_NO_SIGNALS
+  /* Targets with no signals (ESP32: newlib+FreeRTOS): no handler can be
+     installed, and the per-thread 64 KB sigaltstack buffer would be charged
+     against a ~400 KB DRAM budget for a handler that can never fire. Mark
+     armed so callers' once-semantics hold, and leave stack overflow to the
+     platform (FreeRTOS canary check / panic handler). */
+  sp_fiber_fault_armed = 1;
+#else
   if (sp_fiber_fault_armed) return;
   sp_fiber_fault_armed = 1;
   { char here; sp_thread_stack_bounds(&here); }
-  /* the alternate stack is per OS thread; workers live as long as the process */
+  /* the alternate stack is per OS thread; workers live as long as the process.
+     Its only other reference is the kernel's, so it is kept here too: a leak
+     checker (valgrind) reported the buffer as definitely lost. */
   size_t asz = 64 * 1024;
   void *as = malloc(asz);
+  sp_fiber_altstack = as;
   if (as) { stack_t ss; ss.ss_sp = as; ss.ss_size = asz; ss.ss_flags = 0; sigaltstack(&ss, NULL); }
   static int installed = 0;   /* process-wide: read racily, a second install is harmless */
   if (installed) return;
@@ -393,7 +498,8 @@ static void sp_fiber_fault_arm(void) {
   for (int i = 0; i < 2; i++) {
     struct sigaction cur;
     if (sigaction(sigs[i], NULL, &cur) != 0) continue;
-    if (!(cur.sa_flags & SA_SIGINFO) && cur.sa_handler != SIG_DFL) continue;
+    if (!(cur.sa_flags & SA_SIGINFO) && cur.sa_handler == sp_gc_fault_report) sp_fiber_fault_chain = sp_gc_fault_report;
+    else if (!(cur.sa_flags & SA_SIGINFO) && cur.sa_handler != SIG_DFL) continue;
     if ((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction) continue;
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = sp_fiber_fault_handler;
@@ -402,6 +508,7 @@ static void sp_fiber_fault_arm(void) {
     sigaction(sigs[i], &sa, NULL);
   }
   installed = 1;
+#endif /* SP_NO_SIGNALS */
 }
 /* Arm the fault handler for a program that never creates a fiber: the C
    stack it overflows is the thread's own, and the handler is what turns that
@@ -461,6 +568,7 @@ static sp_fiber_ctx sp_main_stack_caller;
 static sp_fiber_ctx sp_main_stack_ctx;
 
 static void sp_main_stack_entry(void) {
+  SP_CTX_ENTERED();
   sp_main_stack_body();
   /* back to main, on the stack the loader gave it, to return from there */
   sp_ctx_swap(&sp_main_stack_ctx, &sp_main_stack_caller);
@@ -559,33 +667,75 @@ else{void*obj=*e;if(obj)sp_gc_mark(obj);}}if(f->exc_ctx)sp_exc_ctx_mark(f->exc_c
    Set by the fibers hook, which runs before any object is scanned. */
 static sp_Fiber *sp_fiber_collecting = NULL;
 void sp_fiber_mark_chain(sp_Fiber*f){for(sp_Fiber*g=f;g;g=g->resumer){if(g==sp_fiber_current||g==sp_fiber_collecting)continue;if(g->stack)sp_gc_mark(g);/* a root fiber is a worker's native stack, not a heap object */sp_fiber_mark_roots(g);}}
-static void sp_mark_suspended_fibers(void){sp_fiber_collecting=sp_fiber_current;if(sp_fiber_current!=&sp_fiber_root)sp_fiber_mark_roots(&sp_fiber_root);if(sp_fiber_current)sp_fiber_mark_chain(sp_fiber_current->resumer);}
+static void sp_mark_suspended_fibers(void){sp_fiber_collecting=sp_fiber_current;if(sp_fiber_current!=&sp_fiber_root)sp_fiber_mark_roots(&sp_fiber_root);if(sp_fiber_current)sp_fiber_mark_chain(sp_fiber_current->resumer);
+  /* and the fiber a transferred one returns to, suspended in its transfer */
+  if(sp_fiber_current&&sp_fiber_current->return_to)sp_fiber_mark_chain(sp_fiber_current->return_to);}
 static void sp_fiber_install_gc_hook(void){if(!sp_gc_mark_suspended_fibers_hook)sp_gc_mark_suspended_fibers_hook=sp_mark_suspended_fibers;}
 static void sp_Fiber_fin(void*p){sp_Fiber*f=(sp_Fiber*)p;if(f->stack)munmap(f->stack,sp_fiber_guard()+f->stack_size);if(f->saved_roots)free(f->saved_roots);if(f->exc_ctx)sp_exc_ctx_free(f->exc_ctx);
 #ifdef SP_TSAN
   if(f->tsan_fiber)__tsan_destroy_fiber(f->tsan_fiber);
 #endif
   sp_fiber_list_remove(f);}
-static void sp_Fiber_scan(void*p){sp_Fiber*f=(sp_Fiber*)p;if(f->user_data)sp_gc_mark(f->user_data);if(f->storage)sp_gc_mark(f->storage);
+static void sp_Fiber_scan(void*p){sp_Fiber*f=(sp_Fiber*)p;if(f->user_data)sp_gc_mark(f->user_data);if(f->storage)sp_gc_mark(f->storage);if(f->attrs)sp_gc_mark(f->attrs);if(f->return_to)sp_gc_mark(f->return_to);
   /* a reachable suspended fiber keeps what its stack holds (its published
      roots); the running one's roots are live, a dead one's are gone */
   if(f!=sp_fiber_collecting&&f!=sp_fiber_current&&f->state!=3)sp_fiber_mark_roots(f);}
 sp_Fiber*sp_Fiber_new(void(*body)(sp_Fiber*)){sp_fiber_fault_arm();sp_Fiber*f=(sp_Fiber*)sp_gc_alloc(sizeof(sp_Fiber),sp_Fiber_fin,sp_Fiber_scan);{size_t _g=sp_fiber_guard();f->stack_size=sp_fiber_stack_bytes();
 /* MAP_NORESERVE: the stack is virtual space until touched, and a strict-overcommit host must not charge every fiber the whole of it (#4496) */
-f->stack=(char*)mmap(NULL,_g+f->stack_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK|MAP_NORESERVE,-1,0);if(f->stack==MAP_FAILED){f->stack=NULL;sp_raise_cls("FiberError","failed to allocate fiber stack");}mprotect(f->stack,_g,PROT_NONE);}f->state=0;f->transferred=0;f->body=body;f->yielded_value=sp_box_nil();f->resumed_value=sp_box_nil();f->user_data=NULL;f->saved_exc_top=0;f->saved_catch_top=0;f->exc_ctx=sp_exc_ctx_new();f->raised=0;f->raised_cls=NULL;f->raised_msg=NULL;f->raised_obj=NULL;f->inject=0;f->inject_defer=0;f->inj_cls=NULL;f->inj_msg=NULL;f->inj_obj=NULL;f->storage=NULL;f->saved_roots=NULL;f->saved_nroots=0;f->saved_roots_cap=0;f->fiber_next=NULL;f->fiber_prev=NULL;sp_fiber_list_add(f);sp_fiber_install_gc_hook();if(sp_fiber_current&&sp_fiber_current->storage){sp_Fiber*volatile _froot=f;int _pushed=0;if(sp_gc_nroots<SP_GC_STACK_MAX){sp_gc_roots[sp_gc_nroots++]=(void**)&_froot;_pushed=1;}f->storage=sp_FiberStore_dup((sp_FiberStore*)sp_fiber_current->storage);if(_pushed)sp_gc_nroots--;}
+f->stack=(char*)mmap(NULL,_g+f->stack_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK|MAP_NORESERVE,-1,0);if(f->stack==MAP_FAILED){f->stack=NULL;sp_raise_cls("FiberError","failed to allocate fiber stack");}mprotect(f->stack,_g,PROT_NONE);}f->state=0;f->transferred=0;f->body=body;f->yielded_value=sp_box_nil();f->resumed_value=sp_box_nil();f->user_data=NULL;f->saved_exc_top=0;f->saved_catch_top=0;f->exc_ctx=sp_exc_ctx_new();f->raised=0;f->raised_cls=NULL;f->raised_msg=NULL;f->raised_obj=NULL;f->inject=0;f->inject_defer=0;f->inj_cls=NULL;f->inj_msg=NULL;f->inj_obj=NULL;f->storage=NULL;f->attrs=NULL;f->birth_file=NULL;f->birth_line=0;f->pass_argc=-1;f->owner=sp_thread_owner_id();f->return_to=NULL;f->thread_main=0;f->blocking=0;f->saved_roots=NULL;f->saved_nroots=0;f->saved_roots_cap=0;f->fiber_next=NULL;f->fiber_prev=NULL;sp_fiber_list_add(f);sp_fiber_install_gc_hook();if(sp_fiber_current&&sp_fiber_current->storage){sp_Fiber*volatile _froot=f;int _pushed=0;if(sp_gc_nroots<SP_GC_STACK_MAX){sp_gc_roots[sp_gc_nroots++]=(void**)&_froot;_pushed=1;}sp_FiberStore*_fst=sp_FiberStore_dup((sp_FiberStore*)sp_fiber_current->storage);sp_gc_wb((void*)f);f->storage=_fst;if(_pushed)sp_gc_nroots--;}
 #ifdef SP_TSAN
   if(!sp_fiber_root.tsan_fiber)sp_fiber_root.tsan_fiber=__tsan_get_current_fiber();
   f->tsan_fiber=__tsan_create_fiber(0);f->caller_fiber=NULL;
 #endif
   return f;}
 sp_RbVal sp_Fiber_storage_get(sp_Fiber*f,sp_sym k){if(!f->storage)return sp_box_nil();return sp_FiberStore_get((sp_FiberStore*)f->storage,k);}
-void sp_Fiber_storage_set(sp_Fiber*f,sp_sym k,sp_RbVal v){SP_GC_ROOT_RBVAL(v);SP_GC_ROOT(f); sp_gc_wb((void*)f);if(!f->storage){f->storage=sp_FiberStore_new();sp_gc_wb((void*)f);}sp_FiberStore_set((sp_FiberStore*)f->storage,k,v);}   /* the store, not the head, is what the barrier has to follow: sp_FiberStore_new can collect */
+/* store v under k as it is, nil included */
+void sp_Fiber_storage_put(sp_Fiber*f,sp_sym k,sp_RbVal v){SP_GC_ROOT_RBVAL(v);SP_GC_ROOT(f); sp_gc_wb((void*)f);if(!f->storage){f->storage=sp_FiberStore_new();sp_gc_wb((void*)f);}sp_FiberStore_set((sp_FiberStore*)f->storage,k,v);}
+/* Fiber[k] = v: nil removes the key (CRuby) */
+void sp_Fiber_storage_set(sp_Fiber*f,sp_sym k,sp_RbVal v){
+  if(v.tag==SP_TAG_NIL){
+    if(f->storage)sp_FiberStore_delete((sp_FiberStore*)f->storage,k);
+    return;
+  }
+  sp_Fiber_storage_put(f,k,v);
+}
+/* the whole store, for Fiber#storage / #storage= (the Hash side is in
+   spinel_rt.h) */
+sp_int sp_Fiber_storage_len(sp_Fiber*f){
+  return f->storage?((sp_FiberStore*)f->storage)->len:0;
+}
+/* entry i: keep i below sp_Fiber_storage_len, which is 0 when there is no store */
+sp_sym sp_Fiber_storage_key(sp_Fiber*f,sp_int i){
+  return ((sp_FiberStore*)f->storage)->keys[i];
+}
+sp_RbVal sp_Fiber_storage_val(sp_Fiber*f,sp_int i){
+  return ((sp_FiberStore*)f->storage)->vals[i];
+}
+/* no store at all (#storage answers nil), or an empty one */
+void sp_Fiber_storage_clear(sp_Fiber*f){
+  sp_gc_wb((void*)f);
+  f->storage=NULL;
+}
+void sp_Fiber_storage_empty(sp_Fiber*f){
+  SP_GC_ROOT(f);
+  sp_FiberStore*s=sp_FiberStore_new();
+  sp_gc_wb((void*)f);
+  f->storage=s;
+}
+/* A `Fiber.attr_accessor` attribute: the fiber's own table, which -- unlike
+   `storage` -- a new fiber does not inherit (an attribute on a fresh fiber is
+   nil, as an ivar on a fresh object is). */
+sp_RbVal sp_Fiber_attr_get(sp_Fiber*f,sp_sym k){if(!f||!f->attrs)return sp_box_nil();return sp_FiberStore_get((sp_FiberStore*)f->attrs,k);}
+void sp_Fiber_attr_set(sp_Fiber*f,sp_sym k,sp_RbVal v){if(!f)return;SP_GC_ROOT_RBVAL(v);SP_GC_ROOT(f); sp_gc_wb((void*)f);if(!f->attrs){f->attrs=sp_FiberStore_new();sp_gc_wb((void*)f);}sp_FiberStore_set((sp_FiberStore*)f->attrs,k,v);}   /* the store, not the head, is what the barrier has to follow: sp_FiberStore_new can collect */
 /* Internal class name of the Fiber#kill signal. It is raised to unwind the
    fiber (running ensure blocks) but is excluded from every user rescue clause by
    the codegen (emit_begin), so only ensures run; the trampoline below recognizes
    it and terminates without propagating. Must stay in sync with the literal the
    codegen emits in src/codegen_stmt.c. */
 #define SP_FIBER_KILL_CLS "FiberKillSignal"
+/* the kill signal's message when it is aimed at a main fiber: fibers pass it
+   on up instead of ending there (see sp_Fiber_kill) */
+#define SP_FIBER_KILL_MAIN "main"
 
 /* The inject slot is written by another OS thread (Thread#kill/#raise under the
    scheduler lock) but read lock-free by the target's own paths (the trampoline,
@@ -640,15 +790,59 @@ void sp_fiber_set_raise_inject(sp_Fiber*f,const char*cls,const char*msg,void*obj
 void sp_fiber_set_kill_inject(sp_Fiber*f){SP_GC_ROOT(f);sp_fiber_inject_publish(f,2,NULL,NULL,NULL);}
 void sp_fiber_defer_inject(void){sp_Fiber*f=sp_fiber_current;if(f)f->inject_defer++;}
 void sp_fiber_undefer_inject(void){sp_Fiber*f=sp_fiber_current;if(f&&f->inject_defer)f->inject_defer--;}
-void sp_fiber_fire_inject_if_pending(void){sp_Fiber*f=sp_fiber_current;if(f&&!f->inject_defer&&SP_INJECT_PEEK(f))sp_fiber_consume_inject(f);}
+void sp_fiber_fire_inject_if_pending(void){sp_Fiber*f=sp_fiber_current;if(!f||f->inject_defer)return;if(SP_INJECT_PEEK(f)){sp_fiber_consume_inject(f);return;}
+  /* A #kill/#raise of a thread that is inside a Fiber it resumed: it is
+     delivered in that fiber, and a kill goes on up to the thread's own. */
+  if(f->thread_main||f==&sp_fiber_root)return;
+  sp_Fiber*m=sp_thread_main_fiber();if(!m||!SP_INJECT_PEEK(m))return;
+  SP_GC_ROOT(m);int kind=sp_fiber_inject_lock(m);const char*cl=m->inj_cls;const char*ms=m->inj_msg;void*ob=m->inj_obj;m->inj_cls=NULL;m->inj_msg=NULL;m->inj_obj=NULL;sp_fiber_inject_unlock(m,0);
+  if(kind==2)sp_raise_cls(SP_FIBER_KILL_CLS,(&("\xff" SP_FIBER_KILL_MAIN)[1]));else sp_fiber_reraise(cl,ms,ob);}
 /* Lock-free peek for the scheduler's pre-park checks (sp_sched_block etc.). */
 int sp_fiber_inject_pending(sp_Fiber*f){return SP_INJECT_PEEK(f)!=0;}
 SP_NORETURN void sp_fiber_raise_kill_self(void){sp_raise_cls(SP_FIBER_KILL_CLS,(&("\xff")[1]));}
-static void sp_fiber_trampoline(void){sp_Fiber*f=sp_fiber_current;jmp_buf base;if(setjmp(base)==0){sp_exc_arm(base);{int _inj=SP_INJECT_PEEK(f);if(_inj&&_inj!=3)sp_fiber_consume_inject(f);}/* a thread raise (3) defers to the body's first suspension point */f->body(f);sp_exc_disarm();}
-else{const char*_cc=sp_exc_cur_cls();if(_cc&&!strcmp(_cc,SP_FIBER_KILL_CLS)){/* killed: ensures already ran while unwinding; terminate without propagating */}
-else{f->raised=1;f->raised_cls=_cc;f->raised_msg=sp_exc_cur_msg();f->raised_obj=sp_exc_cur_obj();}}f->state=3;f->saved_nroots=0;/* dead: the snapshot points into unwound frames; never mark it */if(f->transferred){sp_fiber_current=&sp_fiber_root;SP_TSAN_SWITCH(&sp_fiber_root);sp_ctx_swap(&f->ctx,&sp_fiber_root.ctx);}
+static void sp_fiber_trampoline(void){SP_CTX_ENTERED();sp_Fiber*f=sp_fiber_current;jmp_buf base;if(setjmp(base)==0){sp_exc_arm(base);{int _inj=SP_INJECT_PEEK(f);if(_inj&&_inj!=3)sp_fiber_consume_inject(f);}/* a thread raise (3) defers to the body's first suspension point */f->body(f);sp_exc_disarm();}
+else{const char*_cc=sp_exc_cur_cls();
+  int killed=_cc&&!strcmp(_cc,SP_FIBER_KILL_CLS);
+  /* a kill aimed at a main fiber goes on up to it, like an exception */
+  const char*_km=killed?sp_exc_cur_msg():NULL;
+  if(_km&&!strcmp(_km,SP_FIBER_KILL_MAIN)&&f!=sp_thread_main_fiber())killed=0;
+  if(killed){
+  /* killed: ensures already ran while unwinding; end without propagating,
+     and #resume answers nil rather than whatever it last yielded */
+  f->yielded_value=sp_box_nil();}
+else{f->raised=1;f->raised_cls=_cc;f->raised_msg=sp_exc_cur_msg();f->raised_obj=sp_exc_cur_obj();}}f->state=3;f->saved_nroots=0;/* dead: the snapshot points into unwound frames; never mark it */if(f->transferred){
+  /* back to the fiber it returns to, whose transfer answers the block's result */
+  sp_Fiber*home=f->return_to&&f->return_to->state!=3?f->return_to:sp_thread_main_fiber();
+  if(!home||home==f)home=sp_sched_home_fiber();
+  home->resumed_value=f->yielded_value;sp_fiber_current=home;
+  SP_TSAN_SWITCH(home);sp_ctx_swap(&f->ctx,&home->ctx);}
 else{SP_TSAN_SWITCH(f->caller_fiber);sp_ctx_swap(&f->ctx,&f->caller_ctx);}}
-sp_RbVal sp_Fiber_resume(sp_Fiber*f,sp_RbVal val){SP_GC_ROOT_RBVAL(val);SP_GC_ROOT(f);if(f->state==3){sp_raise_cls("FiberError","attempt to resume a terminated fiber");}if(f->transferred){sp_raise_cls("FiberError","attempt to resume a transferred fiber");}if(f->state==1){sp_raise_cls("FiberError","attempt to resume a resumed fiber (double resume)");}f->resumed_value=val;sp_Fiber*prev=sp_fiber_current;sp_fiber_save_roots(prev);sp_fiber_restore_roots(f);if(!prev->exc_ctx)prev->exc_ctx=sp_exc_ctx_new();sp_exc_ctx_save(prev->exc_ctx);sp_exc_ctx_load(f->exc_ctx);f->resumer=prev;sp_fiber_current=f;SP_TSAN_SET_CALLER(f,prev);SP_TSAN_SWITCH(f);if(f->state==0){f->state=1;sp_ctx_make(&f->ctx,f->stack+sp_fiber_guard(),f->stack_size,sp_fiber_trampoline);sp_ctx_swap(&f->caller_ctx,&f->ctx);}
+/* A fiber belongs to the thread that made it (CRuby's rule). */
+static void sp_fiber_check_thread(sp_Fiber*f){
+  if(f->owner&&f->owner!=sp_thread_owner_id())
+    sp_raise_cls("FiberError","fiber called across threads");
+}
+/* f is waiting in its #resume of a fiber on the running chain. */
+static int sp_fiber_resuming(sp_Fiber*f){
+  for(sp_Fiber*g=sp_fiber_current;g;){
+    if(g->resumer){if(g->resumer==f)return 1;g=g->resumer;}
+    else g=g->return_to;
+  }
+  return 0;
+}
+/* CRuby's refusals for a resume target, in its order. A root fiber has no
+   stack and is never resumable: it is current, resuming, or transferring.
+   That holds for the main thread's root asked from another thread too, which
+   is not this worker's root, so the test is the missing stack. */
+static void sp_fiber_check_resume(sp_Fiber*f){
+  if(f->state==3)sp_raise_cls("FiberError","attempt to resume a terminated fiber");
+  if(f==sp_fiber_current)sp_raise_cls("FiberError","attempt to resume the current fiber");
+  if(f->resumer)sp_raise_cls("FiberError","attempt to resume a resumed fiber (double resume)");
+  if(sp_fiber_resuming(f))sp_raise_cls("FiberError","attempt to resume a resuming fiber");
+  if(f->transferred||f==&sp_fiber_root||!f->stack)sp_raise_cls("FiberError","attempt to resume a transferring fiber");
+  if(f->state==1)sp_raise_cls("FiberError","attempt to resume a resumed fiber (double resume)");
+}
+sp_RbVal sp_Fiber_resume(sp_Fiber*f,sp_RbVal val){SP_GC_ROOT_RBVAL(val);SP_GC_ROOT(f);sp_fiber_check_thread(f);sp_fiber_check_resume(f);f->resumed_value=val;sp_Fiber*prev=sp_fiber_current;sp_fiber_save_roots(prev);sp_fiber_restore_roots(f);if(!prev->exc_ctx)prev->exc_ctx=sp_exc_ctx_new();sp_exc_ctx_save(prev->exc_ctx);sp_exc_ctx_load(f->exc_ctx);f->resumer=prev;sp_fiber_current=f;SP_TSAN_SET_CALLER(f,prev);SP_TSAN_SWITCH(f);if(f->state==0){f->state=1;sp_ctx_make(&f->ctx,f->stack+sp_fiber_guard(),f->stack_size,sp_fiber_trampoline);sp_ctx_swap(&f->caller_ctx,&f->ctx);}
 else{f->state=1;sp_ctx_swap(&f->caller_ctx,&f->ctx);}f->resumer=NULL;sp_exc_ctx_save(f->exc_ctx);sp_exc_ctx_load(prev->exc_ctx);if(f->state!=3)sp_fiber_save_roots(f);sp_fiber_restore_roots(prev);sp_fiber_current=prev;if(f->raised){f->raised=0;const char*rc=f->raised_cls;const char*rm=f->raised_msg;void*ro=f->raised_obj;f->raised_obj=NULL;sp_fiber_reraise(rc,rm,ro);}return f->yielded_value;}
 /* Fiber.yield is only valid inside a fiber entered via #resume. The root fiber
    was never resumed, and a fiber entered via #transfer has no resumer to return
@@ -656,6 +850,27 @@ else{f->state=1;sp_ctx_swap(&f->caller_ctx,&f->ctx);}f->resumer=NULL;sp_exc_ctx_
    context, so raise instead (matching CRuby's FiberError). */
 sp_RbVal sp_Fiber_yield(sp_RbVal val){SP_GC_ROOT_RBVAL(val);sp_Fiber*f=sp_fiber_current;if(f==&sp_fiber_root||f->transferred){sp_raise_cls("FiberError","attempt to yield on a not resumed fiber");}f->yielded_value=val;f->state=2;SP_TSAN_SWITCH(f->caller_fiber);sp_ctx_swap(&f->ctx,&f->caller_ctx);if(!f->inject_defer&&SP_INJECT_PEEK(f))sp_fiber_consume_inject(f);return f->resumed_value;}
 sp_bool sp_Fiber_alive(sp_Fiber*f){return f->state!=3;}
+/* A main fiber -- the root (no stack of its own) or a Thread's -- is
+   blocking; a Fiber.new one only when asked to be. */
+sp_bool sp_Fiber_blocking_p(sp_Fiber*f){
+  return f->stack==NULL||f->thread_main||f->blocking;
+}
+sp_Fiber*sp_Fiber_at(sp_Fiber*f,const char*file,sp_int line){if(f){f->birth_file=file;f->birth_line=line;}return f;}
+/* Fiber#inspect: CRuby's #<Fiber:0xADDR file:line (status)>. Only the
+   running fiber is "resumed"; one waiting in #resume of another is
+   "suspended by resuming". */
+const char*sp_Fiber_inspect(sp_Fiber*f){
+  extern const char*sp_sprintf(const char*fmt,...);
+  if(!f)return "nil";
+  const char*st="suspended";
+  if(f->state==0&&f!=&sp_fiber_root)st="created";
+  else if(f->state==3)st="terminated";
+  else if(f==sp_fiber_current)st="resumed";
+  else for(sp_Fiber*g=sp_fiber_current->resumer;g;g=g->resumer)if(g==f){st="suspended by resuming";break;}
+  if(f->birth_file)
+    return sp_sprintf("#<Fiber:0x%016llx %s:%lld (%s)>",(unsigned long long)(uintptr_t)f,f->birth_file,(long long)f->birth_line,st);
+  return sp_sprintf("#<Fiber:0x%016llx (%s)>",(unsigned long long)(uintptr_t)f,st);
+}
 /* Fiber#raise: queue an exception, then resume the fiber so its suspension point
    (or body entry) raises it. An unhandled raise propagates to this caller via
    sp_Fiber_resume's re-raise, exactly like an exception raised by the body. */
@@ -676,6 +891,20 @@ sp_RbVal sp_Fiber_raise(sp_Fiber*f,const char*cls,const char*msg,void*obj){SP_GC
    bypassed) until the trampoline terminates it. An unstarted fiber never ran its
    body, so it is just marked dead. Returns the fiber, matching CRuby. */
 sp_Fiber*sp_Fiber_kill(sp_Fiber*f){SP_GC_ROOT(f);
+  /* A main fiber: the root (no stack of its own) or a Thread's own fiber. */
+  int main_fiber=f->stack==NULL||f->thread_main;
+  /* the running thread's: the root only counts on the main thread */
+  int ours=f->stack==NULL?sp_thread_main_fiber()==NULL:f==sp_thread_main_fiber();
+  /* Killing the main fiber of the program or of a Thread ends that program
+     or thread, as in CRuby: the signal unwinds every fiber on the way. */
+  if(main_fiber&&ours)
+    sp_raise_cls(SP_FIBER_KILL_CLS,(&("\xff" SP_FIBER_KILL_MAIN)[1]));
+  /* Another thread's fiber is refused before anything is queued on it,
+     with CRuby's messages. */
+  if(main_fiber)sp_raise_cls("FiberError","attempt to resume a transferring fiber");
+  sp_fiber_check_thread(f);
+  /* a fiber killing itself unwinds right here */
+  if(f==sp_fiber_current)sp_fiber_raise_kill_self();
   if(f->state==3)return f;             /* already dead: no-op */
   if(f->state==0){f->state=3;return f;}/* unstarted: nothing to unwind */
   sp_fiber_inject_publish(f,2,NULL,NULL,NULL);
@@ -686,7 +915,27 @@ sp_Fiber*sp_Fiber_kill(sp_Fiber*f){SP_GC_ROOT(f);
    unhandled termination exception PENDING in f->raised for the caller to
    consume. sp_Fiber_transfer re-raises it (Fiber semantics); the thread
    scheduler captures it instead (sp_Fiber_transfer_catch). */
-static sp_RbVal sp_Fiber_transfer_core(sp_Fiber*f,sp_RbVal val){SP_GC_ROOT(f);f->resumed_value=val;sp_Fiber*prev=sp_fiber_current;sp_fiber_save_roots(prev);sp_fiber_restore_roots(f);if(!prev->exc_ctx)prev->exc_ctx=sp_exc_ctx_new();sp_exc_ctx_save(prev->exc_ctx);sp_exc_ctx_load(f->exc_ctx);sp_fiber_current=f;SP_TSAN_SET_CALLER(f,prev);SP_TSAN_SWITCH(f);if(f->state==0&&f!=&sp_fiber_root){f->state=1;f->transferred=1;sp_ctx_make(&f->ctx,f->stack+sp_fiber_guard(),f->stack_size,sp_fiber_trampoline);sp_ctx_swap(&prev->ctx,&f->ctx);}
+/* CRuby's refusals for a transfer target. The root fiber passes, and so does
+   a live fiber already entered by transfer (what the scheduler switches to). */
+static void sp_fiber_check_transfer(sp_Fiber*f){
+  /* the main thread's root, from another thread: it has no owner to check */
+  if(!f->stack&&sp_thread_main_fiber())sp_raise_cls("FiberError","fiber called across threads");
+  if(f==&sp_fiber_root||f==sp_fiber_current)return;
+  if(f->state==3)sp_raise_cls("FiberError","dead fiber called");
+  if(f->transferred)return;
+  if(f->state==2)sp_raise_cls("FiberError","attempt to transfer to a yielding fiber");
+  /* resuming: waiting in #resume of a fiber on the running chain. One that
+     is only suspended in its own transfer may be transferred back to. */
+  for(sp_Fiber*g=sp_fiber_current;g;){
+    if(g->resumer){if(g->resumer==f)sp_raise_cls("FiberError","attempt to transfer to a resuming fiber");g=g->resumer;}
+    else g=g->return_to;
+  }
+}
+/* The switch itself, past CRuby's checks: save prev's (the current fiber's)
+   context and run f. Inlined, so a transfer costs what it did before the
+   scheduler's switch shared it. The caller roots f. */
+static SP_INLINE sp_RbVal sp_fiber_switch(sp_Fiber*f,sp_Fiber*prev,sp_RbVal val){f->resumed_value=val;
+  sp_fiber_save_roots(prev);sp_fiber_restore_roots(f);if(!prev->exc_ctx)prev->exc_ctx=sp_exc_ctx_new();sp_exc_ctx_save(prev->exc_ctx);sp_exc_ctx_load(f->exc_ctx);sp_fiber_current=f;SP_TSAN_SWITCH(f);if(f->state==0&&f!=&sp_fiber_root){f->state=1;f->transferred=1;sp_ctx_make(&f->ctx,f->stack+sp_fiber_guard(),f->stack_size,sp_fiber_trampoline);sp_ctx_swap(&prev->ctx,&f->ctx);}
 else{/* the root fiber is the implicit running coroutine: it has no mmap'd
    stack/body, so it must never be ctx_make'd. Its context was already
    saved into root.ctx by the first transfer away from it, so transferring
@@ -697,11 +946,35 @@ else{/* the root fiber is the implicit running coroutine: it has no mmap'd
    and freeing its live locals on the next collection -- and, since f may already
    be running on another worker (woken between its switch-out and here), that
    write races that worker's load of f's context. We only restore prev's. */sp_exc_ctx_load(prev->exc_ctx);sp_fiber_restore_roots(prev);sp_fiber_current=prev;return prev->resumed_value;}
+static sp_RbVal sp_Fiber_transfer_core(sp_Fiber*f,sp_RbVal val){SP_GC_ROOT(f);sp_fiber_check_thread(f);sp_fiber_check_transfer(f);sp_Fiber*prev=sp_fiber_current;
+  /* it returns where its transferrer would: to that fiber if it was resumed */
+  if(f!=&sp_fiber_root&&f!=prev)f->return_to=prev->resumer?prev:prev->return_to;
+  /* TSan's caller is set by the transfer, not by the scheduler's switch back:
+     a resumed fiber's caller is its resumer, which its Fiber.yield goes to */
+  SP_TSAN_SET_CALLER(f,prev);
+  return sp_fiber_switch(f,prev,val);}
+/* A green thread's switch back to the fiber that ran it (sp_sched.c). That
+   may be a Fiber the main thread resumed, which a transfer would refuse (it
+   is the main thread's, and resumed), and it is not the green thread's to
+   return to when its body ends, so it leaves return_to alone, and under TSan
+   caller_fiber too. */
+void sp_fiber_sched_switch(sp_Fiber*f){SP_GC_ROOT(f);sp_fiber_switch(f,sp_fiber_current,sp_box_nil());}
 sp_RbVal sp_Fiber_transfer(sp_Fiber*f,sp_RbVal val){SP_GC_ROOT_RBVAL(val);SP_GC_ROOT(f);sp_RbVal r=sp_Fiber_transfer_core(f,val);if(f->raised){f->raised=0;const char*rc=f->raised_cls;const char*rm=f->raised_msg;void*ro=f->raised_obj;f->raised_obj=NULL;sp_fiber_reraise(rc,rm,ro);}return r;}
+/* resume / transfer that also tell the body how many values were passed */
+sp_RbVal sp_Fiber_resume_n(sp_Fiber*f,sp_RbVal val,int argc){SP_GC_ROOT(f);f->pass_argc=argc;sp_RbVal r=sp_Fiber_resume(f,val);f->pass_argc=-1;return r;}
+sp_RbVal sp_Fiber_transfer_n(sp_Fiber*f,sp_RbVal val,int argc){SP_GC_ROOT(f);f->pass_argc=argc;sp_RbVal r=sp_Fiber_transfer(f,val);f->pass_argc=-1;return r;}
 /* Thread scheduler transfer: on f's unhandled termination exception, hand the
    (cls,msg,obj) back through *out_* and set *out_raised, rather than re-raising
    in the caller (the scheduler stores it on the green thread for #join/#value).
-   A non-terminating transfer (f yielded back) leaves *out_raised 0. */
-sp_RbVal sp_Fiber_transfer_catch(sp_Fiber*f,sp_RbVal val,int*out_raised,const char**out_cls,const char**out_msg,void**out_obj){SP_GC_ROOT_RBVAL(val);SP_GC_ROOT(f);sp_RbVal r=sp_Fiber_transfer_core(f,val);*out_raised=f->raised;if(f->raised){f->raised=0;*out_cls=f->raised_cls;*out_msg=f->raised_msg;*out_obj=f->raised_obj;f->raised_obj=NULL;}return r;}
+   A non-terminating transfer (f yielded back) leaves *out_raised 0.
+   The thread's fiber returns to no fiber: the fibers it transfers to end in
+   it, and its own body ends where its yields go, in the fiber that ran it
+   (sp_sched_home_fiber). The main thread may run it from inside a Fiber,
+   whose chain is not the thread's. When the thread stopped inside a Fiber
+   it resumed, `at`, the switch goes there, still with f's bookkeeping. */
+sp_RbVal sp_Fiber_transfer_catch(sp_Fiber*f,sp_Fiber*at,sp_RbVal val,int*out_raised,const char**out_cls,const char**out_msg,void**out_obj){SP_GC_ROOT_RBVAL(val);SP_GC_ROOT(f);sp_Fiber*prev=sp_fiber_current;f->return_to=NULL;sp_RbVal r;
+  if(at){SP_GC_ROOT(at);r=sp_fiber_switch(at,prev,val);}
+  else{sp_fiber_check_thread(f);sp_fiber_check_transfer(f);SP_TSAN_SET_CALLER(f,prev);r=sp_fiber_switch(f,prev,val);}
+  *out_raised=f->raised;if(f->raised){f->raised=0;*out_cls=f->raised_cls;*out_msg=f->raised_msg;*out_obj=f->raised_obj;f->raised_obj=NULL;}return r;}
 
-void sp_mark_fiber_root_storage(void){if(sp_fiber_root.storage)sp_gc_mark(sp_fiber_root.storage);}
+void sp_mark_fiber_root_storage(void){if(sp_fiber_root.storage)sp_gc_mark(sp_fiber_root.storage);if(sp_fiber_root.attrs)sp_gc_mark(sp_fiber_root.attrs);}

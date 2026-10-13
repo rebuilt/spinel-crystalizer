@@ -1,3 +1,5 @@
+# spinel: not-cruby -- typed-slot refusals (a String into an Integer array, a
+# false into an Integer parameter) raise here where CRuby takes the value.
 # Regression: the NO-user-`call` poly `.call` fast path and the poly `[]`
 # runtime arms must apply the same per-position legacy sp_int ABI gate as the
 # shadowed pre-arm.
@@ -203,9 +205,10 @@ expect_nome("ptr_arg")   { [ScalarArg.new.method(:add1)][0].call("s") }
 ptr_args = ["s"]
 expect_nome("ptr_splat") { [ScalarArg.new.method(:add1)][0].call(*ptr_args) }
 
-# A rest parameter reached by a trailing runtime splat declines on the static
-# bound-Method path too: the splat's surplus would land in the trailing
-# sp_PolyArray* slot as an sp_int and the callee prologue would root it.
+# A rest parameter reached by a trailing runtime splat: the static
+# bound-Method path binds the arguments as a direct call does, the surplus in
+# the rest, where it once landed in the trailing sp_PolyArray* slot as an
+# sp_int and declined.
 rest_runtime_args = [1, 2, 3]
 expect_nome("rest_splat_static") { Base.new.method(:rest_unused).call(*rest_runtime_args) }
 
@@ -238,9 +241,9 @@ expect_raise("adapter_set_empty")  { adapt.method(:[]=).call(*empty_args) }
 sadapt = ["x"]
 expect_raise("sadapter_set_short") { sadapt.method(:[]=).call(0) }
 
-# A rest target whose optionals before the rest are omitted cannot be expanded
-# into the fixed cast (the omitted registers and the rest pointer are never
-# passed): decline like the poly-slot route instead of calling out of bounds.
+# A rest target whose optionals before the rest are omitted: each takes its
+# default and the rest an empty Array, as in a direct call, where the fixed
+# cast left their registers unpassed and declined.
 class RestOpt
   def m(a, b = 2, *r) = a + b
 end
@@ -275,10 +278,10 @@ expect_raise("adapter_get_proc_short") { ia6.method(:[]).to_proc.call() }
 puts ia6.inspect
 
 # A rest target with parameters AFTER the rest (a post-rest positional, a
-# declared keyword, or `**kwrest`) cannot ride the fixed `.call` cast: the rest
-# arm builds only the parameters up to the rest, so a trailing one read an
-# unpassed register (`def m(a, *r, c: 3); m.call(1, 2, 3)` answered garbage for
-# `c`). The poly-slot route declines these; the bound-Method path declines too.
+# declared keyword, or `**kwrest`): the bound-Method path binds them as a
+# direct call does, where its rest arm built only the parameters up to the
+# rest (`def m(a, *r, c: 3); m.call(1, 2, 3)` answered garbage for `c`) and
+# then declined.
 class RestTail
   def m(a, *r, c: 3) = [a, r, c]
   def p(a, *r, b) = [a, r, b]
@@ -288,26 +291,27 @@ expect_nome("rest_kw_static")   { RestTail.new.method(:m).call(1, 2, 3) }
 expect_nome("rest_post_static") { RestTail.new.method(:p).call(1, 2, 3) }
 # Through Method#to_proc the trampoline binds a keyword after the rest from
 # the call's keyword hash, so a required one the call omits is CRuby's
-# `missing keyword` whatever the positional count. The post-rest positional
-# still declines: the trampoline's fixed positional binding read the trailing
-# parameter's register from args[] and handed an unset register to the
-# callee, whose prologue rooted it -- a SIGSEGV.
+# `missing keyword` whatever the positional count. A post-rest positional
+# binds from the end of the arguments, where the fixed positional binding
+# read its register from args[] and declined.
 expect_nome("rest_kw_toproc")      { RestTail.new.method(:req).to_proc.call(1, 2, 3) }
 expect_nome("rest_kw_toproc_short") { RestTail.new.method(:req).to_proc.call(1) }
 expect_nome("rest_post_toproc")   { RestTail.new.method(:p).to_proc.call(1, 2, 3) }
-# A `**kwrest` after the rest is the same shape (the trailing slot has no
-# fixed C cast).
+# A `**kwrest` after the rest binds the same way, an empty Hash when the call
+# passes no keywords.
 class RestKwrest
   def m(a, *r, **kw) = [a, r, kw]
 end
 expect_nome("rest_kwrest_toproc") { RestKwrest.new.method(:m).to_proc.call(1, 2, 3) }
 
-# Over-arity on a bound array operator is not modeled: the wrapper/adapter C
-# cast has no slot for extra operands, so they are ignored where CRuby raises
-# ArgumentError (`[]` takes 1..2, `[]=` takes 2..3); the in-range slice forms
-# are ignored the same way.
+# A bound `[]` takes CRuby's counts: a start and a length slice, and a third
+# operand is CRuby's ArgumentError, where the wrapper's C function was called
+# with more arguments than it takes. Over-arity on a bound `[]=` adapter is
+# not modeled: its C cast has no slot for extra operands, so they are ignored
+# where CRuby assigns the slice (`[]=` takes 2..3).
 ia7 = [1, 2, 3]
-puts "iarr_get_over: #{ia7.method(:[]).call(0, 2, 3)}"
+expect_raise("iarr_get_over") { ia7.method(:[]).call(0, 2, 3) }
+puts "iarr_get_slice: #{ia7.method(:[]).call(1, 2).inspect}"
 ia8 = [1, 2, 3]
 puts "iarr_set_over: #{ia8.method(:[]=).call(0, 9, 8).inspect} #{ia8.inspect}"
 # A multi-value `push` through a poly slot declines where the static route
@@ -317,16 +321,16 @@ expect_nome("iarr_poly_push_multi") { [ia9.method(:push)][0].call(8, 9) }
 puts ia9.inspect
 
 
-# A parameter default that WRITES a method-scope local the body READS cannot be
-# answered from the bound call-site frame: the default runs there while the
-# body reads its own zeroed slot, so `def m(a, c = (z = a + 1; z)); z; end`
-# answered 0 where CRuby answers 6. The direct call is a C compile failure for
-# the same shape; these two routes decline instead of answering the zero.
+# A parameter default that WRITES a method-scope local the body READS: the
+# callee runs such a default itself (the parameter takes a sentinel default
+# and a guard binds it from the original), so the bound routes answer CRuby's
+# 6 for `def m(a, c = (z = a + 1; z)); z; end` -- they used to decline, as the
+# default ran in the call-site frame while the body read its own zeroed slot.
 class DefaultBodyLocal
   def m(a, c = (z = a + 1; z)) = z
 end
-expect_nome("default_body_local_call")   { DefaultBodyLocal.new.method(:m).call(5) }
-expect_nome("default_body_local_toproc") { DefaultBodyLocal.new.method(:m).to_proc.call(5) }
+puts "default_body_local_call: #{DefaultBodyLocal.new.method(:m).call(5)}"
+puts "default_body_local_toproc: #{DefaultBodyLocal.new.method(:m).to_proc.call(5)}"
 
 # A caller local spelled exactly like the frame's old rename prefix must not be
 # captured by the callee-local declaration; the unique name now begins with an
@@ -374,6 +378,8 @@ class KwRest
   def w(a, **kw) = [a, kw]
   def w2(a, b = 5, **kw) = [a, b, kw]
 end
+# The key a declared keyword does not take goes to the `**kwrest`, as in a
+# direct call, where the positional fallback declined.
 expect_nome("kwrest_unmatched")       { KwRest.new.method(:d).call(1, z: 2) }
 expect_raise("kwrest_positional_name") { KwRest.new.method(:w).call(a: 2) }
 puts KwRest.new.method(:w).call(1, z: 2).inspect
@@ -381,7 +387,7 @@ puts KwRest.new.method(:w).call(1, z: 2).inspect
 # the call cannot route the trailing hash to its kwrest slot: the fixed
 # positional fallback bound the hash to a scalar parameter and the generated C
 # failed to compile (`def w(a, **kw); w.call(z: 2)`). A missing positional now
-# raises CRuby's ArgumentError; the optional-gap shape declines.
+# raises CRuby's ArgumentError; the optional-gap shape binds its default.
 expect_raise("kwrest_gap_call")     { KwRest.new.method(:w).call(z: 2) }
 expect_nome("kwrest_gap_opt_call") { KwRest.new.method(:w2).call(1, z: 2) }
 expect_raise("kwrest_gap2_call")   { KwRest.new.method(:w2).call(z: 2) }
@@ -416,11 +422,10 @@ expect_nome("toproc_many_params_fixed") { ManyParams.new.method(:m17).to_proc.ca
 many_rest = (1..20).to_a
 expect_nome("toproc_rest_over") { ManyParams.new.method(:rest).to_proc.call(*many_rest) }
 
-# A `**kwrest` target cannot ride the fixed positional `to_proc` cast: the proc
-# ABI carries no keyword channel, so the bind==0 arm read an uninitialized
-# register as the sp_SymPolyHash* and the callee dereferenced it -- a SIGSEGV.
-# Decline with the same NoMethodError the rest-tail shapes use. (The direct
-# `.call` supports the shape: see poly_method_return_kinds.rb.)
+# A `**kwrest` target through `to_proc`: the trampoline collects the keys of
+# the call's keyword hash no declared keyword takes, where the fixed
+# positional arm read an uninitialized register as the sp_SymPolyHash* (a
+# SIGSEGV) and then declined.
 class KwRestProc
   def m(a, **k) = [a, k]
 end
@@ -450,7 +455,7 @@ expect_nome("toproc_req_kw")   { KwProc.new.method(:req).to_proc.call(1, c: 9) }
 expect_nome("toproc_req_nokw") { KwProc.new.method(:req).to_proc.call(1) }
 
 # A class value that is not a statically-known constant
-# (`self.class.method(:m)`) resolves no target, so the bind site stamps a NULL
+# (`self.class.method(:m)` in a class with a subclass) resolves no target, so the bind site stamps a NULL
 # fn. Invoking it -- directly, through a poly slot, or through #to_proc -- must
 # decline with NoMethodError rather than jump through NULL. CRuby answers this
 # specific shape, so the decline is a documented limitation; the guarantee
@@ -462,6 +467,7 @@ class ClassValueTarget
   def poly = (a = [self.class.method(:cm)]; a[0].call(3))
   def poly_proc = (a = [self.class.method(:cm)]; a[0].to_proc.call(3))
 end
+class ClassValueSub < ClassValueTarget; end
 expect_nome("class_value_call")     { ClassValueTarget.new.direct }
 expect_nome("class_value_toproc")   { ClassValueTarget.new.direct_proc }
 expect_nome("class_value_poly")     { ClassValueTarget.new.poly }

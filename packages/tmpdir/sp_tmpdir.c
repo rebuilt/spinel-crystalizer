@@ -73,15 +73,16 @@ static const char *tmpdir_mkdtemp(const char *prefix, const char *suffix,
   size_t suf_len = suffix ? strlen(suffix) : 0;
   size_t par_len = strlen(parent);
 
-  /* Format the date once: YYYYMMDD. */
-  char date[9];
+  /* Format the date once, in local time, as CRuby's
+     Time.now.strftime("%Y%m%d"): a year of four digits at least, then the
+     month and day. The buffer holds any int year, so the name is never cut
+     short; it is YYYYMMDD for years 1000 to 9999. */
+  char date[40];
   time_t now = time(NULL);
   struct tm tm;
-  gmtime_r(&now, &tm);  /* CRuby uses local time; gmtime for portability */
-  /* Actually CRuby uses Time.now which is local. Use localtime_r. */
   localtime_r(&now, &tm);
-  snprintf(date, sizeof(date), "%04d%02d%02d",
-           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+  int date_len = snprintf(date, sizeof(date), "%04d%02d%02d",
+                          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 
   /* Pre-format the constant middle: "-pid-". */
   char mid[32];
@@ -89,10 +90,10 @@ static const char *tmpdir_mkdtemp(const char *prefix, const char *suffix,
 
   /* Build path pieces. The final path is:
      parent + "/" + prefix + date + mid + random [+ "-N"] + suffix
-     Worst-case size: 4096 (parent) + 1 + 64 (prefix) + 8 (date) +
+     Worst-case size: 4096 (parent) + 1 + 64 (prefix) + date_len +
                       32 (mid) + 6 (random) + 8 ("-NNNNNNN") + 64 (suffix) */
   char path[PATH_MAX];
-  if (par_len + 1 + pre_len + 8 + 32 + 6 + 8 + suf_len >= sizeof(path))
+  if (par_len + 1 + pre_len + (size_t)date_len + 32 + 6 + 8 + suf_len >= sizeof(path))
     sp_raise_cls("ArgumentError", "tmpdir path too long");
 
   for (int n = 0; n < max_try; n++) {
@@ -103,7 +104,7 @@ static const char *tmpdir_mkdtemp(const char *prefix, const char *suffix,
     memcpy(path + pos, parent, par_len); pos += par_len;
     path[pos++] = '/';
     if (pre_len) { memcpy(path + pos, prefix, pre_len); pos += pre_len; }
-    memcpy(path + pos, date, 8); pos += 8;
+    memcpy(path + pos, date, date_len); pos += date_len;
     memcpy(path + pos, mid, mid_len); pos += mid_len;
     memcpy(path + pos, random, random_len); pos += random_len;
     if (n > 0) {
@@ -170,7 +171,11 @@ static int tmpdir_usable(const char *p) {
 static const char *tmpdir_expand(const char *p) {
   char raw[PATH_MAX];
   size_t n = 0;
+#if defined(_WIN32)
+  if (!sp_file_path_root_len(p)) {
+#else
   if (p[0] != '/') {
+#endif
     if (!getcwd(raw, sizeof(raw)))
       sp_raise_cls("ArgumentError", "cannot expand a relative TMPDIR: getcwd failed");
     n = strlen(raw);
@@ -188,7 +193,15 @@ static const char *tmpdir_expand(const char *p) {
      than climbing above it -- "/.." is "/", as it is on the filesystem. */
   char out[PATH_MAX];
   size_t len = 0;
+#if defined(_WIN32)
+  /* a drive's root ("C:/") is kept: ".." stops at it, and the walk starts
+     after it */
+  size_t floor = 0, i0 = 0;
+  if (sp_file_path_root_len(raw) == 3) { out[0] = raw[0]; out[1] = ':'; len = floor = 2; i0 = 2; }
+  for (size_t i = i0; i < n; ) {
+#else
   for (size_t i = 0; i < n; ) {
+#endif
     while (i < n && raw[i] == '/') i++;
     size_t b = i;
     while (i < n && raw[i] != '/') i++;
@@ -196,15 +209,24 @@ static const char *tmpdir_expand(const char *p) {
     if (clen == 0) continue;
     if (clen == 1 && raw[b] == '.') continue;
     if (clen == 2 && raw[b] == '.' && raw[b + 1] == '.') {
+#if defined(_WIN32)
+      while (len > floor && out[len - 1] != '/') len--;
+      if (len > floor) len--;   /* drop the separator too */
+#else
       while (len > 0 && out[len - 1] != '/') len--;
       if (len > 0) len--;   /* drop the separator too */
+#endif
       continue;
     }
     out[len++] = '/';
     memcpy(out + len, raw + b, clen);
     len += clen;
   }
+#if defined(_WIN32)
+  if (len == floor) out[len++] = '/';   /* every component cancelled: the root */
+#else
   if (len == 0) out[len++] = '/';   /* every component cancelled: the root */
+#endif
 
   char *r = sp_str_alloc_raw(len + 1);
   memcpy(r, out, len);

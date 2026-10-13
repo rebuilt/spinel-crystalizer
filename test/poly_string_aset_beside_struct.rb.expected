@@ -1,0 +1,40 @@
+["Qello", "Qello"]
+"Jello"
+"hEllo"
+["hellO", {k: "hellO"}]
+"aZc"
+"Ybc"
+"Wq"
+["W"]
+["hiPo", "hiPo"]
+"heLLo"
+#<struct P a=9>
+[NoMethodError, 5]
+[NoMethodError, :sym]
+[NoMethodError, nil]
+[NoMethodError, 2.5]
+[NoMethodError, true]
+FrozenError
+"lit"
+"0bc"
+"xyz"
+"xyz"
+"xyz"
+"xyz"
+"xyz"
+"xyz"
+:sym
+"aQc"
+"aQc"
+"XYc"
+"XYc"
+"Qbcd"
+"AQC"
+"XYc"
+"Qbcd"
+"xyz"
+"xyz"
+"xyz"
+"XYc"
+"aQcd"
+"abQ"

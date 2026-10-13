@@ -9,7 +9,10 @@
 /bin/
 /vendor/
 /lib/regexp/libspre.a
+lib/spinel_rt_responds_generated.h
 lib/libspinel_rt.a
+lib/libspinel_cext_rt.a
+lib/libspinel_cext_rec.a
 lib/libspinel_rt_mt.a
 lib/libspinel_rt_mt_tsan.a
 lib/wasm32-wasi/
@@ -38,3 +41,4 @@ CLAUDE.local.md
 # Downloaded gems
 *.gem
 .sccache/
+lib/win32/*.a

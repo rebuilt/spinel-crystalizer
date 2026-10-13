@@ -20,7 +20,7 @@ Ruby (.rb)
 parse (libprism)       Parse with Prism, linked in as a C library
     |                  (a CRuby + Prism-gem path produces the same AST)
     v
-text AST -> NodeTable  Loaded into an in-memory node table
+NodeTable              The walk fills an in-memory node table
     |
     v
 analyze                Whole-program type inference (src/analyze*.c).
@@ -44,7 +44,7 @@ Native binary           Standalone, no runtime dependencies
 Analyze and codegen run in one process and share the in-memory model:
 codegen reads the types analyze just inferred directly, with no
 serialization step in between. See [docs/internals/AST.md](docs/internals/AST.md)
-for the text AST format the parser emits and the analyzer consumes.
+for the node table the parser fills and the analyzer consumes.
 
 ## Quick Start
 
@@ -161,6 +161,11 @@ the compiler can see is a compile error (see
 turns out wrong at run time, narrowed out of a box into the slot, is
 reinterpreted rather than widened. See
 [docs/rbs-extract.md](docs/rbs-extract.md) for the supported subset.
+
+The same signatures can be written inline, as RBS comments in the Ruby
+source (`#: (Integer) -> String` above a `def`, `attr_reader :name #:
+String`); Spinel applies them on every compile, the same way. See
+[docs/inline-rbs.md](docs/inline-rbs.md).
 
 ## Benchmarks
 
@@ -388,8 +393,8 @@ Whole-program type inference drives several compile-time optimizations:
 ```
 spinel                Single binary: parse + analyze + codegen + cc driver
                       (repo-root symlink to build/spinel)
-src/spinel_parse.c    Frontend: libprism → text AST
-src/node_table.c      AST loader: text AST → in-memory NodeTable
+src/spinel_parse.c    Frontend: libprism → NodeTable
+src/node_table.c      The in-memory NodeTable and its --dump-ast printer
 src/analyze*.c        Whole-program type inference
 src/codegen*.c        C code generation
 src/main.c            CLI driver: pipeline + cc invocation
@@ -468,7 +473,7 @@ Generated C includes the header and links the archive; `--gc-sections`
 drops every unused runtime function from the final binary.
 
 The parser is **src/spinel_parse.c**, which links libprism directly (no
-CRuby needed) and emits the text AST the compiler consumes.
+CRuby needed) and fills the node table the compiler consumes.
 `require_relative` is resolved at parse time by inlining the referenced
 file.
 
@@ -522,16 +527,19 @@ The runtime is POSIX-flavoured and targets POSIX platforms:
 | macOS (Intel, Apple Silicon) | Supported | clang |
 | *BSD | Expected to work; not in CI | clang |
 | Windows | Use [WSL](https://learn.microsoft.com/windows/wsl/) (builds/runs as Linux) | gcc, clang |
+| Windows, native (x64) | Community-maintained, best effort; may lag behind master; see [docs/windows.md](docs/windows.md) | MinGW-w64 gcc (UCRT) |
 
 Every PR runs `ubuntu-latest / gcc`, `ubuntu-latest / clang`, and
 `macos-latest / clang` jobs end-to-end (parser build, codegen build,
-full test + benchmark suites). Native Windows (MinGW / MSVC) is not
-supported: the runtime relies on POSIX assumptions (`pthread` for the
-threaded runtime, `<sys/mman.h>` for the regexp engine's executable
-buffers, GCC's `__attribute__((cleanup))` for the GC root stack, and
-GCC/Clang inline assembly for the Fiber context switch). Windows users
-run Spinel under WSL, where it builds and runs as a native Linux
-toolchain.
+full test + benchmark suites). WSL is the dependable way to run Spinel
+on Windows: it builds and runs there as a native Linux toolchain. A native
+build with MinGW-w64 gcc (as MSYS2 and RubyInstaller's Devkit ship it) is
+community-maintained and best effort: the runtime is written against POSIX,
+and `lib/win32/` supplies the POSIX surface MinGW leaves out, the
+arrangement `lib/wasi/` is for WebAssembly, so the POSIX build is
+unchanged by it. CI does not run it; it may lag behind master, and if it
+gets in the way of a POSIX change it may be removed. See
+[docs/windows.md](docs/windows.md).
 
 ## Limitations
 

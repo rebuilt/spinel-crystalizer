@@ -214,6 +214,8 @@ typedef struct {
   uint32_t alt_from;        /* code index of the alternation's first SPLIT */
   uint32_t alt_to;          /* code index just past its last branch */
   mrb_bool has_call;        /* a \g call was emitted: resolve_calls() runs */
+  mrb_bool has_keep;        /* a \K was emitted, as an RE_SAVE to
+                               RE_KEEP_PENDING until the groups are counted */
   mrb_value pending_calls;  /* the \g references the parse could not resolve,
                                as re_pending_call records in a String the GC
                                arena keeps for the compile; nil until the
@@ -259,6 +261,10 @@ compile_error(re_compiler *c, const char *msg)
    stops matching text it describes. The check sits in emit(), the one place
    code_len grows, so it covers every producer including insert_inst(). */
 #define RE_MAX_CODE_LEN 0xffff
+
+/* The slot a \K's RE_SAVE carries until the groups are counted and its own
+   pair is known; no group's slot is this high (RE_MAX_CAPTURES). */
+#define RE_KEEP_PENDING 0xffff
 
 static uint32_t
 emit(re_compiler *c, uint8_t op, uint8_t a, uint16_t offset)
@@ -1494,6 +1500,72 @@ static const char *const prop_posix_names[] = {
 };
 
 #ifdef RE_UNICODE_CTYPE
+/* The long names of the general categories, normalized, with the short ones
+   each stands for: \p{Letter} is \p{L} and \p{Uppercase_Letter} \p{Lu}.
+   LC, a cased letter, has no category of its own and is the three it lists.
+   CRuby reads all of these. Digit, Cntrl and Punct are long names too, but
+   the POSIX names come first and hold the same characters. */
+static const struct {
+  const char *name;
+  char codes[3][3];
+} prop_gc_long_names[] = {
+  {"lc", {"Lu", "Ll", "Lt"}},
+  {"casedletter", {"Lu", "Ll", "Lt"}},
+  {"letter", {"L"}},
+  {"uppercaseletter", {"Lu"}},
+  {"lowercaseletter", {"Ll"}},
+  {"titlecaseletter", {"Lt"}},
+  {"modifierletter", {"Lm"}},
+  {"otherletter", {"Lo"}},
+  {"mark", {"M"}},
+  {"combiningmark", {"M"}},
+  {"nonspacingmark", {"Mn"}},
+  {"spacingmark", {"Mc"}},
+  {"enclosingmark", {"Me"}},
+  {"number", {"N"}},
+  {"decimalnumber", {"Nd"}},
+  {"letternumber", {"Nl"}},
+  {"othernumber", {"No"}},
+  {"punctuation", {"P"}},
+  {"connectorpunctuation", {"Pc"}},
+  {"dashpunctuation", {"Pd"}},
+  {"openpunctuation", {"Ps"}},
+  {"closepunctuation", {"Pe"}},
+  {"initialpunctuation", {"Pi"}},
+  {"finalpunctuation", {"Pf"}},
+  {"otherpunctuation", {"Po"}},
+  {"symbol", {"S"}},
+  {"mathsymbol", {"Sm"}},
+  {"currencysymbol", {"Sc"}},
+  {"modifiersymbol", {"Sk"}},
+  {"othersymbol", {"So"}},
+  {"separator", {"Z"}},
+  {"spaceseparator", {"Zs"}},
+  {"lineseparator", {"Zl"}},
+  {"paragraphseparator", {"Zp"}},
+  {"other", {"C"}},
+  {"control", {"Cc"}},
+  {"format", {"Cf"}},
+  {"privateuse", {"Co"}},
+  {"surrogate", {"Cs"}},
+  {"unassigned", {"Cn"}},
+};
+
+/* The categories the short name `code`, `n` letters long and in either case,
+   holds as a mask: a letter alone stands for every category it begins. */
+static uint32_t
+prop_gc_mask(const char *code, size_t n)
+{
+  uint32_t m = 0;
+  for (int i = 0; i < RE_PROP_GC_COUNT; i++) {
+    const char *gc = re_prop_gc_names[i];
+    if ((gc[0] | 32) == (code[0] | 32) && (n == 1 || gc[1] == (code[1] | 32))) {
+      m |= (uint32_t)1 << i;
+    }
+  }
+  return m;
+}
+
 /* TRUE where `raw`, normalized, is `norm`. */
 static mrb_bool
 prop_name_is(const char *norm, const char *raw)
@@ -1511,8 +1583,9 @@ prop_name_is(const char *norm, const char *raw)
 /* What the property `name` is, with its name normalized into `norm`: CRuby
    reads one without regard to case or to '_', '-' and ' ', and so does this.
    For a category the members are `*want` as a mask of the categories it
-   holds, a letter standing for every category it begins; for an emoji
-   property they are its bit. */
+   holds, a letter standing for every category it begins and a long name for
+   the ones prop_gc_long_names lists; for an emoji property they are its
+   bit. */
 static int
 prop_lookup(const char *name, size_t len, char *norm, uint32_t *want)
 {
@@ -1529,15 +1602,21 @@ prop_lookup(const char *name, size_t len, char *norm, uint32_t *want)
   }
 #ifdef RE_UNICODE_CTYPE
   if (n == 1 || n == 2) {
-    uint32_t m = 0;
-    for (int i = 0; i < RE_PROP_GC_COUNT; i++) {
-      const char *gc = re_prop_gc_names[i];
-      if (gc[0] + 32 == norm[0] && (n == 1 || gc[1] == norm[1])) m |= (uint32_t)1 << i;
-    }
+    uint32_t m = prop_gc_mask(norm, n);
     if (m) {
       *want = m;
       return RE_PROP_GC;
     }
+  }
+  for (size_t i = 0; i < sizeof(prop_gc_long_names) / sizeof(prop_gc_long_names[0]); i++) {
+    if (strcmp(norm, prop_gc_long_names[i].name) != 0) continue;
+    uint32_t m = 0;
+    for (int j = 0; j < 3 && prop_gc_long_names[i].codes[j][0]; j++) {
+      const char *code = prop_gc_long_names[i].codes[j];
+      m |= prop_gc_mask(code, strlen(code));
+    }
+    *want = m;
+    return RE_PROP_GC;
   }
   for (int i = 0; i < RE_PROP_EMOJI_COUNT; i++) {
     if (prop_name_is(norm, re_prop_emoji_names[i])) {
@@ -3871,14 +3950,30 @@ compile_atom(re_compiler *c)
       emit(c, RE_GPOS, 0, 0);
       c->needs_backtrack = TRUE;
     }
-    else if (ch == 'K' || ch == 'R' || ch == 'X') {
+    else if (ch == 'K') {
+      /* spinel: \K, keep: what was matched before it stays out of the
+         match, so $& and group 0 begin where it stood and the pre-match
+         takes the rest. It records its position in a pair of slots past the
+         groups, which a backtrack past it puts back as it does any capture;
+         keep_apply() moves the position into group 0 once the match is
+         made. Inside a lookaround CRuby's reading of it is not one this
+         follows, so it is refused there. */
+      for (uint32_t i = 0; i < c->level_count; i++) {
+        uint8_t k = c->levels[i].kind;
+        if (k == RE_LEVEL_LOOKAHEAD || k == RE_LEVEL_LOOKBEHIND || k == RE_LEVEL_ABSENT)
+          compile_error(c, "\\K inside a look-around or an absent operator is not supported");
+      }
+      next_char(c);
+      emit(c, RE_SAVE, 0, RE_KEEP_PENDING);
+      c->has_keep = TRUE;
+    }
+    else if (ch == 'R' || ch == 'X') {
       /* Each of these means something in CRuby that this engine does not do:
-         `\G` anchors at where the search began, `\K` drops what was matched
-         before it, `\R` is any linebreak and `\X` is a whole grapheme
-         cluster. Left to the fall-through each was simply its own letter, so
-         /\R/ matched an R rather than a newline. Inside a character class
-         CRuby reads them as the letter too, which is what the class parser
-         already does, so only the escape outside one is refused here. */
+         `\R` is any linebreak and `\X` is a whole grapheme cluster. Left to
+         the fall-through each was simply its own letter, so /\R/ matched an
+         R rather than a newline. Inside a character class CRuby reads them
+         as the letter too, which is what the class parser already does, so
+         only the escape outside one is refused here. */
       compile_error_str(c, mrb_format(c->mrb, "\\\\%c is not supported", (char)ch));
     }
     else if ((ch == 'p' || ch == 'P') && c->p + 1 < c->src_end && c->p[1] == '{') {
@@ -5619,6 +5714,21 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
      references a pattern accepts. */
   if (c.max_backref > c.num_groups) {
     compile_error(&c, "invalid backref number/name");
+  }
+
+  /* \K: its slots are the pair after the last group, known only now that
+     every group is counted (at most RE_MAX_CAPTURES, so the pair still fits
+     the array re_exec_attempt() searches into); a quantifier that copied
+     one copied the placeholder too. A group a \g call runs again may hold the \K, and
+     whether its position then counts is CRuby's question this does not
+     answer, so the two are not taken together. */
+  if (c.has_keep) {
+    if (c.has_call) compile_error(&c, "\\K in a pattern that calls a group (\\g) is not supported");
+    for (uint32_t i = 0; i < c.code_len; i++) {
+      if (pat->code[i].op == RE_SAVE && pat->code[i].offset == RE_KEEP_PENDING)
+        pat->code[i].offset = (uint16_t)(c.num_captures * 2);
+    }
+    pat->keep_slot = (uint16_t)(c.num_captures * 2);
   }
 
   /* group 0 end */

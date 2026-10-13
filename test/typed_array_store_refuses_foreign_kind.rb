@@ -10,8 +10,8 @@ rescue TypeError => e
   puts "#{label}: TypeError: #{e.message}"
 end
 # the boxed dispatch (out is a general slot: the call sites disagree). An
-# array built where the call can see it widens with the parameter and holds
-# what CRuby's does; one a method hands over stays typed and refuses.
+# array built where the call can follow it, a method's value too, widens
+# with the parameter and holds what CRuby's does.
 def collect(out, src)
   i = 0
   while i < src.length
@@ -45,6 +45,13 @@ def cat(out, src) = out.concat(src)
 k = Array.new(0, 0); try("concat") { cat(k, [1, "z"]) }; p k
 def fill_second(out, src) = out.fill(src[1])
 m = Array.new(2, 0); try("fill") { fill_second(m, [1, "z"]) }; p m
+# a push whose value is used (a method's last expression) refuses the same
+def push_float(out) = out << [2.5, 1][ARGV.size]
+v1 = [1]; try("<< value") { push_float(v1) }; p v1
+def push_int(out) = out.push([1, "a"][ARGV.size])
+v2 = ["a"]; try("push value") { push_int(v2) }; p v2
+def push_str(out) = out << ["z", 1.5][ARGV.size]
+v3 = [0.5]; try("<< value str") { push_str(v3) }; p v3
 # the adapter
 n = [1, 2]
 try("method push") { n.method(:push).call("z") }; p n

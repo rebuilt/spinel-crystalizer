@@ -1,0 +1,76 @@
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+:frozen
+{a: 1}
+{"a" => "b"}
+{1 => 2}
+{a: "x", b: 2}
+{"a" => 1, "b" => "x"}
+{1 => "a", b: 2}
+{}
+{}
+0
+nil
+:frozen
+0
+:frozen
+{}
+:frozen
+0
+40
+0
+true
+:frozen
+["k", 1]
+[:a, 1]
+{b: 2}
+7
+{a: [1, 3], b: [2]}
+"b"
+eval 5
+5
+5
+eval d
+"d"
+"d"
+eval q
+:q
+:q
+eval 2.5
+2.5
+2.5
+eval 7
+7
+Pt
+eval nil
+nil
+nil
+nil
+nil
+nil
+nil
+eval 9
+FrozenError
+eval e
+FrozenError
+eval r
+FrozenError
+5
+"d"
+nil

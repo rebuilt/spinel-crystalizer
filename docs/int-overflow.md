@@ -26,12 +26,25 @@ The mode applies to integer `+`, `-`, `*`, unary `-`, and (under `promote`) `**`
 and shifts. It does not change division: `1 / 0` is always a
 `ZeroDivisionError` regardless of mode.
 
+A shift that lands exactly on the sign bit follows the mode too: `1 << 63`
+(a literal count or a run-time one) is `-2**63` under `wrap`, a `RangeError`
+under `raise`, and the Bignum `2**63` under `promote`. The value `-2**63`
+itself is an ordinary `Integer` in every mode -- reached by `-9223372036854775807 - 1`,
+by `~0x7fffffffffffffff`, by a wrapping `+ - *` -- and never reads as `nil`:
+the nil of a nullable Integer slot is a flag beside the word, not a bit
+pattern of it (see [limitations.md](limitations.md#a-nil-read-out-of-an-integer-container)).
+
 ### `raise` (default)
 
 The default refuses to be silently wrong. A computation that exceeds 64 bits is
 almost always a bug or a case that needs `promote`; raising surfaces it at the
 point it happens rather than producing a truncated value. This is a deliberate
 deviation from CRuby (which would never raise here) in favour of loudness.
+
+A Float converted to an `Integer` outside the signed 64-bit range (`1e300.round`,
+`1.0e19.to_i`, `floor`, `ceil`) raises `RangeError` (`float out of Integer range
+(Bignum promotion pending)`) in every mode but `promote`, which answers the bignum
+as CRuby does.
 
 ### `wrap`
 
@@ -82,9 +95,14 @@ host the compiler runs on:
   width, `String#unpack` of a 64-bit directive (`Q`, `q`) boxes a Bignum when
   the value does not fit, and a Bignum read out of a poly slot into an Integer
   is a `RangeError` when it does not fit.
-- Known gaps on 32-bit: FFI marshalling of 64-bit C types is not done, and
-  `INT32_MIN` is the sentinel an `Integer | nil` slot uses for `nil`, as
-  `INT64_MIN` is on 64-bit.
+- `INT32_MIN` is an ordinary Integer there, as `INT64_MIN` is on 64-bit: the
+  nil of an `Integer | nil` slot is a flag beside the word on both widths.
+- Known gap on 32-bit: FFI marshalling of 64-bit C types is not done.
+
+For the developer: `make test-corpus SPINEL_INT_OVERFLOW=wrap` (or `promote`)
+runs the test corpus under that mode, and CI runs both on every push to
+master. The tests a mode answers otherwise today are listed in
+`test/int-overflow/<mode>-skip.txt`; a fix takes its test off the list.
 
 For the developer: `make test-corpus CC='cc -m32'` runs the test corpus as
 32-bit programs. Use a separate work tree, or `make clean` first: the runtime
@@ -92,6 +110,11 @@ objects and the precompiled header are built for one width. A test that
 assumes a 64-bit Integer (values or arithmetic past 2^31, `Integer#size`, a
 printed hash, a 64-bit FFI width) says `# spinel: int64` in its first line and
 is filtered out there; CI runs that lane on every push.
+`SPINEL_INT_OVERFLOW=promote make test` and `SPINEL_INT_OVERFLOW=wrap make
+test` run the corpus in the other two modes (each with its own precompiled
+header): the tests that pin a raise-mode RangeError stay out of both, the
+`promote_*` tests run only in promote, and a test whose answer is the Bignum
+the default mode's growth-pattern promotion produced stays out of wrap.
 
 ## Using it when you compile the C yourself
 

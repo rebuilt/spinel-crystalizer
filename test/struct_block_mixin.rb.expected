@@ -1,0 +1,14 @@
+["a.prg@drive1/a!", true, :testsuite, false]
+["b.prg@plain/b!", true, :drive, true]
+["c.prg@drive/c!", true, nil, false]
+["d.prg@plain/d!", false, nil, false]
+"found x.prg"
+"1@2"
+"m3"
+"n"
+"pt"
+6
+"m4"
+5
+"b"
+"p2p1t"
