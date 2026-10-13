@@ -1826,7 +1826,7 @@ REFUSED   test_integer_step_no_limit
 REFUSED   test_integer_times_as_expr
 REFUSED   test_int_element_alias_not_string
 REFUSED   test_int_element_op_assign_floors
-DIFF     test_interp_adjacent_concat
+PASS     test_interp_adjacent_concat
 REFUSED   test_interp_array_container
 REFUSED   test_interp_call_arg_root
 REFUSED   test_interp_diverging_part

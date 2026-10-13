@@ -2049,6 +2049,39 @@ static int cr_sym_is_bare(const char *s) {
 }
 
 /* ---- expressions ---- */
+/* Emit the parts of an InterpolatedStringNode, WITHOUT the surrounding quotes.
+   A part may itself be an InterpolatedStringNode: adjacent literal
+   concatenation (`"a#{x}" "b#{y}"`) nests them, and Ruby joins all the
+   fragments into one string, so a nested part is flattened rather than dropped
+   (an unhandled part kind used to emit an empty string for the whole node). */
+static void cr_emit_interp_parts(CrGen *g, int id, Buf *b) {
+  int n = 0; const int *parts = nt_arr(g->nt, id, "parts", &n);
+  for (int i = 0; i < n; i++) {
+    NodeKind pk = nt_kind(g->nt, parts[i]);
+    if (pk == NK_StringNode) {
+      const char *s = nt_str(g->nt, parts[i], "content");
+      cr_emit_escaped(b, s ? s : "");
+    } else if (pk == NK_InterpolatedStringNode) {
+      cr_emit_interp_parts(g, parts[i], b);
+    } else if (pk == NK_EmbeddedStatementsNode) {
+      int stmts = nt_ref(g->nt, parts[i], "statements");
+      buf_puts(b, "#{");
+      int e = cr_single_expr(g->nt, stmts);
+      if (e >= 0) {
+        cr_emit_expr(g, e, b);
+      } else {
+        /* Several statements (run for side effects; the value is the last).
+           Crystal's interpolation holds one expression, so `begin ... end`
+           wraps the sequence (`"#{a; b}"` is not valid Crystal). */
+        buf_puts(b, "begin\n");
+        cr_emit_stmts(g, stmts, b, 0);
+        buf_puts(b, "end");
+      }
+      buf_puts(b, "}");
+    }
+  }
+}
+
 static void cr_emit_expr(CrGen *g, int id, Buf *b) {
   if (id < 0) { buf_puts(b, "nil"); return; }
   /* nil_ok describes the node being emitted, never a subtree: only an index read
@@ -2231,30 +2264,8 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       return;
     }
     case NK_InterpolatedStringNode: {
-      int n = 0; const int *parts = nt_arr(g->nt, id, "parts", &n);
       buf_puts(b, "\"");
-      for (int i = 0; i < n; i++) {
-        NodeKind pk = nt_kind(g->nt, parts[i]);
-        if (pk == NK_StringNode) {
-          const char *s = nt_str(g->nt, parts[i], "content");
-          cr_emit_escaped(b, s ? s : "");
-        } else if (pk == NK_EmbeddedStatementsNode) {
-          int stmts = nt_ref(g->nt, parts[i], "statements");
-          buf_puts(b, "#{");
-          int e = cr_single_expr(g->nt, stmts);
-          if (e >= 0) {
-            cr_emit_expr(g, e, b);
-          } else {
-            /* Several statements (run for side effects; the value is the last).
-               Crystal's interpolation holds one expression, so `begin ... end`
-               wraps the sequence (`"#{a; b}"` is not valid Crystal). */
-            buf_puts(b, "begin\n");
-            cr_emit_stmts(g, stmts, b, 0);
-            buf_puts(b, "end");
-          }
-          buf_puts(b, "}");
-        }
-      }
+      cr_emit_interp_parts(g, id, b);
       buf_puts(b, "\"");
       return;
     }
