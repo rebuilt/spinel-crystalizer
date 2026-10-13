@@ -2893,623 +2893,17 @@ static const char *cr_enum_passthrough(const char *name, TyKind recv_ty, char *r
   return NULL;
 }
 
-static void cr_emit_call(CrGen *g, int id, Buf *b) {
-  const char *name = nt_str(g->nt, id, "name");
-  int recv  = nt_ref(g->nt, id, "receiver");
-  int argc  = 0; const int *argv = call_args(g->nt, id, &argc);
-  int block = nt_ref(g->nt, id, "block");
-  if (!name) { g->unsupported++; buf_puts(b, "nil"); return; }
-
-  /* unary - / + : no receiver, one argument */
-  if (recv < 0 && argc == 1 && (sp_streq(name, "-") || sp_streq(name, "+"))) {
-    buf_printf(b, "%c(", name[0]); cr_emit_expr(g, argv[0], b); buf_puts(b, ")");
-    return;
-  }
-  /* unary ! : receiver present, no arguments. Ruby's ! answers a Bool (the
-     truthiness negation), so a widened operand asks its SpValue. */
-  if (recv >= 0 && argc == 0 && sp_streq(name, "!")) {
-    buf_puts(b, "!("); cr_emit_cond(g, recv, b); buf_puts(b, ")");
-    return;
-  }
-  /* unary -x / +x on a value: Prism names these "-@" / "+@" with the operand as
-     the receiver. Crystal has the same unary operators. */
-  if (recv >= 0 && argc == 0 && (sp_streq(name, "-@") || sp_streq(name, "+@"))) {
-    buf_printf(b, "%c(", name[0]); cr_emit_expr(g, recv, b); buf_puts(b, ")");
-    return;
-  }
-  /* `arr.<stage>.with_index(...)` chains (map/each/select/reject) and their
-     blockless pair-Enumerator form. */
-  if (cr_emit_with_index(g, id, b)) return;
-  /* `arr.<stage>.with_index(...).to_a`: Ruby's Enumerator yields [element,
-     index] Arrays; the Crystal chain yields {element, index} Tuples. Convert at
-     the terminal so the rendering matches -- a Tuple auto-splats in a block and
-     an Array does not, so the conversion cannot be pushed any earlier. */
-  if (recv >= 0 && block < 0 && sp_streq(name, "to_a") && cr_is_blockless_wi(g, recv)) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".map(&.to_a).to_a");
-    return;
-  }
-  /* A blockless each_with_index is a pair Enumerator in Ruby. Crystal's is a
-     lazy Iterator with no sort_by/size and without Ruby's Enumerable shape, so
-     materialize it to an Array of {element, index} Tuples -- what the
-     sort_by.with_index desugar and the to_a/to_h/reduce chains expect. */
-  if (recv >= 0 && block < 0 && sp_streq(name, "each_with_index") &&
-      ty_is_array(comp_ntype(g->c, recv))) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".each_with_index().to_a");
-    return;
-  }
-  /* Ruby's bare `raise` re-raises `$!`. Crystal has no `$!`: inside a rescue
-     block the current exception is the clause's bound name, and re-raising means
-     `raise e`. Outside any clause there is nothing to re-raise, and Ruby would
-     be raising RuntimeError from nil, so refuse rather than emit a no-arg
-     `raise` that fails to compile ("wrong number of arguments, expected 1"). */
-  if (recv < 0 && sp_streq(name, "raise") && argc == 0) {
-    if (g->rescue_var) { buf_printf(b, "raise(%s)", g->rescue_var); return; }
-    cr_mark_unsupported(g, id, "a bare `raise` outside a rescue clause "
-                                "(Crystal re-raises with `raise e`)");
-    buf_puts(b, "nil");
-    return;
-  }
-
-  /* Ruby's `raise Class, message` builds and raises the exception in one step;
-     Crystal's `raise` takes a single value, so the message has to become the
-     constructor argument. Emitting the two-argument call straight through
-     produces a valid-looking file that fails with "wrong number of arguments
-     for 'raise' (given 2, expected 1)" -- and since `raise` is how most rescue
-     clauses get exercised, that would hide the rescue translation's own bugs
-     behind a raise bug. */
-  if (recv < 0 && sp_streq(name, "raise") && argc == 2) {
-    int cls = cr_peek(g, argv[0]);
-    /* Only a class reference becomes `Klass.new(msg)`; `raise obj` and
-       `raise SomeFactory.call` already pass a value, and `raise SomeClass`
-       with no message stays a plain one-argument raise. */
-    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
-                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
-      const char *nm = cr_exception_operand(g, cls);
-      const char *cn = nm ? cr_exception_name(g, nm) : NULL;
-      if (cn && *cn) {
-        buf_printf(b, "raise(%s.new(", cn);
-        cr_emit_expr(g, argv[1], b);
-        buf_puts(b, "))");
-        return;
-      }
-    }
-    /* A class with no Crystal equivalent cannot be constructed; refuse it here
-       rather than emitting an undefined constant, and name the class. */
-    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
-                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
-      const char *nm = cr_exception_operand(g, cls);
-      char why[300];
-      snprintf(why, sizeof why,
-               "the exception class '%s' has no Crystal equivalent: "
-               CR_NO_CRYSTAL_EXC, nm ? nm : "?");
-      cr_mark_unsupported(g, cls, why);
-    }
-  }
-
-  /* Ruby's `raise SomeError` with no message raises a new instance of the
-     class; Crystal's `raise` needs the instance, so a bare exception-class
-     constant becomes `raise(Cls.new)`. A non-class argument (`raise obj`) is
-     left alone. */
-  if (recv < 0 && sp_streq(name, "raise") && argc == 1) {
-    int cls = cr_peek(g, argv[0]);
-    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
-                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
-      const char *nm = cr_exception_operand(g, cls);
-      const char *cn = nm ? cr_exception_name(g, nm) : NULL;
-      if (cn && *cn) { buf_printf(b, "raise(%s.new)", cn); return; }
-    }
-  }
-
-  /* Ruby's exit(true/false) maps success/failure to a status code; Crystal's
-     exit takes an Int or a Process::Status, not a Bool. */
-  if (recv < 0 && sp_streq(name, "exit") && argc == 1 &&
-      (nt_kind(g->nt, argv[0]) == NK_TrueNode || nt_kind(g->nt, argv[0]) == NK_FalseNode)) {
-    buf_printf(b, "exit(%d)", nt_kind(g->nt, argv[0]) == NK_TrueNode ? 0 : 1);
-    return;
-  }
-
-  /* A blockless Kernel#loop is an infinite Enumerator (yielding nil) in Ruby;
-     Crystal's loop requires a block and has no equivalent enumerator. */
-  if (recv < 0 && sp_streq(name, "loop") && block < 0) {
-    cr_mark_unsupported(g, id, "a blockless `loop` (an infinite Enumerator in Ruby "
-                              "with no Crystal form)");
-    buf_puts(b, "nil");
-    return;
-  }
-
-  /* Crystal's is_a? / kind_of? / instance_of? take a TYPE, so a variable holding
-     a class has no Crystal form (a constant is emitted as-is). A constant naming
-     a MODULE is also refused: Crystal's `is_a?` against a mixin is not Ruby's
-     `is_a?` against the module (a value whose class merely includes it answers
-     false), so the two are not interchangeable. */
-  if (recv >= 0 &&
-      (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?"))) {
-    int is_const_arg = argc == 1 &&
-                       (nt_kind(g->nt, argv[0]) == NK_ConstantReadNode ||
-                        nt_kind(g->nt, argv[0]) == NK_ConstantPathNode);
-    int bad = !is_const_arg;   /* a runtime class value has no type form */
-    if (is_const_arg) {
-      const char *cn = nt_str(g->nt, argv[0], "name");
-      int ci = cn ? comp_class_index(g->c, cn) : -1;
-      if (ci >= 0 && comp_class_is_module(g->c, &g->c->classes[ci])) bad = 1;
-    }
-    if (bad) {
-      cr_mark_unsupported(g, id, "is_a?/kind_of?/instance_of? with a runtime class "
-                                "value or a module (Crystal takes a type)");
-      buf_puts(b, "nil");
-      return;
-    }
-  }
-
-  /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
-     value answers through the runtime's sp_nil? instead. */
-  if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 && argc == 0 &&
-      sp_streq(name, "nil?") && cr_is_poly(comp_ntype(g->c, recv))) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".sp_nil?");
-    return;
-  }
-
-  /* A call on a widened receiver: the run-time value's own kind decides what
-     answers, so it goes through the boxed dispatch. This is the seam that lets
-     `x.m` work when x is a poly slot -- an Integer, a String, an Array, a user
-     object -- which before was refused. `!` and the operators have their own
-     SpValue forms and are handled above. `call` is the block/proc protocol,
-     answered by SpValue#call. */
-  if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 &&
-      cr_is_poly(comp_ntype(g->c, recv)) && !cr_user_method_ok(g, name, TY_POLY, 0) &&
-      !sp_streq(name, "!") && !sp_streq(name, "[]") && !sp_streq(name, "[]=") &&
-      !cr_is_binop(name) && !sp_streq(name, "-@") && !sp_streq(name, "+@")) {
-    if (block >= 0) {
-      cr_mark_unsupported(g, id, "a block passed to a call on a widened (poly) receiver");
-      buf_puts(b, "nil");
-      return;
-    }
-    /* The result comes back boxed; unbox it to the type this call site expects
-       (the node's inferred type) so it flows into concrete code unchanged.
-       A node the inference left poly keeps the SpValue. */
-    TyKind nt = comp_ntype(g->c, id);
-    const char *unbox = sp_streq(name, "call") ? "sp_unbox_call" : "sp_unbox";
-    if (nt == TY_INT)         buf_puts(b, "sp_unbox_i(");
-    else if (nt == TY_FLOAT)  buf_puts(b, "sp_unbox_f(");
-    else if (nt == TY_STRING) buf_puts(b, "sp_unbox_s(");
-    else if (nt == TY_BOOL)   buf_puts(b, "sp_unbox_b(");
-    (void)unbox;
-    if (sp_streq(name, "call")) { cr_emit_recv(g, recv, b); buf_puts(b, ".call("); }
-    else { cr_emit_recv(g, recv, b); buf_printf(b, ".sp_send(\"%s\", ", name); }
-    /* Crystal cannot infer an empty literal's element type, so the no-argument
-       case names it (`[] of SpValue`); a non-empty literal types itself. */
-    if (argc == 0) {
-      buf_puts(b, "[] of SpValue");
-    } else {
-      buf_puts(b, "[");
-      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
-      buf_puts(b, "]");
-    }
-    buf_puts(b, ")");
-    if (nt == TY_INT || nt == TY_FLOAT || nt == TY_STRING || nt == TY_BOOL) buf_puts(b, ")");
-    return;
-  }
-
-  /* A widened array's elements are SpValue, so a push into it boxes. This is
-     the `a = []` then `a << 1; a << "x"` shape, where the empty-literal pin
-     made `a` an Array(SpValue); the element is boxed on the way in. Only the
-     push names are handled -- an index write (`a[i] = x`) and a
-     symbol/string-keyed hash write are left to the general path, because a
-     receiver that reads back as TY_POLY_ARRAY / TY_SYM_POLY_HASH need not have
-     been pinned to the boxed form, and boxing a concrete container's write is
-     the read/write coupling that P22 (read-side unboxing) resolves. */
-  if (CR_POLY_CONTAINERS && recv >= 0 &&
-      (sp_streq(name, "<<") || sp_streq(name, "push") || sp_streq(name, "unshift"))) {
-    /* Box only when the receiver is a local that was declared Array(SpValue) --
-       the widened empty `[]` of P21. A concrete array (including one the
-       analyzer calls TY_POLY_ARRAY before object-array narrowing) keeps its own
-       element type and must not receive a boxed value. */
-    int box_push = 0;
-    if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
-      const char *rn = nt_str(g->nt, recv, "name");
-      box_push = rn && nameset_has(&g->poly_arrays, rn);
-    }
-    if (box_push) {
-      cr_emit_recv(g, recv, b);
-      buf_printf(b, ".%s(", name);
-      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
-      buf_puts(b, ")");
-      return;
-    }
-  }
-
-  /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
-     raises IndexError, so it maps onto the `[]?` form. */
-  if (recv >= 0 && sp_streq(name, "at") && argc == 1 && ty_is_array(comp_ntype(g->c, recv))) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, "[");
-    cr_emit_expr(g, argv[0], b);
-    buf_puts(b, "]?");
-    return;
-  }
-
-  /* Ruby's String#chars yields an array of one-character Strings; Crystal's
-     String#chars yields Chars. The analyzer models the result as a string array
-     (a String read out of a container during the poly pass, and TY_STR_ARRAY on
-     the concrete pass), so a later use of an element as a String -- a hash
-     lookup, `==` against a literal, string concatenation -- would take the Char
-     path and raise at runtime (issue 2903). Map each Char back to a String for
-     the blockless form. The block form cannot be rewritten without changing what
-     the block parameter is, so it is refused rather than silently Char-typed. */
-  if (recv >= 0 && sp_streq(name, "chars") && argc == 0 &&
-      comp_ntype(g->c, recv) == TY_STRING &&
-      !cr_user_method_ok(g, name, TY_STRING, 0)) {
-    if (block >= 0) {
-      cr_mark_unsupported(g, id, "String#chars with a block (Crystal's chars "
-                                "yields Char; Ruby's yields one-character Strings)");
-      buf_puts(b, "nil");
-      return;
-    }
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".chars.map(&.to_s)");
-    return;
-  }
-
-  /* Ruby's String#to_i auto-detects the base's prefix for base 0, treats a
-     leading zero as octal only there, accepts `_` digit separators, and never
-     raises (it answers 0 when no digits parse); Crystal's to_i defaults to
-     strict:true (raising ArgumentError) with no prefix/underscore handling
-     (string.cr `to_i`). Set the flags that make Crystal answer as Ruby does. */
-  if (recv >= 0 && sp_streq(name, "to_i") && argc <= 1 &&
-      comp_ntype(g->c, recv) == TY_STRING &&
-      !cr_user_method_ok(g, name, TY_STRING, 0)) {
-    /* Crystal rejects base 0 outright, so Ruby's autodetect is spelled by
-       leaving the (valid) default base in place and letting prefix/octal
-       detection override it per string. A bare `s.to_i` keeps Crystal's default
-       base 10 and only needs strict/underscore. The `{ 0 }` block is Ruby's "no
-       digits parsed means 0": Crystal's to_i otherwise raises on "0", "08" or
-       "", where Ruby answers 0. */
-    int base0 = argc == 1 && nt_kind(g->nt, argv[0]) == NK_IntegerNode &&
-                nt_int(g->nt, argv[0], "value", -1) == 0;
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".to_i(");
-    if (base0)          buf_puts(b, "10, ");
-    else if (argc == 1) { cr_emit_expr(g, argv[0], b); buf_puts(b, ", "); }
-    buf_puts(b, "strict: false, underscore: true");
-    if (base0) buf_puts(b, ", prefix: true, leading_zero_is_octal: true");
-    buf_puts(b, ") { 0 }");
-    return;
-  }
-
-  /* Crystal's Float#to_i returns an Int32 and raises once the value passes
-     2**31; Ruby's returns a full Integer. Crystal's Float#to_i64 keeps Ruby's
-     value across the whole Int64 range, so use it. Past Int64 the two still
-     differ -- Ruby yields a Bignum, Crystal raises OverflowError -- so a float
-     literal outside the range is refused rather than shipped as a crash. */
-  if (recv >= 0 && sp_streq(name, "to_i") && argc == 0 &&
-      comp_ntype(g->c, recv) == TY_FLOAT &&
-      !cr_user_method_ok(g, name, TY_FLOAT, 0)) {
-    if (nt_kind(g->nt, recv) == NK_FloatNode) {
-      const char *c = nt_content(g->nt, recv);
-      double d = c ? strtod(c, NULL) : 0.0;
-      if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) {
-        cr_mark_unsupported(g, id, "Float#to_i outside the Int64 range (Ruby "
-                                  "returns a Bignum; Crystal raises OverflowError)");
-        buf_puts(b, "nil");
-        return;
-      }
-    }
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".to_i64");
-    return;
-  }
-
-  /* Integer#round/ceil/floor/truncate(ndigits): n >= 0 is self; n < 0 rounds to
-     10**(-n) exactly. A literal past 10**18 needs a Bignum, so refuse. */
-  if (recv >= 0 && argc == 1 && comp_ntype(g->c, recv) == TY_INT &&
-      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
-       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
-    int lit = nt_kind(g->nt, argv[0]) == NK_IntegerNode;
-    long long n = lit ? nt_int(g->nt, argv[0], "value", 0) : 0;
-    if (lit && n <= -19) {
-      cr_mark_unsupported(g, id, "Integer#round/ceil/floor/truncate with an "
-                                "ndigits below 0 (modulus past 10**18; Ruby "
-                                "returns a Bignum)");
-      buf_puts(b, "nil");
-      return;
-    }
-    if (lit && n >= 0) { cr_emit_recv(g, recv, b); return; }   /* ndigits >= 0: self */
-    buf_printf(b, "sp_int_%s(", name);
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ", ");
-    cr_emit_expr(g, argv[0], b);
-    buf_puts(b, ")");
-    return;
-  }
-
-  /* Float#round/ceil/floor/truncate(ndigits): Crystal has Float#round(n) but no
-     digit-taking ceil/floor/truncate, so the scaling helpers. CRuby returns an
-     Integer for a literal ndigits <= 0, so append .to_i there. */
-  if (recv >= 0 && argc == 1 && comp_ntype(g->c, recv) == TY_FLOAT &&
-      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
-       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
-    int lit = nt_kind(g->nt, argv[0]) == NK_IntegerNode;
-    long long n = lit ? nt_int(g->nt, argv[0], "value", 0) : 0;
-    int want_int = lit && n <= 0;
-    if (sp_streq(name, "round")) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ".round(");
-      cr_emit_expr(g, argv[0], b);
-      buf_puts(b, ")");
-    } else {
-      buf_printf(b, "sp_flt_%s(", name);
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ", ");
-      cr_emit_expr(g, argv[0], b);
-      buf_puts(b, ")");
-    }
-    if (want_int) buf_puts(b, ".to_i");
-    return;
-  }
-
-  /* Ruby's Float#round/ceil/floor/truncate with no argument answer an Integer;
-     Crystal's round/ceil/floor answer a Float64 and it has no truncate. */
-  if (recv >= 0 && argc == 0 && comp_ntype(g->c, recv) == TY_FLOAT &&
-      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
-       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
-    cr_emit_recv(g, recv, b);
-    if (!sp_streq(name, "truncate")) buf_printf(b, ".%s", name);
-    buf_puts(b, ".to_i");
-    return;
-  }
-
-  /* Ruby's min/max answer nil on an empty collection; Crystal's min/max raise
-     Enumerable::EmptyError. The `?` form returns the nilable counterpart, so it
-     is used only where the surrounding context already tolerates nil -- the same
-     gate the `[]` read uses -- to avoid widening an element type that a later
-     non-nil use depends on. */
-  if (recv >= 0 && (sp_streq(name, "min") || sp_streq(name, "max")) &&
-      argc == 0 && block < 0 && g->nil_ok &&
-      (ty_is_array(comp_ntype(g->c, recv)) || comp_ntype(g->c, recv) == TY_RANGE)) {
-    cr_emit_recv(g, recv, b);
-    buf_printf(b, ".%s?()", name);
-    return;
-  }
-
-  /* Ruby's String#split differs from Crystal's on all three of whitespace (awk)
-     mode for a single-space separator, trailing-empty dropping under the default
-     limit, and the positive-cap / negative-keep limit rule. Route a String (or
-     nil, or no) separator through the sp_ruby_split helpers. A Regexp or Char
-     separator keeps the plain path. A block yields each field (split's own
-     return value is the receiver, which the corpus does not use). */
-  int str_sep = argc == 0 || nt_kind(g->nt, argv[0]) == NK_NilNode ||
-                (recv >= 0 && comp_ntype(g->c, argv[0]) == TY_STRING);
-  if (recv >= 0 && sp_streq(name, "split") && comp_ntype(g->c, recv) == TY_STRING &&
-      argc <= 2 && str_sep) {
-    buf_puts(b, "sp_ruby_split(");
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ", ");
-    if (argc >= 1) cr_emit_expr(g, argv[0], b); else buf_puts(b, "nil");
-    if (argc == 2) { buf_puts(b, ", "); cr_emit_expr(g, argv[1], b); }
-    buf_puts(b, ")");
-    if (block >= 0) { buf_puts(b, ".each"); cr_emit_block(b, g, block, 0, recv, "each"); }
-    return;
-  }
-
-  /* Crystal's values_at answers a Tuple, and zip an Array of Tuples, where Ruby
-     answers a plain Array (of Arrays for zip). `.to_a` / `.map(&.to_a)`
-     restores Ruby's shape; a later `|a, b|` destructuring still works on an
-     Array, so this is safe when the result is consumed either way. */
-  if (recv >= 0 && block < 0 &&
-      (sp_streq(name, "values_at") || sp_streq(name, "zip")) &&
-      ty_is_array(comp_ntype(g->c, recv))) {
-    /* `arr.values_at` with no index answers []; Crystal's values_at needs at
-       least one. `first(0)` is an empty Array of the right element type. */
-    if (sp_streq(name, "values_at") && argc == 0) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ".first(0)");
-      return;
-    }
-    cr_emit_recv(g, recv, b);
-    buf_printf(b, ".%s(", name);
-    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
-    buf_puts(b, sp_streq(name, "zip") ? ").map(&.to_a)" : ").to_a");
-    return;
-  }
-
-  /* Ruby's Enumerable#count with no argument and no block is the size; Crystal's
-     requires an item or a block (there is no 0-argument count). */
-  if (recv >= 0 && block < 0 && argc == 0 && sp_streq(name, "count")) {
-    TyKind rt = comp_ntype(g->c, recv);
-    if (ty_is_array(rt) || ty_is_hash(rt) || rt == TY_RANGE) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ".size");
-      return;
-    }
-  }
-
-  /* Ruby's Hash#fetch(key) with no default raises KeyError on a miss, which is
-     exactly Crystal's `h[key]`; Crystal's own fetch() requires a default. */
-  if (recv >= 0 && block < 0 && argc == 1 && sp_streq(name, "fetch") &&
-      ty_is_hash(comp_ntype(g->c, recv))) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, "[");
-    cr_emit_expr(g, argv[0], b);
-    buf_puts(b, "]");
-    return;
-  }
-
-  /* Ruby's File.delete / File.unlink with no path delete nothing and answer 0;
-     Crystal's require at least one path. */
-  if (recv >= 0 && argc == 0 && (sp_streq(name, "delete") || sp_streq(name, "unlink")) &&
-      nt_kind(g->nt, recv) == NK_ConstantReadNode &&
-      sp_streq(nt_str(g->nt, recv, "name"), "File")) {
-    buf_puts(b, "0");
-    return;
-  }
-
-  /* Ruby's Numeric#step(limit, step) takes positional bounds; Crystal's step
-     takes named `to:` / `by:`. */
-  if (recv >= 0 && sp_streq(name, "step") && (argc == 1 || argc == 2)) {
-    TyKind rt = comp_ntype(g->c, recv);
-    if (rt == TY_INT || rt == TY_FLOAT) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ".step(to: ");
-      if (argc == 2) { cr_emit_expr(g, argv[0], b); buf_puts(b, ", by: "); cr_emit_expr(g, argv[1], b); }
-      else cr_emit_expr(g, argv[0], b);
-      buf_puts(b, ")");
-      if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
-      return;
-    }
-  }
-
-  /* A blockless each_index / each_cons / each_slice is a lazy Iterator in
-     Crystal, so a following map/first/sum runs lazily (or yields an iterator)
-     where Ruby materializes an Array. These yield Arrays, not Tuples, so a plain
-     .to_a restores Ruby's shape -- and a following block destructuring (`|k, v|`)
-     still works on the Array. */
-  if (recv >= 0 && block < 0 && sp_streq(name, "each_index")) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".each_index().to_a");
-    return;
-  }
-
-  /* Ruby's Enumerable#first(n) answers an Array; Crystal's Array#first(n) does
-     too, but an Iterator's first(n) answers a lazy iterator (so `p` would show
-     the iterator). Append .to_a: identity for an Array, materializing for an
-     iterator's first n. */
-  if (recv >= 0 && sp_streq(name, "first") && argc == 1) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".first(");
-    cr_emit_expr(g, argv[0], b);
-    buf_puts(b, ").to_a");
-    return;
-  }
-
-
-
-
-
-  /* `reduce(:op)` / `inject(seed, :op)` names the fold by an OPERATOR symbol.
-     The shared desugarer rewrites only identifier-named symbols to a block
-     (desugar_reduce_method_symbol); operator symbols ride the C backend's typed
-     fold emitters, which the Crystal emitter does not have -- so it emitted
-     `reduce(:+)`, which Crystal rejects. Spell the fold as a block here. */
-  if (recv >= 0 && block < 0 && argc >= 1 &&
-      (sp_streq(name, "reduce") || sp_streq(name, "inject"))) {
-    int last = argv[argc - 1];
-    const char *sym = nt_kind(g->nt, last) == NK_SymbolNode
-                      ? nt_str(g->nt, last, "value") : NULL;
-    if (sym && cr_is_binop(sym)) {
-      /* A symbol fold over a Hash folds Ruby's [k, v] pair Arrays; Crystal's
-         Hash#reduce yields {k, v} Tuples, so the fold is a different type (and
-         a growing Tuple at that). Refuse rather than ship it. */
-      if (ty_is_hash(comp_ntype(g->c, recv))) {
-        cr_mark_unsupported(g, id, "a symbol fold over a Hash (Ruby folds [k, v] pairs)");
-        buf_puts(b, "nil");
-        return;
-      }
-      char ra[32], rb[32];
-      int t = g->tmp_seq++;
-      snprintf(ra, sizeof ra, "__sp_rd%d_a", t);
-      snprintf(rb, sizeof rb, "__sp_rd%d_b", t);
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ".reduce(");
-      for (int i = 0; i < argc - 1; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
-      buf_printf(b, ") do |%s, %s|\n  %s %s %s\nend", ra, rb, ra, sym, rb);
-      return;
-    }
-  }
-
-  /* Ruby's Array#join flattens nested Arrays recursively before joining, with
-     the separator between every element; Crystal's join renders a nested Array
-     with its inspect form. `flatten` recurses through Arrays only -- the same
-     set Ruby's join flattens -- and leaves scalar elements alone. */
-  if (recv >= 0 && sp_streq(name, "join") && block < 0 &&
-      ty_is_array(comp_ntype(g->c, recv))) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".flatten.join(");
-    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
-    buf_puts(b, ")");
-    return;
-  }
-
-  /* Ruby's charset arguments use range notation, and a lone "^" is a literal
-     caret. Crystal's delete/count/squeeze parse both the same way EXCEPT the
-     lone "^" (there it negates the empty set and matches every character), and
-     Crystal's tr expands no ranges at all. Rewrite the literal charset(s). */
-  if (recv >= 0 && comp_ntype(g->c, recv) == TY_STRING) {
-    if (sp_streq(name, "tr") && argc == 2 &&
-        nt_kind(g->nt, argv[0]) == NK_StringNode && nt_kind(g->nt, argv[1]) == NK_StringNode) {
-      cr_emit_recv(g, recv, b);
-      buf_puts(b, ".tr(");
-      cr_emit_charset_literal(b, nt_str(g->nt, argv[0], "content"), 1);
-      buf_puts(b, ", ");
-      cr_emit_charset_literal(b, nt_str(g->nt, argv[1], "content"), 1);
-      buf_puts(b, ")");
-      return;
-    }
-    const char *cs = argc == 1 && nt_kind(g->nt, argv[0]) == NK_StringNode
-                     ? nt_str(g->nt, argv[0], "content") : NULL;
-    if (cs && sp_streq(cs, "^") &&
-        (sp_streq(name, "delete") || sp_streq(name, "count") || sp_streq(name, "squeeze"))) {
-      cr_emit_recv(g, recv, b);
-      buf_printf(b, ".%s(", name);
-      cr_emit_charset_literal(b, "\\^", 0);
-      buf_puts(b, ")");
-      return;
-    }
-  }
-
-  /* Regexp#options in Ruby is an Integer bitmask (1=IGNORECASE, 2=EXTENDED,
-     4=MULTILINE); Crystal's `options` returns its own Options enum, which the
-     stdlib uses internally, so it cannot be overridden. Answer through the
-     shim's ruby_options helper instead. */
-  if (recv >= 0 && sp_streq(name, "options") && argc == 0 &&
-      comp_ntype(g->c, recv) == TY_REGEX) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, ".ruby_options");
-    return;
-  }
-
-  /* Ruby's Time#utc / #getlocal (no argument) answer a Time in the UTC / local
-     zone; Crystal spells those to_utc / to_local. The argument-taking
-     getlocal(offset) and the in-place gmtime/localtime are refused by the
-     receiver-typed table below. */
-  if (recv >= 0 && argc == 0 && comp_ntype(g->c, recv) == TY_TIME &&
-      (sp_streq(name, "utc") || sp_streq(name, "getlocal"))) {
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, sp_streq(name, "utc") ? ".to_utc" : ".to_local");
-    return;
-  }
-
-  /* Ruby's Math.lgamma answers [log|Gamma(x)|, sign]; Crystal's answers the log
-     alone. Pair it with the computed sign; the argument is bound to a temp so a
-     side-effecting expression is evaluated once. */
-  if (recv >= 0 && sp_streq(name, "lgamma") && argc == 1 &&
-      nt_kind(g->nt, recv) == NK_ConstantReadNode &&
-      sp_streq(nt_str(g->nt, recv, "name"), "Math")) {
-    char tmp[32];
-    snprintf(tmp, sizeof tmp, "__sp_lg%d", g->tmp_seq++);
-    buf_printf(b, "(begin %s = ", tmp);
-    cr_emit_expr(g, argv[0], b);
-    buf_printf(b, "; [Math.lgamma(%s), sp_lgamma_sign(%s)] end)", tmp, tmp);
-    return;
-  }
-
-  /* Ruby's sub/gsub replacement strings expand `\&` (the whole match) and
-     `\k<name>` (empty when the group did not participate); Crystal's replacement
-     parser leaves `\&` literal and raises IndexError for a non-participating
-     `\k<name>`. The two languages are not interchangeable, and a computed
-     replacement hides its contents, so only a literal one is inspected. */
-  if (recv >= 0 && (sp_streq(name, "sub") || sp_streq(name, "gsub")) &&
-      argc == 2 && nt_kind(g->nt, argv[1]) == NK_StringNode &&
-      cr_str_has_ruby_only_replacement(nt_str(g->nt, argv[1], "content"))) {
-    cr_mark_unsupported(g, id, "a sub/gsub replacement using a Ruby-only "
-                              "backreference (whole match, pre/post match, "
-                              "last group, or named group)");
-    buf_puts(b, "nil");
-    return;
-  }
-
+/* The special Ruby call forms -- operators, Kernel raise/exit, poly dispatch,
+   stdlib method rewrites, index read/write -- that cr_emit_call recognizes
+   before the general method call. They are an ORDERED sequence: each case is
+   tried in turn, so the extraction preserves the order. Returns 1 when a case
+   emitted the call (the caller must return), 0 to fall through to the general
+   path. */
+/* Ruby/Crystal binary-operator translation: integer `/` -> `//`, the `%`
+   named-format key rewrite, and the boxed comparison at a widened boundary.
+   Returns 1 when it emitted the call. */
+static int cr_emit_binop_call(CrGen *g, int id, const char *name, int recv,
+                              int argc, const int *argv, int block, Buf *b) {
   /* binary operator */
   if (recv >= 0 && argc == 1 && cr_is_binop(name)) {
     const char *op = name;
@@ -3535,7 +2929,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       buf_puts(b, " % (");
       cr_emit_expr(g, argv[0], b);
       buf_puts(b, ".transform_keys(&.to_s))");
-      return;
+      return 1;
     }
     /* `x == nil` / `x != nil` is the other spelling of "does this read have a
        value", so the left operand is a nil-tolerant position too. */
@@ -3597,8 +2991,642 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     } else {
       cr_emit_operand(g, argv[0], b);
     }
-    return;
+    return 1;
   }
+  return 0;
+}
+
+/* A call on a widened (poly) receiver, and the boxed push into a widened
+   array: nil?, the sp_send dynamic dispatch with its unbox, and the boxing
+   push. Returns 1 when it emitted the call. */
+static int cr_emit_poly_call(CrGen *g, int id, const char *name, int recv,
+                     int argc, const int *argv, int block, Buf *b) {
+  /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
+     value answers through the runtime's sp_nil? instead. */
+  if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 && argc == 0 &&
+      sp_streq(name, "nil?") && cr_is_poly(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".sp_nil?");
+    return 1;
+  }
+
+  /* A call on a widened receiver: the run-time value's own kind decides what
+     answers, so it goes through the boxed dispatch. This is the seam that lets
+     `x.m` work when x is a poly slot -- an Integer, a String, an Array, a user
+     object -- which before was refused. `!` and the operators have their own
+     SpValue forms and are handled above. `call` is the block/proc protocol,
+     answered by SpValue#call. */
+  if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 &&
+      cr_is_poly(comp_ntype(g->c, recv)) && !cr_user_method_ok(g, name, TY_POLY, 0) &&
+      !sp_streq(name, "!") && !sp_streq(name, "[]") && !sp_streq(name, "[]=") &&
+      !cr_is_binop(name) && !sp_streq(name, "-@") && !sp_streq(name, "+@")) {
+    if (block >= 0) {
+      cr_mark_unsupported(g, id, "a block passed to a call on a widened (poly) receiver");
+      buf_puts(b, "nil");
+      return 1;
+    }
+    /* The result comes back boxed; unbox it to the type this call site expects
+       (the node's inferred type) so it flows into concrete code unchanged.
+       A node the inference left poly keeps the SpValue. */
+    TyKind nt = comp_ntype(g->c, id);
+    const char *unbox = sp_streq(name, "call") ? "sp_unbox_call" : "sp_unbox";
+    if (nt == TY_INT)         buf_puts(b, "sp_unbox_i(");
+    else if (nt == TY_FLOAT)  buf_puts(b, "sp_unbox_f(");
+    else if (nt == TY_STRING) buf_puts(b, "sp_unbox_s(");
+    else if (nt == TY_BOOL)   buf_puts(b, "sp_unbox_b(");
+    (void)unbox;
+    if (sp_streq(name, "call")) { cr_emit_recv(g, recv, b); buf_puts(b, ".call("); }
+    else { cr_emit_recv(g, recv, b); buf_printf(b, ".sp_send(\"%s\", ", name); }
+    /* Crystal cannot infer an empty literal's element type, so the no-argument
+       case names it (`[] of SpValue`); a non-empty literal types itself. */
+    if (argc == 0) {
+      buf_puts(b, "[] of SpValue");
+    } else {
+      buf_puts(b, "[");
+      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
+      buf_puts(b, "]");
+    }
+    buf_puts(b, ")");
+    if (nt == TY_INT || nt == TY_FLOAT || nt == TY_STRING || nt == TY_BOOL) buf_puts(b, ")");
+    return 1;
+  }
+
+  /* A widened array's elements are SpValue, so a push into it boxes. This is
+     the `a = []` then `a << 1; a << "x"` shape, where the empty-literal pin
+     made `a` an Array(SpValue); the element is boxed on the way in. Only the
+     push names are handled -- an index write (`a[i] = x`) and a
+     symbol/string-keyed hash write are left to the general path, because a
+     receiver that reads back as TY_POLY_ARRAY / TY_SYM_POLY_HASH need not have
+     been pinned to the boxed form, and boxing a concrete container's write is
+     the read/write coupling that P22 (read-side unboxing) resolves. */
+  if (CR_POLY_CONTAINERS && recv >= 0 &&
+      (sp_streq(name, "<<") || sp_streq(name, "push") || sp_streq(name, "unshift"))) {
+    /* Box only when the receiver is a local that was declared Array(SpValue) --
+       the widened empty `[]` of P21. A concrete array (including one the
+       analyzer calls TY_POLY_ARRAY before object-array narrowing) keeps its own
+       element type and must not receive a boxed value. */
+    int box_push = 0;
+    if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
+      const char *rn = nt_str(g->nt, recv, "name");
+      box_push = rn && nameset_has(&g->poly_arrays, rn);
+    }
+    if (box_push) {
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".%s(", name);
+      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
+      buf_puts(b, ")");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Kernel call forms with no Crystal equivalent: bare `raise` (re-raise),
+   `raise Cls, msg`, `raise Cls`, `exit(true/false)`, and blockless `loop`.
+   Returns 1 when it emitted the call. */
+static int cr_emit_kernel_call(CrGen *g, int id, const char *name, int recv,
+                     int argc, const int *argv, int block, Buf *b) {
+  /* Ruby's bare `raise` re-raises `$!`. Crystal has no `$!`: inside a rescue
+     block the current exception is the clause's bound name, and re-raising means
+     `raise e`. Outside any clause there is nothing to re-raise, and Ruby would
+     be raising RuntimeError from nil, so refuse rather than emit a no-arg
+     `raise` that fails to compile ("wrong number of arguments, expected 1"). */
+  if (recv < 0 && sp_streq(name, "raise") && argc == 0) {
+    if (g->rescue_var) { buf_printf(b, "raise(%s)", g->rescue_var); return 1; }
+    cr_mark_unsupported(g, id, "a bare `raise` outside a rescue clause "
+                                "(Crystal re-raises with `raise e`)");
+    buf_puts(b, "nil");
+    return 1;
+  }
+
+  /* Ruby's `raise Class, message` builds and raises the exception in one step;
+     Crystal's `raise` takes a single value, so the message has to become the
+     constructor argument. Emitting the two-argument call straight through
+     produces a valid-looking file that fails with "wrong number of arguments
+     for 'raise' (given 2, expected 1)" -- and since `raise` is how most rescue
+     clauses get exercised, that would hide the rescue translation's own bugs
+     behind a raise bug. */
+  if (recv < 0 && sp_streq(name, "raise") && argc == 2) {
+    int cls = cr_peek(g, argv[0]);
+    /* Only a class reference becomes `Klass.new(msg)`; `raise obj` and
+       `raise SomeFactory.call` already pass a value, and `raise SomeClass`
+       with no message stays a plain one-argument raise. */
+    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
+                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
+      const char *nm = cr_exception_operand(g, cls);
+      const char *cn = nm ? cr_exception_name(g, nm) : NULL;
+      if (cn && *cn) {
+        buf_printf(b, "raise(%s.new(", cn);
+        cr_emit_expr(g, argv[1], b);
+        buf_puts(b, "))");
+        return 1;
+      }
+    }
+    /* A class with no Crystal equivalent cannot be constructed; refuse it here
+       rather than emitting an undefined constant, and name the class. */
+    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
+                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
+      const char *nm = cr_exception_operand(g, cls);
+      char why[300];
+      snprintf(why, sizeof why,
+               "the exception class '%s' has no Crystal equivalent: "
+               CR_NO_CRYSTAL_EXC, nm ? nm : "?");
+      cr_mark_unsupported(g, cls, why);
+    }
+  }
+
+  /* Ruby's `raise SomeError` with no message raises a new instance of the
+     class; Crystal's `raise` needs the instance, so a bare exception-class
+     constant becomes `raise(Cls.new)`. A non-class argument (`raise obj`) is
+     left alone. */
+  if (recv < 0 && sp_streq(name, "raise") && argc == 1) {
+    int cls = cr_peek(g, argv[0]);
+    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_ConstantReadNode ||
+                     nt_kind(g->nt, cls) == NK_ConstantPathNode)) {
+      const char *nm = cr_exception_operand(g, cls);
+      const char *cn = nm ? cr_exception_name(g, nm) : NULL;
+      if (cn && *cn) { buf_printf(b, "raise(%s.new)", cn); return 1; }
+    }
+  }
+
+  /* Ruby's exit(true/false) maps success/failure to a status code; Crystal's
+     exit takes an Int or a Process::Status, not a Bool. */
+  if (recv < 0 && sp_streq(name, "exit") && argc == 1 &&
+      (nt_kind(g->nt, argv[0]) == NK_TrueNode || nt_kind(g->nt, argv[0]) == NK_FalseNode)) {
+    buf_printf(b, "exit(%d)", nt_kind(g->nt, argv[0]) == NK_TrueNode ? 0 : 1);
+    return 1;
+  }
+
+  /* A blockless Kernel#loop is an infinite Enumerator (yielding nil) in Ruby;
+     Crystal's loop requires a block and has no equivalent enumerator. */
+  if (recv < 0 && sp_streq(name, "loop") && block < 0) {
+    cr_mark_unsupported(g, id, "a blockless `loop` (an infinite Enumerator in Ruby "
+                              "with no Crystal form)");
+    buf_puts(b, "nil");
+    return 1;
+  }
+  return 0;
+}
+
+static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
+                                int argc, const int *argv, int block, Buf *b) {
+  /* unary - / + : no receiver, one argument */
+  if (recv < 0 && argc == 1 && (sp_streq(name, "-") || sp_streq(name, "+"))) {
+    buf_printf(b, "%c(", name[0]); cr_emit_expr(g, argv[0], b); buf_puts(b, ")");
+    return 1;
+  }
+  /* unary ! : receiver present, no arguments. Ruby's ! answers a Bool (the
+     truthiness negation), so a widened operand asks its SpValue. */
+  if (recv >= 0 && argc == 0 && sp_streq(name, "!")) {
+    buf_puts(b, "!("); cr_emit_cond(g, recv, b); buf_puts(b, ")");
+    return 1;
+  }
+  /* unary -x / +x on a value: Prism names these "-@" / "+@" with the operand as
+     the receiver. Crystal has the same unary operators. */
+  if (recv >= 0 && argc == 0 && (sp_streq(name, "-@") || sp_streq(name, "+@"))) {
+    buf_printf(b, "%c(", name[0]); cr_emit_expr(g, recv, b); buf_puts(b, ")");
+    return 1;
+  }
+  /* `arr.<stage>.with_index(...)` chains (map/each/select/reject) and their
+     blockless pair-Enumerator form. */
+  if (cr_emit_with_index(g, id, b)) return 1;
+  /* `arr.<stage>.with_index(...).to_a`: Ruby's Enumerator yields [element,
+     index] Arrays; the Crystal chain yields {element, index} Tuples. Convert at
+     the terminal so the rendering matches -- a Tuple auto-splats in a block and
+     an Array does not, so the conversion cannot be pushed any earlier. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "to_a") && cr_is_blockless_wi(g, recv)) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".map(&.to_a).to_a");
+    return 1;
+  }
+  /* A blockless each_with_index is a pair Enumerator in Ruby. Crystal's is a
+     lazy Iterator with no sort_by/size and without Ruby's Enumerable shape, so
+     materialize it to an Array of {element, index} Tuples -- what the
+     sort_by.with_index desugar and the to_a/to_h/reduce chains expect. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "each_with_index") &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".each_with_index().to_a");
+    return 1;
+  }
+  if (cr_emit_kernel_call(g, id, name, recv, argc, argv, block, b)) return 1;
+
+  /* Crystal's is_a? / kind_of? / instance_of? take a TYPE, so a variable holding
+     a class has no Crystal form (a constant is emitted as-is). A constant naming
+     a MODULE is also refused: Crystal's `is_a?` against a mixin is not Ruby's
+     `is_a?` against the module (a value whose class merely includes it answers
+     false), so the two are not interchangeable. */
+  if (recv >= 0 &&
+      (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?"))) {
+    int is_const_arg = argc == 1 &&
+                       (nt_kind(g->nt, argv[0]) == NK_ConstantReadNode ||
+                        nt_kind(g->nt, argv[0]) == NK_ConstantPathNode);
+    int bad = !is_const_arg;   /* a runtime class value has no type form */
+    if (is_const_arg) {
+      const char *cn = nt_str(g->nt, argv[0], "name");
+      int ci = cn ? comp_class_index(g->c, cn) : -1;
+      if (ci >= 0 && comp_class_is_module(g->c, &g->c->classes[ci])) bad = 1;
+    }
+    if (bad) {
+      cr_mark_unsupported(g, id, "is_a?/kind_of?/instance_of? with a runtime class "
+                                "value or a module (Crystal takes a type)");
+      buf_puts(b, "nil");
+      return 1;
+    }
+  }
+
+  if (cr_emit_poly_call(g, id, name, recv, argc, argv, block, b)) return 1;
+
+  /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
+     raises IndexError, so it maps onto the `[]?` form. */
+  if (recv >= 0 && sp_streq(name, "at") && argc == 1 && ty_is_array(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, "[");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, "]?");
+    return 1;
+  }
+
+  /* Ruby's String#chars yields an array of one-character Strings; Crystal's
+     String#chars yields Chars. The analyzer models the result as a string array
+     (a String read out of a container during the poly pass, and TY_STR_ARRAY on
+     the concrete pass), so a later use of an element as a String -- a hash
+     lookup, `==` against a literal, string concatenation -- would take the Char
+     path and raise at runtime (issue 2903). Map each Char back to a String for
+     the blockless form. The block form cannot be rewritten without changing what
+     the block parameter is, so it is refused rather than silently Char-typed. */
+  if (recv >= 0 && sp_streq(name, "chars") && argc == 0 &&
+      comp_ntype(g->c, recv) == TY_STRING &&
+      !cr_user_method_ok(g, name, TY_STRING, 0)) {
+    if (block >= 0) {
+      cr_mark_unsupported(g, id, "String#chars with a block (Crystal's chars "
+                                "yields Char; Ruby's yields one-character Strings)");
+      buf_puts(b, "nil");
+      return 1;
+    }
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".chars.map(&.to_s)");
+    return 1;
+  }
+
+  /* Ruby's String#to_i auto-detects the base's prefix for base 0, treats a
+     leading zero as octal only there, accepts `_` digit separators, and never
+     raises (it answers 0 when no digits parse); Crystal's to_i defaults to
+     strict:true (raising ArgumentError) with no prefix/underscore handling
+     (string.cr `to_i`). Set the flags that make Crystal answer as Ruby does. */
+  if (recv >= 0 && sp_streq(name, "to_i") && argc <= 1 &&
+      comp_ntype(g->c, recv) == TY_STRING &&
+      !cr_user_method_ok(g, name, TY_STRING, 0)) {
+    /* Crystal rejects base 0 outright, so Ruby's autodetect is spelled by
+       leaving the (valid) default base in place and letting prefix/octal
+       detection override it per string. A bare `s.to_i` keeps Crystal's default
+       base 10 and only needs strict/underscore. The `{ 0 }` block is Ruby's "no
+       digits parsed means 0": Crystal's to_i otherwise raises on "0", "08" or
+       "", where Ruby answers 0. */
+    int base0 = argc == 1 && nt_kind(g->nt, argv[0]) == NK_IntegerNode &&
+                nt_int(g->nt, argv[0], "value", -1) == 0;
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".to_i(");
+    if (base0)          buf_puts(b, "10, ");
+    else if (argc == 1) { cr_emit_expr(g, argv[0], b); buf_puts(b, ", "); }
+    buf_puts(b, "strict: false, underscore: true");
+    if (base0) buf_puts(b, ", prefix: true, leading_zero_is_octal: true");
+    buf_puts(b, ") { 0 }");
+    return 1;
+  }
+
+  /* Crystal's Float#to_i returns an Int32 and raises once the value passes
+     2**31; Ruby's returns a full Integer. Crystal's Float#to_i64 keeps Ruby's
+     value across the whole Int64 range, so use it. Past Int64 the two still
+     differ -- Ruby yields a Bignum, Crystal raises OverflowError -- so a float
+     literal outside the range is refused rather than shipped as a crash. */
+  if (recv >= 0 && sp_streq(name, "to_i") && argc == 0 &&
+      comp_ntype(g->c, recv) == TY_FLOAT &&
+      !cr_user_method_ok(g, name, TY_FLOAT, 0)) {
+    if (nt_kind(g->nt, recv) == NK_FloatNode) {
+      const char *c = nt_content(g->nt, recv);
+      double d = c ? strtod(c, NULL) : 0.0;
+      if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) {
+        cr_mark_unsupported(g, id, "Float#to_i outside the Int64 range (Ruby "
+                                  "returns a Bignum; Crystal raises OverflowError)");
+        buf_puts(b, "nil");
+        return 1;
+      }
+    }
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".to_i64");
+    return 1;
+  }
+
+  /* Integer#round/ceil/floor/truncate(ndigits): n >= 0 is self; n < 0 rounds to
+     10**(-n) exactly. A literal past 10**18 needs a Bignum, so refuse. */
+  if (recv >= 0 && argc == 1 && comp_ntype(g->c, recv) == TY_INT &&
+      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
+       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
+    int lit = nt_kind(g->nt, argv[0]) == NK_IntegerNode;
+    long long n = lit ? nt_int(g->nt, argv[0], "value", 0) : 0;
+    if (lit && n <= -19) {
+      cr_mark_unsupported(g, id, "Integer#round/ceil/floor/truncate with an "
+                                "ndigits below 0 (modulus past 10**18; Ruby "
+                                "returns a Bignum)");
+      buf_puts(b, "nil");
+      return 1;
+    }
+    if (lit && n >= 0) { cr_emit_recv(g, recv, b); return 1; }   /* ndigits >= 0: self */
+    buf_printf(b, "sp_int_%s(", name);
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ", ");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ")");
+    return 1;
+  }
+
+  /* Float#round/ceil/floor/truncate(ndigits): Crystal has Float#round(n) but no
+     digit-taking ceil/floor/truncate, so the scaling helpers. CRuby returns an
+     Integer for a literal ndigits <= 0, so append .to_i there. */
+  if (recv >= 0 && argc == 1 && comp_ntype(g->c, recv) == TY_FLOAT &&
+      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
+       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
+    int lit = nt_kind(g->nt, argv[0]) == NK_IntegerNode;
+    long long n = lit ? nt_int(g->nt, argv[0], "value", 0) : 0;
+    int want_int = lit && n <= 0;
+    if (sp_streq(name, "round")) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".round(");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+    } else {
+      buf_printf(b, "sp_flt_%s(", name);
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ", ");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+    }
+    if (want_int) buf_puts(b, ".to_i");
+    return 1;
+  }
+
+  /* Ruby's Float#round/ceil/floor/truncate with no argument answer an Integer;
+     Crystal's round/ceil/floor answer a Float64 and it has no truncate. */
+  if (recv >= 0 && argc == 0 && comp_ntype(g->c, recv) == TY_FLOAT &&
+      (sp_streq(name, "round") || sp_streq(name, "ceil") ||
+       sp_streq(name, "floor") || sp_streq(name, "truncate"))) {
+    cr_emit_recv(g, recv, b);
+    if (!sp_streq(name, "truncate")) buf_printf(b, ".%s", name);
+    buf_puts(b, ".to_i");
+    return 1;
+  }
+
+  /* Ruby's min/max answer nil on an empty collection; Crystal's min/max raise
+     Enumerable::EmptyError. The `?` form returns the nilable counterpart, so it
+     is used only where the surrounding context already tolerates nil -- the same
+     gate the `[]` read uses -- to avoid widening an element type that a later
+     non-nil use depends on. */
+  if (recv >= 0 && (sp_streq(name, "min") || sp_streq(name, "max")) &&
+      argc == 0 && block < 0 && g->nil_ok &&
+      (ty_is_array(comp_ntype(g->c, recv)) || comp_ntype(g->c, recv) == TY_RANGE)) {
+    cr_emit_recv(g, recv, b);
+    buf_printf(b, ".%s?()", name);
+    return 1;
+  }
+
+  /* Ruby's String#split differs from Crystal's on all three of whitespace (awk)
+     mode for a single-space separator, trailing-empty dropping under the default
+     limit, and the positive-cap / negative-keep limit rule. Route a String (or
+     nil, or no) separator through the sp_ruby_split helpers. A Regexp or Char
+     separator keeps the plain path. A block yields each field (split's own
+     return value is the receiver, which the corpus does not use). */
+  int str_sep = argc == 0 || nt_kind(g->nt, argv[0]) == NK_NilNode ||
+                (recv >= 0 && comp_ntype(g->c, argv[0]) == TY_STRING);
+  if (recv >= 0 && sp_streq(name, "split") && comp_ntype(g->c, recv) == TY_STRING &&
+      argc <= 2 && str_sep) {
+    buf_puts(b, "sp_ruby_split(");
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ", ");
+    if (argc >= 1) cr_emit_expr(g, argv[0], b); else buf_puts(b, "nil");
+    if (argc == 2) { buf_puts(b, ", "); cr_emit_expr(g, argv[1], b); }
+    buf_puts(b, ")");
+    if (block >= 0) { buf_puts(b, ".each"); cr_emit_block(b, g, block, 0, recv, "each"); }
+    return 1;
+  }
+
+  /* Crystal's values_at answers a Tuple, and zip an Array of Tuples, where Ruby
+     answers a plain Array (of Arrays for zip). `.to_a` / `.map(&.to_a)`
+     restores Ruby's shape; a later `|a, b|` destructuring still works on an
+     Array, so this is safe when the result is consumed either way. */
+  if (recv >= 0 && block < 0 &&
+      (sp_streq(name, "values_at") || sp_streq(name, "zip")) &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    /* `arr.values_at` with no index answers []; Crystal's values_at needs at
+       least one. `first(0)` is an empty Array of the right element type. */
+    if (sp_streq(name, "values_at") && argc == 0) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".first(0)");
+      return 1;
+    }
+    cr_emit_recv(g, recv, b);
+    buf_printf(b, ".%s(", name);
+    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    buf_puts(b, sp_streq(name, "zip") ? ").map(&.to_a)" : ").to_a");
+    return 1;
+  }
+
+  /* Ruby's Enumerable#count with no argument and no block is the size; Crystal's
+     requires an item or a block (there is no 0-argument count). */
+  if (recv >= 0 && block < 0 && argc == 0 && sp_streq(name, "count")) {
+    TyKind rt = comp_ntype(g->c, recv);
+    if (ty_is_array(rt) || ty_is_hash(rt) || rt == TY_RANGE) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".size");
+      return 1;
+    }
+  }
+
+  /* Ruby's Hash#fetch(key) with no default raises KeyError on a miss, which is
+     exactly Crystal's `h[key]`; Crystal's own fetch() requires a default. */
+  if (recv >= 0 && block < 0 && argc == 1 && sp_streq(name, "fetch") &&
+      ty_is_hash(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, "[");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, "]");
+    return 1;
+  }
+
+  /* Ruby's File.delete / File.unlink with no path delete nothing and answer 0;
+     Crystal's require at least one path. */
+  if (recv >= 0 && argc == 0 && (sp_streq(name, "delete") || sp_streq(name, "unlink")) &&
+      nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+      sp_streq(nt_str(g->nt, recv, "name"), "File")) {
+    buf_puts(b, "0");
+    return 1;
+  }
+
+  /* Ruby's Numeric#step(limit, step) takes positional bounds; Crystal's step
+     takes named `to:` / `by:`. */
+  if (recv >= 0 && sp_streq(name, "step") && (argc == 1 || argc == 2)) {
+    TyKind rt = comp_ntype(g->c, recv);
+    if (rt == TY_INT || rt == TY_FLOAT) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".step(to: ");
+      if (argc == 2) { cr_emit_expr(g, argv[0], b); buf_puts(b, ", by: "); cr_emit_expr(g, argv[1], b); }
+      else cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+      if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
+      return 1;
+    }
+  }
+
+  /* A blockless each_index / each_cons / each_slice is a lazy Iterator in
+     Crystal, so a following map/first/sum runs lazily (or yields an iterator)
+     where Ruby materializes an Array. These yield Arrays, not Tuples, so a plain
+     .to_a restores Ruby's shape -- and a following block destructuring (`|k, v|`)
+     still works on the Array. */
+  if (recv >= 0 && block < 0 && sp_streq(name, "each_index")) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".each_index().to_a");
+    return 1;
+  }
+
+  /* Ruby's Enumerable#first(n) answers an Array; Crystal's Array#first(n) does
+     too, but an Iterator's first(n) answers a lazy iterator (so `p` would show
+     the iterator). Append .to_a: identity for an Array, materializing for an
+     iterator's first n. */
+  if (recv >= 0 && sp_streq(name, "first") && argc == 1) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".first(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").to_a");
+    return 1;
+  }
+
+
+
+
+
+  /* `reduce(:op)` / `inject(seed, :op)` names the fold by an OPERATOR symbol.
+     The shared desugarer rewrites only identifier-named symbols to a block
+     (desugar_reduce_method_symbol); operator symbols ride the C backend's typed
+     fold emitters, which the Crystal emitter does not have -- so it emitted
+     `reduce(:+)`, which Crystal rejects. Spell the fold as a block here. */
+  if (recv >= 0 && block < 0 && argc >= 1 &&
+      (sp_streq(name, "reduce") || sp_streq(name, "inject"))) {
+    int last = argv[argc - 1];
+    const char *sym = nt_kind(g->nt, last) == NK_SymbolNode
+                      ? nt_str(g->nt, last, "value") : NULL;
+    if (sym && cr_is_binop(sym)) {
+      /* A symbol fold over a Hash folds Ruby's [k, v] pair Arrays; Crystal's
+         Hash#reduce yields {k, v} Tuples, so the fold is a different type (and
+         a growing Tuple at that). Refuse rather than ship it. */
+      if (ty_is_hash(comp_ntype(g->c, recv))) {
+        cr_mark_unsupported(g, id, "a symbol fold over a Hash (Ruby folds [k, v] pairs)");
+        buf_puts(b, "nil");
+        return 1;
+      }
+      char ra[32], rb[32];
+      int t = g->tmp_seq++;
+      snprintf(ra, sizeof ra, "__sp_rd%d_a", t);
+      snprintf(rb, sizeof rb, "__sp_rd%d_b", t);
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".reduce(");
+      for (int i = 0; i < argc - 1; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+      buf_printf(b, ") do |%s, %s|\n  %s %s %s\nend", ra, rb, ra, sym, rb);
+      return 1;
+    }
+  }
+
+  /* Ruby's Array#join flattens nested Arrays recursively before joining, with
+     the separator between every element; Crystal's join renders a nested Array
+     with its inspect form. `flatten` recurses through Arrays only -- the same
+     set Ruby's join flattens -- and leaves scalar elements alone. */
+  if (recv >= 0 && sp_streq(name, "join") && block < 0 &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".flatten.join(");
+    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    buf_puts(b, ")");
+    return 1;
+  }
+
+  /* Ruby's charset arguments use range notation, and a lone "^" is a literal
+     caret. Crystal's delete/count/squeeze parse both the same way EXCEPT the
+     lone "^" (there it negates the empty set and matches every character), and
+     Crystal's tr expands no ranges at all. Rewrite the literal charset(s). */
+  if (recv >= 0 && comp_ntype(g->c, recv) == TY_STRING) {
+    if (sp_streq(name, "tr") && argc == 2 &&
+        nt_kind(g->nt, argv[0]) == NK_StringNode && nt_kind(g->nt, argv[1]) == NK_StringNode) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".tr(");
+      cr_emit_charset_literal(b, nt_str(g->nt, argv[0], "content"), 1);
+      buf_puts(b, ", ");
+      cr_emit_charset_literal(b, nt_str(g->nt, argv[1], "content"), 1);
+      buf_puts(b, ")");
+      return 1;
+    }
+    const char *cs = argc == 1 && nt_kind(g->nt, argv[0]) == NK_StringNode
+                     ? nt_str(g->nt, argv[0], "content") : NULL;
+    if (cs && sp_streq(cs, "^") &&
+        (sp_streq(name, "delete") || sp_streq(name, "count") || sp_streq(name, "squeeze"))) {
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".%s(", name);
+      cr_emit_charset_literal(b, "\\^", 0);
+      buf_puts(b, ")");
+      return 1;
+    }
+  }
+
+  /* Regexp#options in Ruby is an Integer bitmask (1=IGNORECASE, 2=EXTENDED,
+     4=MULTILINE); Crystal's `options` returns its own Options enum, which the
+     stdlib uses internally, so it cannot be overridden. Answer through the
+     shim's ruby_options helper instead. */
+  if (recv >= 0 && sp_streq(name, "options") && argc == 0 &&
+      comp_ntype(g->c, recv) == TY_REGEX) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".ruby_options");
+    return 1;
+  }
+
+  /* Ruby's Time#utc / #getlocal (no argument) answer a Time in the UTC / local
+     zone; Crystal spells those to_utc / to_local. The argument-taking
+     getlocal(offset) and the in-place gmtime/localtime are refused by the
+     receiver-typed table below. */
+  if (recv >= 0 && argc == 0 && comp_ntype(g->c, recv) == TY_TIME &&
+      (sp_streq(name, "utc") || sp_streq(name, "getlocal"))) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, sp_streq(name, "utc") ? ".to_utc" : ".to_local");
+    return 1;
+  }
+
+  /* Ruby's Math.lgamma answers [log|Gamma(x)|, sign]; Crystal's answers the log
+     alone. Pair it with the computed sign; the argument is bound to a temp so a
+     side-effecting expression is evaluated once. */
+  if (recv >= 0 && sp_streq(name, "lgamma") && argc == 1 &&
+      nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+      sp_streq(nt_str(g->nt, recv, "name"), "Math")) {
+    char tmp[32];
+    snprintf(tmp, sizeof tmp, "__sp_lg%d", g->tmp_seq++);
+    buf_printf(b, "(begin %s = ", tmp);
+    cr_emit_expr(g, argv[0], b);
+    buf_printf(b, "; [Math.lgamma(%s), sp_lgamma_sign(%s)] end)", tmp, tmp);
+    return 1;
+  }
+
+  /* Ruby's sub/gsub replacement strings expand `\&` (the whole match) and
+     `\k<name>` (empty when the group did not participate); Crystal's replacement
+     parser leaves `\&` literal and raises IndexError for a non-participating
+     `\k<name>`. The two languages are not interchangeable, and a computed
+     replacement hides its contents, so only a literal one is inspected. */
+  if (recv >= 0 && (sp_streq(name, "sub") || sp_streq(name, "gsub")) &&
+      argc == 2 && nt_kind(g->nt, argv[1]) == NK_StringNode &&
+      cr_str_has_ruby_only_replacement(nt_str(g->nt, argv[1], "content"))) {
+    cr_mark_unsupported(g, id, "a sub/gsub replacement using a Ruby-only "
+                              "backreference (whole match, pre/post match, "
+                              "last group, or named group)");
+    buf_puts(b, "nil");
+    return 1;
+  }
+
+  if (cr_emit_binop_call(g, id, name, recv, argc, argv, block, b)) return 1;
 
   /* index read: Crystal uses bracket syntax, not a .[]() call.
      Ruby's `h[k]` / `a[i]` answer nil for a missing key or an out-of-range index;
@@ -3614,7 +3642,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     if (rt == TY_INT || rt == TY_BIGINT) {
       cr_mark_unsupported(g, id, "Ruby's Integer#[] bit read has no Crystal form");
       buf_puts(b, "nil");
-      return;
+      return 1;
     }
     int nilable = g->nil_ok && argc == 1 &&
                   nt_kind(g->nt, argv[0]) != NK_RangeNode &&
@@ -3639,7 +3667,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
     g->nil_ok = savr;
     buf_puts(b, nilable ? "]?" : "]");
-    return;
+    return 1;
   }
 
   /* index write: `a[i] = v` reaches the analyzer as a .[]= call. Crystal's
@@ -3651,16 +3679,25 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     if (comp_ntype(g->c, recv) == TY_STRING) {
       cr_mark_unsupported(g, id, "Crystal's String is immutable and has no []=; a Ruby index-assign needs a mutable buffer");
       buf_puts(b, "nil");
-      return;
+      return 1;
     }
     cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
     cr_emit_expr(g, argv[0], b);
     buf_puts(b, "] = ");
     cr_emit_expr(g, argv[1], b);
-    return;
+    return 1;
   }
+  return 0;
+}
 
+static void cr_emit_call(CrGen *g, int id, Buf *b) {
+  const char *name = nt_str(g->nt, id, "name");
+  int recv  = nt_ref(g->nt, id, "receiver");
+  int argc  = 0; const int *argv = call_args(g->nt, id, &argc);
+  int block = nt_ref(g->nt, id, "block");
+  if (!name) { g->unsupported++; buf_puts(b, "nil"); return; }
+  if (cr_emit_call_special(g, id, name, recv, argc, argv, block, b)) return;
   /* method call: refuse a name we cannot verify, so an unknown method never
      ships as a silent build error. A nil placeholder keeps emission going; the
      run is refused at the end (codegen_program_crystal). */
