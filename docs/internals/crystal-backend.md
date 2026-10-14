@@ -1005,11 +1005,12 @@ and `Range#%`→`step` (`62c841df`, giving 403/54/236/3705), then the union-rece
 `slice` refusal, `minmax`→`.minmax?.to_a`, `entries`→`to_a`, the `Range#step`
 block-form receiver (`5e229d84`), and Ruby-style `.class` rendering via a runtime
 name shim (`b9a123bd`, gated to rendered uses), giving **413 PASS / 53 DIFF /
-239 BUILDFAIL / 3693 REFUSED**. The remaining transitions are upstream-driven
+239 BUILDFAIL / 3693 REFUSED** before the 7 `.class`-unmasked latent gaps were
+then refused (`f78a086b`), giving **413 PASS / 53 DIFF / 226 BUILDFAIL / 3706
+REFUSED**. The remaining transitions are upstream-driven
 (Float inference to `10.0`, new synthesized `GlobalVariableReadNode`s from the
 load-path preamble), an upstream test change, or spun's own expected output
-(`ruby_engine_dead_branch`); the `.class` shim also unmasks 7 latent gaps
-(documented in its commit), and two behavior-preserving refactorings of the call
+(`ruby_engine_dead_branch`); two behavior-preserving refactorings of the call
 emitter followed (`cr_emit_args`/`CrCall`/`cr_emit_index_call`). The corpus was
 re-baselined in place to this state.
 
