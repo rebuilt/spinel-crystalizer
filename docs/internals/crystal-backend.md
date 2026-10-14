@@ -1002,14 +1002,16 @@ survived the rewrite — but the analyzer's *inference and desugaring* changed,
 shifting the same 4398-program corpus from 404/52/235/3707 to 401/53/237/3707.
 Backend-addressable regressions were then fixed in two rounds: `find_index`→`index`
 and `Range#%`→`step` (`62c841df`, giving 403/54/236/3705), then the union-receiver
-`slice` refusal, `minmax`→`.minmax?.to_a`, `entries`→`to_a`, and the `Range#step`
-block-form receiver (`5e229d84`), giving **404 PASS / 56 DIFF / 232 BUILDFAIL /
-3706 REFUSED**. The remaining transitions are upstream-driven (Float inference to
-`10.0`, new synthesized `GlobalVariableReadNode`s from the load-path preamble) or
-fundamental rendering gaps (`.class` on a generic type prints `Range(Int64, Int64)`
-not `Range`; a blockless enumerator is a `StepIterator`, not an `Enumerator`), an
-upstream test change, or spun's own expected output (`ruby_engine_dead_branch`).
-`test/crystal_corpus_baseline.txt` was re-baselined in place to this state.
+`slice` refusal, `minmax`→`.minmax?.to_a`, `entries`→`to_a`, the `Range#step`
+block-form receiver (`5e229d84`), and Ruby-style `.class` rendering via a runtime
+name shim (`b9a123bd`, gated to rendered uses), giving **413 PASS / 53 DIFF /
+239 BUILDFAIL / 3693 REFUSED**. The remaining transitions are upstream-driven
+(Float inference to `10.0`, new synthesized `GlobalVariableReadNode`s from the
+load-path preamble), an upstream test change, or spun's own expected output
+(`ruby_engine_dead_branch`); the `.class` shim also unmasks 7 latent gaps
+(documented in its commit), and two behavior-preserving refactorings of the call
+emitter followed (`cr_emit_args`/`CrCall`/`cr_emit_index_call`). The corpus was
+re-baselined in place to this state.
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
