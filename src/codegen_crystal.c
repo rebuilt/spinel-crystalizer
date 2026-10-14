@@ -101,20 +101,14 @@ typedef struct {
                              needs the binding the enclosing clause introduced.
                              Set around the emission of a clause body, which may
                              itself contain nested begin/rescue. */
-  int value_ctx;        /* 1 when the expression about to be emitted has its
-                           value used (an argument, an RHS, a condition); 0 when
-                           it is a discarded statement. cr_emit_expr moves it into
-                           cur_value and resets it to 1 for the node's own
-                           children, which are always value positions. */
-  int cur_value;        /* the value_ctx of the node currently being emitted,
-                           read by cr_emit_call to tell a used call (a
-                           self-returning iterator, a setter) from a discarded
-                           one. */
-  int class_render;     /* 1 while emitting an argument of p/puts/print/pp, where
-                           a `.class` result is rendered rather than dispatched
-                           on. cr_emit_expr moves it into cur_class_render and
-                           clears it for the node's own children. */
-  int cur_class_render; /* the class_render of the node being emitted. */
+  /* The parent-set context for the expression about to be emitted, and the
+     context of the node being emitted. cr_emit_expr snapshots `ctx` into
+     `cur_ctx` and resets it for the node's own children (whose context is the
+     default below). `value` is 1 when the expression's value is used (an
+     argument, an RHS, a condition) and 0 for a discarded statement;
+     `class_render` is 1 inside an argument of p/puts/print/pp, where a `.class`
+     result is rendered rather than dispatched on. */
+  struct { int value; int class_render; } ctx, cur_ctx;
   int tmp_seq;          /* counter for synthetic emitter-local names, so two
                            desugarings in one method never collide */
 } CrGen;
@@ -2187,10 +2181,9 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
   /* Record whether THIS node's value is used (read by a call handler: a
      self-returning iterator, a setter), then reset the ambient flag so the
      node's own children -- always value positions -- see 1. */
-  g->cur_value = g->value_ctx;
-  g->value_ctx = 1;
-  g->cur_class_render = g->class_render;
-  g->class_render = 0;
+  g->cur_ctx = g->ctx;
+  g->ctx.value = 1;
+  g->ctx.class_render = 0;
   /* nil_ok describes the node being emitted, never a subtree: only an index read
      consults it, and a parent sets it for that one child. Clearing it here means
      `p(h[k] + 1)` cannot reach through the `+` and make its operand a nilable
@@ -3300,7 +3293,7 @@ static int cr_iter_returns_self(const char *n) {
 static int cr_emit_self_return_wrap(CrGen *g, const CrCall *c, Buf *b) {
   int id = c->id; const char *name = c->name; int recv = c->recv;
   int argc = c->argc; const int *argv = c->argv; int block = c->block;
-  if (g->cur_value == 0 || recv < 0 || block < 0) return 0;
+  if (g->cur_ctx.value == 0 || recv < 0 || block < 0) return 0;
   if (!cr_iter_returns_self(name)) return 0;
   TyKind rt = comp_ntype(g->c, recv);
   /* Only a receiver emitted verbatim (an Array or Hash): a Range or String
@@ -3867,7 +3860,7 @@ static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
      type arguments (Range(Int64, Int64)) and spells Int64 / Float64 / Bool.
      Route it through the runtime name shim so `p x.class` and `x.class.name`
      match CRuby. A user-defined `class` method is kept. */
-  if (g->cur_class_render && recv >= 0 && argc == 0 && block < 0 &&
+  if (g->cur_ctx.class_render && recv >= 0 && argc == 0 && block < 0 &&
       sp_streq(name, "class") &&
       !cr_user_method_ok(g, name, comp_ntype(g->c, recv), 0)) {
     buf_puts(b, "sp_class_of(");
@@ -4033,11 +4026,11 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       cr_emit_recv(g, recv, b);
       buf_printf(b, ".try { |%s| %s.%s(", tmp, tmp, mname);
       int sav2 = g->nil_ok;
-      int savcr = g->class_render;
+      int savcr = g->ctx.class_render;
       if (sp_streq(name, "p") || sp_streq(name, "puts") || sp_streq(name, "print") ||
           sp_streq(name, "pp")) {
         g->nil_ok = 1;
-        g->class_render = 1;
+        g->ctx.class_render = 1;
       }
       for (int i = 0; i < argc; i++) {
         if (i) buf_puts(b, ", ");
@@ -4045,7 +4038,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
         else cr_emit_expr(g, argv[i], b);
       }
       g->nil_ok = sav2;
-      g->class_render = savcr;
+      g->ctx.class_render = savcr;
       buf_puts(b, ")");
       /* The block belongs INSIDE the `try` braces: `x&.m { }` is a call of `m`
          with a block, so it must read `try { |t| t.m() { ... } }`. Appending it
@@ -4064,11 +4057,11 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   /* Ruby's output helpers all accept nil (p prints it, puts/print skip it), and
      Crystal's do too, so a possibly-missing read must not raise before the print. */
   int sav2 = g->nil_ok;
-  int savcr = g->class_render;
+  int savcr = g->ctx.class_render;
   if (sp_streq(name, "p") || sp_streq(name, "puts") || sp_streq(name, "print") ||
       sp_streq(name, "pp")) {
     g->nil_ok = 1;
-    g->class_render = 1;
+    g->ctx.class_render = 1;
   }
   for (int i = 0; i < argc; i++) {
     if (i) buf_puts(b, ", ");
@@ -4076,7 +4069,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
     else cr_emit_expr(g, argv[i], b);
   }
   g->nil_ok = sav2;
-  g->class_render = savcr;
+  g->ctx.class_render = savcr;
   buf_puts(b, ")");
 
   if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
@@ -4434,7 +4427,7 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
         g->nil_ok = 1;
       /* A discarded expression statement's value is unused -- unless it is the
          body's tail, whose value is the method/block return. */
-      g->value_ctx = (id == g->tail_value) ? 1 : 0;
+      g->ctx.value = (id == g->tail_value) ? 1 : 0;
       cr_emit_expr(g, id, b);
       g->nil_ok = savs;
       buf_puts(b, "\n");
@@ -5520,7 +5513,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
   CrGen g; memset(&g, 0, sizeof g);
   g.c = c; g.nt = nt;
   g.first_unsup = -1;
-  g.value_ctx = 1;
+  g.ctx.value = 1;
   g.cur_class = -1;
 
   Buf b; memset(&b, 0, sizeof b);
