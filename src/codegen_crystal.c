@@ -119,6 +119,18 @@ typedef struct {
                            desugarings in one method never collide */
 } CrGen;
 
+/* A CallNode's shape, bundled so the call handlers take (g, c, b) instead of
+   seven separate arguments -- the data clump they all share. The handler bodies
+   re-bind the members to locals, so only the signature changes. */
+typedef struct {
+  int id;
+  const char *name;
+  int recv;
+  int argc;
+  const int *argv;
+  int block;
+} CrCall;
+
 /* Record that `id` is outside the supported subset. Emission continues (a
    placeholder is emitted by the caller) so the whole program is scanned and the
    count is complete; codegen_program_crystal refuses at the end if any were seen,
@@ -2947,8 +2959,26 @@ static const char *cr_enum_passthrough(const char *name, TyKind recv_ty, char *r
 /* Ruby/Crystal binary-operator translation: integer `/` -> `//`, the `%`
    named-format key rewrite, and the boxed comparison at a widened boundary.
    Returns 1 when it emitted the call. */
-static int cr_emit_binop_call(CrGen *g, int id, const char *name, int recv,
-                              int argc, const int *argv, int block, Buf *b) {
+/* Emit a call's arguments comma-separated, each as an expression. Shared by
+   every call site so the separator convention lives in one place. */
+static void cr_emit_args(CrGen *g, const int *argv, int argc, Buf *b) {
+  for (int i = 0; i < argc; i++) {
+    if (i) buf_puts(b, ", ");
+    cr_emit_expr(g, argv[i], b);
+  }
+}
+
+/* The boxed form, for a call whose arguments sit at widened (poly) positions. */
+static void cr_emit_boxed_args(CrGen *g, const int *argv, int argc, Buf *b) {
+  for (int i = 0; i < argc; i++) {
+    if (i) buf_puts(b, ", ");
+    cr_emit_boxed(g, argv[i], b);
+  }
+}
+
+static int cr_emit_binop_call(CrGen *g, const CrCall *c, Buf *b) {
+  int id = c->id; const char *name = c->name; int recv = c->recv;
+  int argc = c->argc; const int *argv = c->argv; int block = c->block;
   /* binary operator */
   if (recv >= 0 && argc == 1 && cr_is_binop(name)) {
     const char *op = name;
@@ -3044,8 +3074,9 @@ static int cr_emit_binop_call(CrGen *g, int id, const char *name, int recv,
 /* A call on a widened (poly) receiver, and the boxed push into a widened
    array: nil?, the sp_send dynamic dispatch with its unbox, and the boxing
    push. Returns 1 when it emitted the call. */
-static int cr_emit_poly_call(CrGen *g, int id, const char *name, int recv,
-                     int argc, const int *argv, int block, Buf *b) {
+static int cr_emit_poly_call(CrGen *g, const CrCall *c, Buf *b) {
+  int id = c->id; const char *name = c->name; int recv = c->recv;
+  int argc = c->argc; const int *argv = c->argv; int block = c->block;
   /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
      value answers through the runtime's sp_nil? instead. */
   if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 && argc == 0 &&
@@ -3088,7 +3119,7 @@ static int cr_emit_poly_call(CrGen *g, int id, const char *name, int recv,
       buf_puts(b, "[] of SpValue");
     } else {
       buf_puts(b, "[");
-      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
+      cr_emit_boxed_args(g, argv, argc, b);
       buf_puts(b, "]");
     }
     buf_puts(b, ")");
@@ -3118,7 +3149,7 @@ static int cr_emit_poly_call(CrGen *g, int id, const char *name, int recv,
     if (box_push) {
       cr_emit_recv(g, recv, b);
       buf_printf(b, ".%s(", name);
-      for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_boxed(g, argv[i], b); }
+      cr_emit_boxed_args(g, argv, argc, b);
       buf_puts(b, ")");
       return 1;
     }
@@ -3129,8 +3160,9 @@ static int cr_emit_poly_call(CrGen *g, int id, const char *name, int recv,
 /* Kernel call forms with no Crystal equivalent: bare `raise` (re-raise),
    `raise Cls, msg`, `raise Cls`, `exit(true/false)`, and blockless `loop`.
    Returns 1 when it emitted the call. */
-static int cr_emit_kernel_call(CrGen *g, int id, const char *name, int recv,
-                     int argc, const int *argv, int block, Buf *b) {
+static int cr_emit_kernel_call(CrGen *g, const CrCall *c, Buf *b) {
+  int id = c->id; const char *name = c->name; int recv = c->recv;
+  int argc = c->argc; const int *argv = c->argv; int block = c->block;
   /* Ruby's bare `raise` re-raises `$!`. Crystal has no `$!`: inside a rescue
      block the current exception is the clause's bound name, and re-raising means
      `raise e`. Outside any clause there is nothing to re-raise, and Ruby would
@@ -3247,8 +3279,9 @@ static int cr_iter_returns_self(const char *n) {
    evaluation of it. A `break` in the block makes the iterator answer the break
    value (nil or the value) in BOTH languages, so such a call is left alone.
    Returns 1 when it emitted the call. */
-static int cr_emit_self_return_wrap(CrGen *g, int id, const char *name, int recv,
-                                    int argc, const int *argv, int block, Buf *b) {
+static int cr_emit_self_return_wrap(CrGen *g, const CrCall *c, Buf *b) {
+  int id = c->id; const char *name = c->name; int recv = c->recv;
+  int argc = c->argc; const int *argv = c->argv; int block = c->block;
   if (g->cur_value == 0 || recv < 0 || block < 0) return 0;
   if (!cr_iter_returns_self(name)) return 0;
   TyKind rt = comp_ntype(g->c, recv);
@@ -3268,15 +3301,16 @@ static int cr_emit_self_return_wrap(CrGen *g, int id, const char *name, int recv
   snprintf(tmp, sizeof tmp, "__cr_ret%d", g->tmp_seq++);
   cr_emit_recv(g, recv, b);
   buf_printf(b, ".tap { |%s| %s.%s(", tmp, tmp, mname);
-  for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+  cr_emit_args(g, argv, argc, b);
   buf_puts(b, ")");
   cr_emit_block(b, g, block, 0, recv, name);
   buf_puts(b, " }");
   return 1;
 }
 
-static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
-                                int argc, const int *argv, int block, Buf *b) {
+static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
+  int id = c->id; const char *name = c->name; int recv = c->recv;
+  int argc = c->argc; const int *argv = c->argv; int block = c->block;
   /* unary - / + : no receiver, one argument */
   if (recv < 0 && argc == 1 && (sp_streq(name, "-") || sp_streq(name, "+"))) {
     buf_printf(b, "%c(", name[0]); cr_emit_expr(g, argv[0], b); buf_puts(b, ")");
@@ -3316,7 +3350,7 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     buf_puts(b, ".each_with_index().to_a");
     return 1;
   }
-  if (cr_emit_kernel_call(g, id, name, recv, argc, argv, block, b)) return 1;
+  if (cr_emit_kernel_call(g, c, b)) return 1;
 
   /* Crystal's is_a? / kind_of? / instance_of? take a TYPE, so a variable holding
      a class has no Crystal form (a constant is emitted as-is). A constant naming
@@ -3342,7 +3376,7 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     }
   }
 
-  if (cr_emit_poly_call(g, id, name, recv, argc, argv, block, b)) return 1;
+  if (cr_emit_poly_call(g, c, b)) return 1;
 
   /* Ruby's Array#at is `[]` with a nil sentinel out of range; Crystal's `at`
      raises IndexError, so it maps onto the `[]?` form. */
@@ -3533,7 +3567,7 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     }
     cr_emit_recv(g, recv, b);
     buf_printf(b, ".%s(", name);
-    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    cr_emit_args(g, argv, argc, b);
     buf_puts(b, sp_streq(name, "zip") ? ").map(&.to_a)" : ").to_a");
     return 1;
   }
@@ -3650,7 +3684,7 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
       ty_is_array(comp_ntype(g->c, recv))) {
     cr_emit_recv(g, recv, b);
     buf_puts(b, ".flatten.join(");
-    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    cr_emit_args(g, argv, argc, b);
     buf_puts(b, ")");
     return 1;
   }
@@ -3767,7 +3801,7 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     buf_puts(b, ".minmax?.to_a");
     return 1;
   }
-  if (cr_emit_binop_call(g, id, name, recv, argc, argv, block, b)) return 1;
+  if (cr_emit_binop_call(g, c, b)) return 1;
 
   /* index read: Crystal uses bracket syntax, not a .[]() call.
      Ruby's `h[k]` / `a[i]` answer nil for a missing key or an out-of-range index;
@@ -3805,7 +3839,7 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     int savr = g->nil_ok; g->nil_ok = 0;
     cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
-    for (int i = 0; i < argc; i++) { if (i) buf_puts(b, ", "); cr_emit_expr(g, argv[i], b); }
+    cr_emit_args(g, argv, argc, b);
     g->nil_ok = savr;
     buf_puts(b, nilable ? "]?" : "]");
     return 1;
@@ -3838,10 +3872,11 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   int argc  = 0; const int *argv = call_args(g->nt, id, &argc);
   int block = nt_ref(g->nt, id, "block");
   if (!name) { g->unsupported++; buf_puts(b, "nil"); return; }
-  if (cr_emit_call_special(g, id, name, recv, argc, argv, block, b)) return;
+  CrCall c = { id, name, recv, argc, argv, block };
+  if (cr_emit_call_special(g, &c, b)) return;
   /* Ruby's self-returning element iterators (each, times, upto, ...) answer the
      receiver; Crystal's answer nil. When the value is used, wrap in `tap`. */
-  if (cr_emit_self_return_wrap(g, id, name, recv, argc, argv, block, b)) return;
+  if (cr_emit_self_return_wrap(g, &c, b)) return;
   /* method call: refuse a name we cannot verify, so an unknown method never
      ships as a silent build error. A nil placeholder keeps emission going; the
      run is refused at the end (codegen_program_crystal). */
