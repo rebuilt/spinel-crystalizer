@@ -3308,6 +3308,74 @@ static int cr_emit_self_return_wrap(CrGen *g, const CrCall *c, Buf *b) {
   return 1;
 }
 
+/* Index read (`a[i]` / `h[k]`, answered nil for a miss) and index write
+   (`a[i] = v`). Returns 1 when it emitted the call. */
+static int cr_emit_index_call(CrGen *g, const CrCall *c, Buf *b) {
+  int id = c->id; const char *name = c->name; int recv = c->recv;
+  int argc = c->argc; const int *argv = c->argv; int block = c->block;
+  /* index read: Crystal uses bracket syntax, not a .[]() call.
+     Ruby's `h[k]` / `a[i]` answer nil for a missing key or an out-of-range index;
+     Crystal's `[]` raises KeyError/IndexError. The `?` form is the translation
+     that keeps Ruby's answer. Restricted to a single scalar index on a receiver
+     the inference knows is a Hash or Array, so a Range slice (`a[1..2]`) or a
+     non-container receiver keeps the raising form rather than a guess. */
+  if (recv >= 0 && sp_streq(name, "[]")) {
+    TyKind rt = comp_ntype(g->c, recv);
+    /* Ruby's Integer#[] is a bit read; Crystal's Int has no []. (`[]` is
+       special-cased before the missing-method table, so it needs its own guard.)
+       A Symbol#[] slice is likewise rejected below by the plain emission. */
+    if (rt == TY_INT || rt == TY_BIGINT) {
+      cr_mark_unsupported(g, id, "Ruby's Integer#[] bit read has no Crystal form");
+      buf_puts(b, "nil");
+      return 1;
+    }
+    int nilable = g->nil_ok && argc == 1 &&
+                  nt_kind(g->nt, argv[0]) != NK_RangeNode &&
+                  (ty_is_hash(rt) || ty_is_array(rt));
+    /* `s[regexp, name]` is the named-capture read. Ruby answers nil when the
+       group did not participate; Crystal's `[]` instead declares a non-nilable
+       String and asserts a match, so the nil answer is the `[]?` form. This is
+       always correct -- the group may or may not have matched -- so it does not
+       depend on the surrounding nil-tolerance. */
+    if (argc == 2 && comp_ntype(g->c, argv[0]) == TY_REGEX) nilable = 1;
+    /* ENV is a String-keyed Hash in Ruby: a missing key answers nil rather than
+       raising. Crystal's `ENV[]?` is that form (and `ENV[]=` already accepts nil
+       to delete), so this is always the nil-returning read, not a guess. */
+    if (nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+        sp_streq(nt_str(g->nt, recv, "name"), "ENV")) nilable = 1;
+    /* The flag is about THIS read only. Clear it for the receiver and the index
+       so a nested read is not silently made nilable: in `t[k][j]`, making the
+       inner `t[k]` nilable would change the type of the outer receiver. */
+    int savr = g->nil_ok; g->nil_ok = 0;
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, "[");
+    cr_emit_args(g, argv, argc, b);
+    g->nil_ok = savr;
+    buf_puts(b, nilable ? "]?" : "]");
+    return 1;
+  }
+
+  /* index write: `a[i] = v` reaches the analyzer as a .[]= call. Crystal's
+     bracket assignment is an expression that evaluates to the stored value,
+     the same as Ruby's, so this holds in statement and value position alike. */
+  if (recv >= 0 && sp_streq(name, "[]=") && argc == 2) {
+    /* Crystal's String is immutable; Ruby's String#[]= mutates in place. (`[]=`
+       is special-cased before the missing-method table, so guard it here.) */
+    if (comp_ntype(g->c, recv) == TY_STRING) {
+      cr_mark_unsupported(g, id, "Crystal's String is immutable and has no []=; a Ruby index-assign needs a mutable buffer");
+      buf_puts(b, "nil");
+      return 1;
+    }
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, "[");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, "] = ");
+    cr_emit_expr(g, argv[1], b);
+    return 1;
+  }
+  return 0;
+}
+
 static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
   int id = c->id; const char *name = c->name; int recv = c->recv;
   int argc = c->argc; const int *argv = c->argv; int block = c->block;
@@ -3803,66 +3871,7 @@ static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
   }
   if (cr_emit_binop_call(g, c, b)) return 1;
 
-  /* index read: Crystal uses bracket syntax, not a .[]() call.
-     Ruby's `h[k]` / `a[i]` answer nil for a missing key or an out-of-range index;
-     Crystal's `[]` raises KeyError/IndexError. The `?` form is the translation
-     that keeps Ruby's answer. Restricted to a single scalar index on a receiver
-     the inference knows is a Hash or Array, so a Range slice (`a[1..2]`) or a
-     non-container receiver keeps the raising form rather than a guess. */
-  if (recv >= 0 && sp_streq(name, "[]")) {
-    TyKind rt = comp_ntype(g->c, recv);
-    /* Ruby's Integer#[] is a bit read; Crystal's Int has no []. (`[]` is
-       special-cased before the missing-method table, so it needs its own guard.)
-       A Symbol#[] slice is likewise rejected below by the plain emission. */
-    if (rt == TY_INT || rt == TY_BIGINT) {
-      cr_mark_unsupported(g, id, "Ruby's Integer#[] bit read has no Crystal form");
-      buf_puts(b, "nil");
-      return 1;
-    }
-    int nilable = g->nil_ok && argc == 1 &&
-                  nt_kind(g->nt, argv[0]) != NK_RangeNode &&
-                  (ty_is_hash(rt) || ty_is_array(rt));
-    /* `s[regexp, name]` is the named-capture read. Ruby answers nil when the
-       group did not participate; Crystal's `[]` instead declares a non-nilable
-       String and asserts a match, so the nil answer is the `[]?` form. This is
-       always correct -- the group may or may not have matched -- so it does not
-       depend on the surrounding nil-tolerance. */
-    if (argc == 2 && comp_ntype(g->c, argv[0]) == TY_REGEX) nilable = 1;
-    /* ENV is a String-keyed Hash in Ruby: a missing key answers nil rather than
-       raising. Crystal's `ENV[]?` is that form (and `ENV[]=` already accepts nil
-       to delete), so this is always the nil-returning read, not a guess. */
-    if (nt_kind(g->nt, recv) == NK_ConstantReadNode &&
-        sp_streq(nt_str(g->nt, recv, "name"), "ENV")) nilable = 1;
-    /* The flag is about THIS read only. Clear it for the receiver and the index
-       so a nested read is not silently made nilable: in `t[k][j]`, making the
-       inner `t[k]` nilable would change the type of the outer receiver. */
-    int savr = g->nil_ok; g->nil_ok = 0;
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, "[");
-    cr_emit_args(g, argv, argc, b);
-    g->nil_ok = savr;
-    buf_puts(b, nilable ? "]?" : "]");
-    return 1;
-  }
-
-  /* index write: `a[i] = v` reaches the analyzer as a .[]= call. Crystal's
-     bracket assignment is an expression that evaluates to the stored value,
-     the same as Ruby's, so this holds in statement and value position alike. */
-  if (recv >= 0 && sp_streq(name, "[]=") && argc == 2) {
-    /* Crystal's String is immutable; Ruby's String#[]= mutates in place. (`[]=`
-       is special-cased before the missing-method table, so guard it here.) */
-    if (comp_ntype(g->c, recv) == TY_STRING) {
-      cr_mark_unsupported(g, id, "Crystal's String is immutable and has no []=; a Ruby index-assign needs a mutable buffer");
-      buf_puts(b, "nil");
-      return 1;
-    }
-    cr_emit_recv(g, recv, b);
-    buf_puts(b, "[");
-    cr_emit_expr(g, argv[0], b);
-    buf_puts(b, "] = ");
-    cr_emit_expr(g, argv[1], b);
-    return 1;
-  }
+  if (cr_emit_index_call(g, c, b)) return 1;
   return 0;
 }
 
