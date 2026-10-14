@@ -1000,13 +1000,15 @@ merged with `upstream/master` (7576 commits ahead of the fork base) as
 `73fede85a`. The Crystal backend compiled unchanged — the analyzer API it uses
 survived the rewrite — but the analyzer's *inference and desugaring* changed,
 shifting the same 4398-program corpus from 404/52/235/3707 to 401/53/237/3707.
-Two backend-addressable regressions were then fixed (`find_index`→`index`,
-`Range#%`→`step`, commit `62c841df`), giving **403 PASS / 54 DIFF / 236 BUILDFAIL /
-3705 REFUSED** (the P22u-column numbers above are the pre-merge baseline). The
-remaining transitions are upstream-driven (Float inference to `10.0`, new
-synthesized `GlobalVariableReadNode`s from the load-path preamble, a
-union-receiver `slice`, a blockless-enumerator `class`), an upstream test change,
-or spun's own expected output (`ruby_engine_dead_branch`).
+Backend-addressable regressions were then fixed in two rounds: `find_index`→`index`
+and `Range#%`→`step` (`62c841df`, giving 403/54/236/3705), then the union-receiver
+`slice` refusal, `minmax`→`.minmax?.to_a`, `entries`→`to_a`, and the `Range#step`
+block-form receiver (`5e229d84`), giving **404 PASS / 56 DIFF / 232 BUILDFAIL /
+3706 REFUSED**. The remaining transitions are upstream-driven (Float inference to
+`10.0`, new synthesized `GlobalVariableReadNode`s from the load-path preamble) or
+fundamental rendering gaps (`.class` on a generic type prints `Range(Int64, Int64)`
+not `Range`; a blockless enumerator is a `StepIterator`, not an `Enumerator`), an
+upstream test change, or spun's own expected output (`ruby_engine_dead_branch`).
 `test/crystal_corpus_baseline.txt` was re-baselined in place to this state.
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
