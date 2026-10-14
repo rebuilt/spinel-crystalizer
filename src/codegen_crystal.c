@@ -1448,12 +1448,22 @@ static const char *cr_translate_name(CrGen *g, int id, int recv, const char *n) 
   if (sp_streq(n, "inject")) return "reduce";
   /* Ruby's Enumerable#entries is an alias of to_a (a fresh Array); Crystal
      spells it to_a on Range/Array/Hash/Set. A user method is emitted verbatim
-     (def names are not translated), so it must be kept as-is. */
+     (def names are not translated), so it must be kept as-is. A Dir is the
+     exception: Crystal has both Dir.entries and Dir#entries and they answer the
+     same listing Ruby's do (including "." and ".."), while Dir.to_a is not even
+     a method -- the rename would turn a working call into an "undefined method"
+     build error. */
   if (sp_streq(n, "entries")) {
     TyKind rt = recv >= 0 ? comp_ntype(g->c, recv) : TY_UNKNOWN;
+    if (rt == TY_DIR) return n;
+    if (recv >= 0 && nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+        sp_streq(nt_str(g->nt, recv, "name"), "Dir")) return n;
     if (cr_user_method_ok(g, n, rt, recv < 0)) return n;
     return "to_a";
   }
+  /* Ruby's Dir#to_path is the directory path; Crystal names it Dir#path. */
+  if (sp_streq(n, "to_path") && recv >= 0 && comp_ntype(g->c, recv) == TY_DIR)
+    return "path";
   return n;
 }
 
@@ -1520,6 +1530,20 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { "Random",  "urandom", "Crystal's secure randomness is Random::Secure" },
     { "ENV",     "key?",  "Crystal's ENV has no key?; use has_key?" },
     { "ENV",     "update", "Crystal's ENV has no update" },
+    /* File/Dir surface Crystal does not carry. `realdirpath` and `readable_real?`
+       and friends answer "the real id", not the effective one, and Crystal's
+       File.readable? is the effective test; `realdirpath` also resolves a
+       missing file's parent, which Crystal's File.real_path (which raises)
+       cannot. `birthtime` has no slot at all -- File::Info stops at
+       modification_time. Each would otherwise emit an "undefined method". */
+    { "File",    "readable_real?",   "Crystal distinguishes real from effective ids only through File.info; there is no File.readable_real?" },
+    { "File",    "writable_real?",   "Crystal has no File.writable_real? (File.writable? is the effective-id test)" },
+    { "File",    "executable_real?", "Crystal has no File.executable_real? (File.executable? is the effective-id test)" },
+    { "File",    "realdirpath",      "Crystal's File.real_path raises on a missing file; Ruby's realdirpath resolves the parent instead" },
+    { "File",    "birthtime",        "Crystal's File::Info has no creation time" },
+    { "File",    "mkfifo",           "Crystal's File has no mkfifo" },
+    { "File",    "extname",          "Crystal's File.extname answers \"\" where Ruby answers \".\" (a last component ending in a dot); refusing is better than the wrong value" },
+    { "Dir",     "for_fd",           "Crystal's Dir cannot be built from a file descriptor" },
   };
   if (mod) {
     /* Class-object reflection -- `Dog.ancestors`, `Dog.method_defined?`,
@@ -1609,9 +1633,39 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { TY_TIME,   "asctime", "Crystal's Time has no asctime; format it" },
     { TY_RANDOM, "bytes",  "Crystal's Random has next_bytes, not Ruby's bytes(n)" },
     { TY_IO,     "stat",   "Crystal's IO/File has no #stat; use File.info" },
+    /* Ruby's MatchData surface beyond what Crystal's Regex::MatchData carries.
+       `offset`/`byteoffset` have no equivalent (begin/end and byte_begin/
+       byte_end do), `values_at` does not exist, and `names` is not exposed (the
+       lazy named-capture index is, through named_captures). */
+    { TY_MATCHDATA, "offset",     "Crystal's MatchData has no offset; use begin/end" },
+    { TY_MATCHDATA, "values_at",  "Crystal's MatchData has no values_at" },
+    { TY_MATCHDATA, "names",      "Crystal's MatchData exposes named captures through named_captures, not names" },
+    { TY_MATCHDATA, "byteoffset", "Crystal's MatchData has byte_begin/byte_end, not byteoffset" },
+    { TY_MATCHDATA, "bytebegin",  "Crystal's MatchData spells it byte_begin" },
+    { TY_MATCHDATA, "byteend",    "Crystal's MatchData spells it byte_end" },
+    { TY_DIR, "fileno", "Crystal's Dir has no fileno" },
   };
   for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
     if (v[i].type == rt && sp_streq(v[i].meth, name)) return v[i].why;
+  /* A Range whose begin is a Float cannot be iterated in Crystal at all: its
+     each steps with succ, and Float has no succ. Ruby raises from such a range
+     too (a Float begin never iterates), but Crystal's failure is a build error,
+     so name it. `max`/`min`/`first`/`last` on an inclusive range are answered
+     from the endpoint by the emitter before this runs, so they are not listed. */
+  if (rt == TY_FLOAT_RANGE) {
+    static const char *const iter[] = {
+      "to_a", "sum", "each", "map", "select", "reject", "count", "step",
+      "reduce", "inject", "sort", "sort_by", "min_by", "max_by", "find",
+      "detect", "any?", "all?", "none?", "one?", "group_by", "flat_map",
+      "each_with_index", "each_slice", "each_cons", "each_with_object",
+      "partition", "tally", "zip", "take", "drop", "take_while", "drop_while",
+      "filter_map", "chunk_while", "slice_when", "minmax", "to_set", NULL,
+    };
+    for (int i = 0; iter[i]; i++)
+      if (sp_streq(name, iter[i]))
+        return "Crystal cannot iterate a Range whose endpoint is a Float (its "
+               "step uses succ); Ruby raises from a Float begin too";
+  }
   /* Container methods Crystal lacks (keyed on the container family, so every
      element type is covered without listing each TyKind). */
   if (ty_is_array(rt)) {
@@ -1692,6 +1746,61 @@ static int cr_call_remap(CrGen *g, int id, int recv, const char *name, Buf *b) {
       cr_emit_expr(g, argv[i], b);
     }
     buf_puts(b, ")");
+    return 1;
+  }
+  /* Ruby's File.unlink is File.delete (the no-path form already answered 0 in
+     cr_emit_call_special, so this is the argc >= 1 case). */
+  if (sp_streq(mod, "File") && sp_streq(name, "unlink") && argc >= 1) {
+    buf_puts(b, "File.delete(");
+    for (int i = 0; i < argc; i++) {
+      if (i) buf_puts(b, ", ");
+      cr_emit_expr(g, argv[i], b);
+    }
+    buf_puts(b, ")");
+    return 1;
+  }
+  /* Ruby's File.readlines keeps the line terminators that split('\n') drops;
+     Crystal's read_lines strips them, so read the bytes and split with the
+     terminators kept -- byte-identical to Ruby, including the empty file ([]). */
+  if (sp_streq(mod, "File") && sp_streq(name, "readlines") && argc == 1) {
+    buf_puts(b, "File.read(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").lines(chomp: false)");
+    return 1;
+  }
+  /* Ruby's File.binread reads the raw bytes; Crystal's File.read is byte-safe
+     (its String carries a byte count), so it is the exact equivalent. */
+  if (sp_streq(mod, "File") && sp_streq(name, "binread") && argc == 1) {
+    buf_puts(b, "File.read(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ")");
+    return 1;
+  }
+  /* Ruby's File.absolute_path? is Crystal's Path#absolute? on the same name. */
+  if (sp_streq(mod, "File") && sp_streq(name, "absolute_path?") && argc == 1) {
+    buf_puts(b, "Path.new(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").absolute?");
+    return 1;
+  }
+  /* Ruby's Dir.pwd is Crystal's Dir.current (both answer the cwd as a String). */
+  if (sp_streq(mod, "Dir") && sp_streq(name, "pwd") && argc == 0) {
+    buf_puts(b, "Dir.current");
+    return 1;
+  }
+  /* Ruby's Dir.home answers the home directory as a String; Crystal spells it
+     Path.home, which is a Path, so `.to_s` restores the String. */
+  if (sp_streq(mod, "Dir") && sp_streq(name, "home") && argc == 0) {
+    buf_puts(b, "Path.home.to_s");
+    return 1;
+  }
+  /* Ruby's Dir.glob sorts its matches (since 3.0); Crystal's keeps the readdir
+     order. Only the bare single-pattern form maps -- Ruby's flag arguments
+     (File::FNM_* and base:) have no Crystal shape, so those fall through. */
+  if (sp_streq(mod, "Dir") && sp_streq(name, "glob") && argc == 1) {
+    buf_puts(b, "Dir.glob(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ").sort");
     return 1;
   }
   return 0;
@@ -3604,6 +3713,35 @@ static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
     if (!sp_streq(name, "truncate")) buf_printf(b, ".%s", name);
     buf_puts(b, ".to_i");
     return 1;
+  }
+
+  /* Ruby's Range#last (no argument) answers the end value, exclusive or not,
+     and Crystal's Range has no last at all. A Range whose endpoint is a Float
+     cannot even be iterated in Crystal (Range#each steps with succ, which a
+     Float endpoint has not), so its max/min/first would fail to build too,
+     while Ruby answers an inclusive range's endpoint without iterating. Emit
+     the endpoint directly. */
+  if (recv >= 0 && argc == 0 && block < 0) {
+    TyKind rrt = comp_ntype(g->c, recv);
+    int is_range = (rrt == TY_RANGE || rrt == TY_FLOAT_RANGE);
+    int flt = (rrt == TY_FLOAT_RANGE), incl = 1;
+    if (is_range && nt_kind(g->nt, recv) == NK_RangeNode) {
+      int rl = nt_ref(g->nt, recv, "left"), rr = nt_ref(g->nt, recv, "right");
+      if ((rl >= 0 && comp_ntype(g->c, rl) == TY_FLOAT) ||
+          (rr >= 0 && comp_ntype(g->c, rr) == TY_FLOAT)) flt = 1;
+      incl = !(nt_int(g->nt, recv, "flags", 0) & 4);
+    }
+    if (is_range && sp_streq(name, "last")) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ".end");
+      return 1;
+    }
+    if (is_range && flt && (sp_streq(name, "first") ||
+                            (incl && (sp_streq(name, "max") || sp_streq(name, "min"))))) {
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, (sp_streq(name, "min") || sp_streq(name, "first")) ? ".begin" : ".end");
+      return 1;
+    }
   }
 
   /* Ruby's min/max answer nil on an empty collection; Crystal's min/max raise
