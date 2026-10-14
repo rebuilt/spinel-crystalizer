@@ -1607,7 +1607,7 @@ REFUSED   test_hash_symbol_fold
 REFUSED   test_hash_symbol_key_store_through_dup
 REFUSED   test_hash_symbol_key_vs_string_keyed
 PASS     test_hash_temp_gc_root
-BUILDFAIL test_hash_to_a_entries
+DIFF     test_hash_to_a_entries
 REFUSED   test_hash_to_h_identity
 REFUSED   test_hash_transform_group
 REFUSED   test_hash_transform_keys_bang
@@ -3053,7 +3053,7 @@ REFUSED   test_poly_hash_index_dispatch
 REFUSED   test_poly_hash_inspect
 REFUSED   test_poly_hash_is_int_with_user_hash
 BUILDFAIL test_poly_hash_key_p_kinds
-BUILDFAIL test_poly_hash_slice_recv_from_dispatch
+REFUSED   test_poly_hash_slice_recv_from_dispatch
 REFUSED   test_poly_hash_slice_under_poly_user_slice
 REFUSED   test_poly_hash_surface
 PASS     test_poly_hash_with_range
@@ -3173,7 +3173,7 @@ REFUSED   test_poly_size_user_return
 REFUSED   test_poly_slice_assign
 REFUSED   test_poly_slice_bang_recv_root
 REFUSED   test_poly_slice_non_object_receiver
-BUILDFAIL test_poly_slice_three_keys_compare
+REFUSED   test_poly_slice_three_keys_compare
 REFUSED   test_poly_slot_op_assign
 REFUSED   test_poly_slot_typed_array_read
 REFUSED   test_poly_step_blockless
@@ -3417,7 +3417,7 @@ PASS     test_range_bsearch
 BUILDFAIL test_range_case_eq_range
 BUILDFAIL test_range_case_eq_type_mismatch
 REFUSED   test_range_comparable_wave8
-BUILDFAIL test_range_conformance_batch2
+DIFF     test_range_conformance_batch2
 PASS     test_range_container_equality
 REFUSED   test_range_cycle_block
 PASS     test_range_each_fusion
@@ -3816,7 +3816,7 @@ REFUSED   test_str_append_accumulator
 BUILDFAIL test_str_array_delete_boxed_needle
 REFUSED   test_str_array_include_nil_arg
 REFUSED   test_str_array_max_min_by
-REFUSED   test_str_array_min_max
+PASS     test_str_array_min_max
 PASS     test_str_array_sort_by
 REFUSED   test_str_array_uniq
 REFUSED   test_strbuf_append_value_alias

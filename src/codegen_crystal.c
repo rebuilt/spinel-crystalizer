@@ -1435,6 +1435,14 @@ static const char *cr_translate_name(CrGen *g, int id, int recv, const char *n) 
   /* Enumerable#inject is Enumerable#reduce; the shared desugarer rewrites the
      symbol/block forms in place but keeps the `inject` name. */
   if (sp_streq(n, "inject")) return "reduce";
+  /* Ruby's Enumerable#entries is an alias of to_a (a fresh Array); Crystal
+     spells it to_a on Range/Array/Hash/Set. A user method is emitted verbatim
+     (def names are not translated), so it must be kept as-is. */
+  if (sp_streq(n, "entries")) {
+    TyKind rt = recv >= 0 ? comp_ntype(g->c, recv) : TY_UNKNOWN;
+    if (cr_user_method_ok(g, n, rt, recv < 0)) return n;
+    return "to_a";
+  }
   return n;
 }
 
@@ -1455,6 +1463,14 @@ static const char *cr_translate_name(CrGen *g, int id, int recv, const char *n) 
    program defines is never matched here. */
 static const char *cr_missing_method(CrGen *g, int id, int recv, const char *name) {
   if (!name) return NULL;
+  /* Ruby's Array#slice / Hash#slice / String#slice / Symbol#slice have no
+     Crystal method at all -- Crystal's Array and Hash have `[]` but not `slice`
+     (verified against Crystal 1.21). A user class defining `slice` is matched
+     before this table (the caller passes NULL for a user method), so a
+     remaining `slice` is a guaranteed "undefined method". Refusing by name also
+     covers a union receiver that the container-family checks below cannot name. */
+  if (sp_streq(name, "slice"))
+    return "Crystal has no slice; index with [] or a range instead";
   /* The module or class a call is on, for the table below. A bare constant
      (`GC.start`) names it directly; `Thread.new{...}.value` names it through the
      constructor, so resolve one `new` hop as well. NULL when the receiver is a
@@ -3216,7 +3232,7 @@ static int cr_iter_returns_self(const char *n) {
          sp_streq(n, "each_line") || sp_streq(n, "each_key") ||
          sp_streq(n, "each_value") || sp_streq(n, "each_pair") ||
          sp_streq(n, "reverse_each") || sp_streq(n, "upto") ||
-         sp_streq(n, "downto") || sp_streq(n, "times");
+         sp_streq(n, "downto") || sp_streq(n, "times") || sp_streq(n, "step");
 }
 
 /* A self-returning iterator whose value is used: wrap it as
@@ -3231,8 +3247,10 @@ static int cr_emit_self_return_wrap(CrGen *g, int id, const char *name, int recv
   TyKind rt = comp_ntype(g->c, recv);
   /* Only a receiver emitted verbatim (an Array or Hash): a Range or String
      receiver is rewritten to a materialized Array by the emitter, so `tap`
-     would answer the Array rather than Ruby's receiver. */
-  if (!ty_is_array(rt) && !ty_is_hash(rt)) return 0;
+     would answer the Array rather than Ruby's receiver. `step` on a Range is
+     the exception -- the emitter keeps the Range, so `tap` answers it. */
+  int range_step = (rt == TY_RANGE || rt == TY_STR_RANGE) && sp_streq(name, "step");
+  if (!ty_is_array(rt) && !ty_is_hash(rt) && !range_step) return 0;
   if (cr_is_poly(rt)) return 0;
   if (cr_user_method_ok(g, name, rt, 0)) return 0;
   const char *cop = nt_str(g->nt, id, "call_operator");
@@ -3716,6 +3734,17 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     buf_puts(b, ".step(");
     cr_emit_expr(g, argv[0], b);
     buf_puts(b, ")");
+    return 1;
+  }
+  /* Ruby's Enumerable#minmax answers a 2-element Array (nil-padded when empty);
+     Crystal's minmax raises on an empty collection and answers a Tuple.
+     `minmax?` answers a nil-padded Tuple for the same value, and `.to_a`
+     restores Ruby's Array shape and the [nil, nil] empty answer. Array/Range
+     only -- a Hash's minmax folds [k, v] pairs (a different shape). */
+  if (recv >= 0 && block < 0 && sp_streq(name, "minmax") &&
+      (ty_is_array(comp_ntype(g->c, recv)) || comp_ntype(g->c, recv) == TY_RANGE)) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".minmax?.to_a");
     return 1;
   }
   if (cr_emit_binop_call(g, id, name, recv, argc, argv, block, b)) return 1;
