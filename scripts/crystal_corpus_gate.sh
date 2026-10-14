@@ -20,6 +20,17 @@ BASE="${2:-test/crystal_corpus_baseline.txt}"
 [ -f "$RESULTS" ] || { echo "crystal-corpus-gate: no such results file: $RESULTS" >&2; exit 2; }
 [ -f "$BASE" ]    || { echo "crystal-corpus-gate: no such baseline: $BASE" >&2; exit 2; }
 
+# The baseline is keyed by NAME (field 2) with the status in field 1. A row whose
+# status and name ran together (a past formatting slip, e.g. `BUILDFAILtest_x`)
+# would land under an empty key and be silently skipped -- including a PASS row,
+# which would hide a regression. Validate the shape before comparing.
+bad=$(awk 'NF && $1 !~ /^(PASS|DIFF|REFUSED|BUILDFAIL)$/ { n++ } END { print n+0 }' "$BASE")
+if [ "$bad" != "0" ]; then
+  echo "crystal-corpus-gate: $bad malformed row(s) in $BASE:" >&2
+  awk 'NF && $1 !~ /^(PASS|DIFF|REFUSED|BUILDFAIL)$/ { print "  "NR": "$0 }' "$BASE" | head >&2
+  exit 2
+fi
+
 # base[key]=status, res[key]=status; report regressions and a transition summary.
 awk '
   NR==FNR { base[$2]=$1; if ($1=="PASS") np++; next }
