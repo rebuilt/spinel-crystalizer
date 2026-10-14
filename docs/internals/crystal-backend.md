@@ -995,6 +995,20 @@ counted independently and can drift by a few programs (P22g shows 671 against 67
 P22l was tried and reverted (−3 PASS / 0 gained), and P22m is metrics-neutral, so
 neither gets a column.
 
+**Post-merge re-baseline (upstream `matz/spinel`, 2026-10-13).** The fork was
+merged with `upstream/master` (7576 commits ahead of the fork base) as
+`73fede85a`. The Crystal backend compiled unchanged — the analyzer API it uses
+survived the rewrite — but the analyzer's *inference and desugaring* changed,
+shifting the same 4398-program corpus from 404/52/235/3707 to 401/53/237/3707.
+Two backend-addressable regressions were then fixed (`find_index`→`index`,
+`Range#%`→`step`, commit `62c841df`), giving **403 PASS / 54 DIFF / 236 BUILDFAIL /
+3705 REFUSED** (the P22u-column numbers above are the pre-merge baseline). The
+remaining transitions are upstream-driven (Float inference to `10.0`, new
+synthesized `GlobalVariableReadNode`s from the load-path preamble, a
+union-receiver `slice`, a blockless-enumerator `class`), an upstream test change,
+or spun's own expected output (`ruby_engine_dead_branch`).
+`test/crystal_corpus_baseline.txt` was re-baselined in place to this state.
+
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
 P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`, P12 `9f4e8772`,
