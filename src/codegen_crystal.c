@@ -1509,6 +1509,11 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { "GC",      "stat",  "Crystal's GC has no stat; timing is Process.monotonic_time" },
     { "Thread",  "value", "Crystal's Thread has no value; join then read a field" },
     { "File",    "stat",  "Crystal's File has no class-level stat; use File.info" },
+    { "File",    "mtime", "Crystal's File has no class-level mtime; use File.info(path).modification_time" },
+    { "Process", "uid",   "Crystal's Process has no uid" },
+    { "Process", "euid",  "Crystal's Process has no euid" },
+    { "Array",   "allocate", "Crystal cannot allocate a generic Array without its element type" },
+    { "Hash",    "allocate", "Crystal cannot allocate a generic Hash without its key/value types" },
     { "File",    "lstat", "Crystal's File has no class-level lstat" },
     { "Time",    "to_a",  "Crystal's Time has no to_a" },
     { "Time",    "mktime", "Crystal spells mktime Time.local" },
@@ -1608,6 +1613,8 @@ static const char *cr_missing_method(CrGen *g, int id, int recv, const char *nam
     { TY_TIME,   "min",    "Crystal spells the minute of the hour `minute`" },
     { TY_TIME,   "to_a",   "Crystal's Time has no to_a" },
     { TY_TIME,   "asctime", "Crystal's Time has no asctime; format it" },
+    { TY_RANDOM, "bytes",  "Crystal's Random has next_bytes, not Ruby's bytes(n)" },
+    { TY_IO,     "stat",   "Crystal's IO/File has no #stat; use File.info" },
   };
   for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
     if (v[i].type == rt && sp_streq(v[i].meth, name)) return v[i].why;
@@ -2979,6 +2986,17 @@ static void cr_emit_boxed_args(CrGen *g, const int *argv, int argc, Buf *b) {
 static int cr_emit_binop_call(CrGen *g, const CrCall *c, Buf *b) {
   int id = c->id; const char *name = c->name; int recv = c->recv;
   int argc = c->argc; const int *argv = c->argv; int block = c->block;
+  /* Ruby's NilClass#<=> is 0 for nil <=> nil and nil otherwise, and a boxed
+     (poly) operand has no Int-returning <=> in Crystal (the result would escape
+     boxed). Refuse both. */
+  if (recv >= 0 && argc >= 1 && sp_streq(name, "<=>") &&
+      (comp_ntype(g->c, recv) == TY_NIL || cr_is_poly(comp_ntype(g->c, recv)) ||
+       comp_ntype(g->c, argv[0]) == TY_NIL || cr_is_poly(comp_ntype(g->c, argv[0])))) {
+    cr_mark_unsupported(g, id, "Crystal's Nil has no <=>, and a boxed operand "
+                               "has no Int-returning <=>");
+    buf_puts(b, "nil");
+    return 1;
+  }
   /* binary operator */
   if (recv >= 0 && argc == 1 && cr_is_binop(name)) {
     const char *op = name;
@@ -3379,6 +3397,15 @@ static int cr_emit_index_call(CrGen *g, const CrCall *c, Buf *b) {
 static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
   int id = c->id; const char *name = c->name; int recv = c->recv;
   int argc = c->argc; const int *argv = c->argv; int block = c->block;
+  /* Ruby's Array#fill with a block answers the block's result for each index;
+     Crystal's fill block must return the element type, but it yields the index
+     as an Int32, so `a.fill(..) { |i| i }` on an Array(Int64) is a type error. */
+  if (recv >= 0 && block >= 0 && sp_streq(name, "fill") &&
+      ty_is_array(comp_ntype(g->c, recv))) {
+    cr_mark_unsupported(g, id, "Array#fill with a block (Crystal's fill block yields an Int32 index)");
+    buf_puts(b, "nil");
+    return 1;
+  }
   /* unary - / + : no receiver, one argument */
   if (recv < 0 && argc == 1 && (sp_streq(name, "-") || sp_streq(name, "+"))) {
     buf_printf(b, "%c(", name[0]); cr_emit_expr(g, argv[0], b); buf_puts(b, ")");

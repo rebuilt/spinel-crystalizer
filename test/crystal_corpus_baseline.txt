@@ -64,7 +64,7 @@ REFUSED   test_array_enum_materialize
 REFUSED   test_array_eq_cross_kind
 REFUSED   test_array_eql_strict
 REFUSED   test_array_fetch_recv_root
-BUILDFAILtest_array_fill_block_form
+REFUSED   test_array_fill_block_form
 BUILDFAIL test_array_fill_incompatible
 REFUSED   test_array_fill_offset_check
 PASS     test_array_fill_poly
@@ -145,7 +145,7 @@ REFUSED   test_array_slice_start_oob_nil
 REFUSED   test_array_slice_when_chunk
 REFUSED   test_array_sort_by_bang
 REFUSED   test_array_sort_by_schwartzian
-BUILDFAIL test_array_spaceship
+REFUSED   test_array_spaceship
 REFUSED   test_array_splice_exceptions
 REFUSED   test_array_splice_kinds
 REFUSED   test_array_splice_poly_source
@@ -653,7 +653,7 @@ REFUSED   test_clamp_bignum_bounds
 REFUSED   test_clamp_bounds
 REFUSED   test_clamp_nil_open_bounds
 PASS     test_clamp_string_and_range
-BUILDFAILtest_class_allocate_builtin_var
+REFUSED   test_class_allocate_builtin_var
 REFUSED   test_class_allocate
 REFUSED   test_class_ancestors_superclass
 REFUSED   test_class_basicobject_superclass
@@ -1294,7 +1294,7 @@ BUILDFAIL test_file_dir_methods
 PASS     test_file_expand_path
 BUILDFAIL test_file_io_predicates_and_inspect
 BUILDFAIL test_file_join_poly_component
-BUILDFAILtest_file_mtime
+REFUSED   test_file_mtime
 REFUSED   test_file_null_constant
 REFUSED   test_file_open_poly_mode
 REFUSED   test_file_path_predicates
@@ -1639,7 +1639,7 @@ REFUSED   test_i1031
 REFUSED   test_i1035
 REFUSED   test_i1041
 REFUSED   test_i709
-BUILDFAILtest_i898
+REFUSED   test_i898
 BUILDFAIL test_i912
 REFUSED   test_i916
 REFUSED   test_i918
@@ -1886,7 +1886,7 @@ REFUSED   test_io_select_high_fd
 REFUSED   test_io_select_set_parks_thread
 REFUSED   test_io_select_to_io
 REFUSED   test_io_select_user_to_io
-BUILDFAILtest_io_stat_from_fd
+REFUSED   test_io_stat_from_fd
 BUILDFAIL test_io_stdout_tty_chain
 REFUSED   test_io_sysopen_flags
 REFUSED   test_io_tty_winsize_poly_handle
@@ -2040,7 +2040,7 @@ REFUSED   test_issue_3001
 REFUSED   test_issue_3002
 REFUSED   test_issue_3003
 REFUSED   test_issue_3004
-BUILDFAIL test_issue_3005
+REFUSED   test_issue_3005
 REFUSED   test_issue_3006
 PASS     test_issue_3007
 REFUSED   test_issue_3008
@@ -2075,10 +2075,10 @@ REFUSED   test_issue_3037
 REFUSED   test_issue_3038
 REFUSED   test_issue_3039
 REFUSED   test_issue_3040
-BUILDFAIL test_issue_3041
+REFUSED   test_issue_3041
 REFUSED   test_issue_3042b
 REFUSED   test_issue_3042
-BUILDFAILtest_issue_3043
+REFUSED   test_issue_3043
 PASS     test_issue_3044
 REFUSED   test_issue_3045
 REFUSED   test_issue_3046
@@ -2087,7 +2087,7 @@ REFUSED   test_issue_3047
 REFUSED   test_issue_3048
 REFUSED   test_issue_3049b
 REFUSED   test_issue_3049
-BUILDFAIL test_issue_3050
+REFUSED   test_issue_3050
 REFUSED   test_issue_3051
 REFUSED   test_issue_3053
 REFUSED   test_issue_3054
@@ -2774,7 +2774,7 @@ REFUSED   test_nil_recv_compare_nomethod
 REFUSED   test_nil_recv_integer_builtin
 REFUSED   test_nil_sentinel_from_index_compact
 REFUSED   test_nil_sentinel_receiver_surface
-BUILDFAILtest_nil_spaceship_variable
+REFUSED   test_nil_spaceship_variable
 REFUSED   test_nil_string_join
 REFUSED   test_nil_string_receiver_raises
 REFUSED   test_nil_time_return_guard_narrow
@@ -3763,7 +3763,7 @@ REFUSED   test_sort_with_comparator
 REFUSED   test_source_encoding
 REFUSED   test_source_file
 REFUSED   test_source_file_required
-BUILDFAIL test_spaceship_incomparable_nil
+REFUSED   test_spaceship_incomparable_nil
 REFUSED   test_spaceship_nil_guard_poly_compare
 REFUSED   test_sp_crypto_basic
 REFUSED   test_sp_crypto_sha1
@@ -3860,7 +3860,7 @@ REFUSED   test_string_chomp_bang_mutates
 REFUSED   test_string_clamp_ranges
 REFUSED   test_string_class_check_builder
 REFUSED   test_string_clone_frozen
-BUILDFAIL test_string_cmp_object_operand
+REFUSED   test_string_cmp_object_operand
 REFUSED   test_string_codepoints_block
 REFUSED   test_string_comparison_to_str
 REFUSED   test_string_conformance_batch3
