@@ -64,7 +64,7 @@ REFUSED   test_array_enum_materialize
 REFUSED   test_array_eq_cross_kind
 REFUSED   test_array_eql_strict
 REFUSED   test_array_fetch_recv_root
-REFUSED   test_array_fill_block_form
+BUILDFAILtest_array_fill_block_form
 BUILDFAIL test_array_fill_incompatible
 REFUSED   test_array_fill_offset_check
 PASS     test_array_fill_poly
@@ -653,7 +653,7 @@ REFUSED   test_clamp_bignum_bounds
 REFUSED   test_clamp_bounds
 REFUSED   test_clamp_nil_open_bounds
 PASS     test_clamp_string_and_range
-REFUSED   test_class_allocate_builtin_var
+BUILDFAILtest_class_allocate_builtin_var
 REFUSED   test_class_allocate
 REFUSED   test_class_ancestors_superclass
 REFUSED   test_class_basicobject_superclass
@@ -693,7 +693,7 @@ REFUSED   test_class_object_dispatch_fallback_arg
 REFUSED   test_class_object_dispatch_order
 REFUSED   test_class_object_dispatch
 REFUSED   test_class_of_known_receiver_escapes_narrowly
-REFUSED   test_class_of_primitive
+PASS     test_class_of_primitive
 DIFF     test_class_ordering_unrelated_nil
 REFUSED   test_class_ordering_vs_data
 REFUSED   test_class_pattern_user_object
@@ -1171,7 +1171,7 @@ PASS     test_eval_block_wide_body
 REFUSED   test_exception_backtrace_common
 DIFF     test_exception_backtrace_empty
 REFUSED   test_exception_backtrace_is_array
-REFUSED   test_exception_backtrace_wired
+PASS     test_exception_backtrace_wired
 REFUSED   test_exception_cause_ensure_reraise
 REFUSED   test_exception_cause
 REFUSED   test_exception_class_array_inspect
@@ -1294,7 +1294,7 @@ BUILDFAIL test_file_dir_methods
 PASS     test_file_expand_path
 BUILDFAIL test_file_io_predicates_and_inspect
 BUILDFAIL test_file_join_poly_component
-REFUSED   test_file_mtime
+BUILDFAILtest_file_mtime
 REFUSED   test_file_null_constant
 REFUSED   test_file_open_poly_mode
 REFUSED   test_file_path_predicates
@@ -1355,10 +1355,10 @@ REFUSED   test_float_remainder_zero_divisor
 REFUSED   test_float_round_digits_cruby
 REFUSED   test_float_round_half_mode
 REFUSED   test_float_round_half
-REFUSED   test_float_round_ndigits_return_type
+PASS     test_float_round_ndigits_return_type
 PASS     test_float_round_nonliteral
 DIFF     test_float_round_truncate_ndigits
-REFUSED   test_float_round_value_based_type
+PASS     test_float_round_value_based_type
 PASS     test_float_round_zero
 REFUSED   test_float_spaceship
 PASS     test_float_step_block
@@ -1639,7 +1639,7 @@ REFUSED   test_i1031
 REFUSED   test_i1035
 REFUSED   test_i1041
 REFUSED   test_i709
-REFUSED   test_i898
+BUILDFAILtest_i898
 BUILDFAIL test_i912
 REFUSED   test_i916
 REFUSED   test_i918
@@ -1886,7 +1886,7 @@ REFUSED   test_io_select_high_fd
 REFUSED   test_io_select_set_parks_thread
 REFUSED   test_io_select_to_io
 REFUSED   test_io_select_user_to_io
-REFUSED   test_io_stat_from_fd
+BUILDFAILtest_io_stat_from_fd
 BUILDFAIL test_io_stdout_tty_chain
 REFUSED   test_io_sysopen_flags
 REFUSED   test_io_tty_winsize_poly_handle
@@ -2078,8 +2078,8 @@ REFUSED   test_issue_3040
 BUILDFAIL test_issue_3041
 REFUSED   test_issue_3042b
 REFUSED   test_issue_3042
-REFUSED   test_issue_3043
-REFUSED   test_issue_3044
+BUILDFAILtest_issue_3043
+PASS     test_issue_3044
 REFUSED   test_issue_3045
 REFUSED   test_issue_3046
 REFUSED   test_issue_3047b
@@ -2774,7 +2774,7 @@ REFUSED   test_nil_recv_compare_nomethod
 REFUSED   test_nil_recv_integer_builtin
 REFUSED   test_nil_sentinel_from_index_compact
 REFUSED   test_nil_sentinel_receiver_surface
-REFUSED   test_nil_spaceship_variable
+BUILDFAILtest_nil_spaceship_variable
 REFUSED   test_nil_string_join
 REFUSED   test_nil_string_receiver_raises
 REFUSED   test_nil_time_return_guard_narrow
@@ -2970,7 +2970,7 @@ BUILDFAIL test_poly_call_unanswered_unrelated_class
 REFUSED   test_poly_call_user_call_arity_shadow
 REFUSED   test_poly_call_user_defined_call
 REFUSED   test_poly_channel_root_survives_other_workers_gc
-DIFF     test_poly_class_dispatch
+PASS     test_poly_class_dispatch
 REFUSED   test_poly_compare_recv_before_operand
 PASS     test_poly_concat_chain_rooted
 REFUSED   test_poly_container_delete
@@ -3367,7 +3367,7 @@ PASS     test_ptr_array_to_poly_array_at_call
 REFUSED   test_public_method
 PASS     test_public_send
 REFUSED   test_public_send_visibility
-REFUSED   test_puts_class_value
+PASS     test_puts_class_value
 PASS     test_puts_in_case_value_arm
 DIFF     test_puts_nested_inspect_container
 PASS     test_puts_nil
@@ -3417,7 +3417,7 @@ PASS     test_range_bsearch
 BUILDFAIL test_range_case_eq_range
 BUILDFAIL test_range_case_eq_type_mismatch
 REFUSED   test_range_comparable_wave8
-DIFF     test_range_conformance_batch2
+PASS     test_range_conformance_batch2
 PASS     test_range_container_equality
 REFUSED   test_range_cycle_block
 PASS     test_range_each_fusion
@@ -3931,7 +3931,7 @@ REFUSED   test_string_partition_regex_and_puts
 REFUSED   test_string_plus_heap_gc
 BUILDFAIL test_string_range_accessors
 PASS     test_string_range_each_inspect
-DIFF     test_string_range_step
+PASS     test_string_range_step
 PASS     test_string_range_to_a
 REFUSED   test_string_regexp_group_index
 REFUSED   test_string_replace_prepend_insert_clear

@@ -110,6 +110,11 @@ typedef struct {
                            read by cr_emit_call to tell a used call (a
                            self-returning iterator, a setter) from a discarded
                            one. */
+  int class_render;     /* 1 while emitting an argument of p/puts/print/pp, where
+                           a `.class` result is rendered rather than dispatched
+                           on. cr_emit_expr moves it into cur_class_render and
+                           clears it for the node's own children. */
+  int cur_class_render; /* the class_render of the node being emitted. */
   int tmp_seq;          /* counter for synthetic emitter-local names, so two
                            desugarings in one method never collide */
 } CrGen;
@@ -2165,6 +2170,8 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
      node's own children -- always value positions -- see 1. */
   g->cur_value = g->value_ctx;
   g->value_ctx = 1;
+  g->cur_class_render = g->class_render;
+  g->class_render = 0;
   /* nil_ok describes the node being emitted, never a subtree: only an index read
      consults it, and a parent sets it for that one child. Clearing it here means
      `p(h[k] + 1)` cannot reach through the `+` and make its operand a nilable
@@ -3726,6 +3733,19 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     return 1;
   }
 
+  /* Ruby's `x.class` renders the bare class name (and Ruby's scalar names
+     Integer / Float / TrueClass / FalseClass); Crystal's carries the generic
+     type arguments (Range(Int64, Int64)) and spells Int64 / Float64 / Bool.
+     Route it through the runtime name shim so `p x.class` and `x.class.name`
+     match CRuby. A user-defined `class` method is kept. */
+  if (g->cur_class_render && recv >= 0 && argc == 0 && block < 0 &&
+      sp_streq(name, "class") &&
+      !cr_user_method_ok(g, name, comp_ntype(g->c, recv), 0)) {
+    buf_puts(b, "sp_class_of(");
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ")");
+    return 1;
+  }
   /* Ruby's Range#% is an alias for Range#step (`(1..10) % 3`); Crystal's Range
      has no `%`, so emit the step call. */
   if (recv >= 0 && argc == 1 && sp_streq(name, "%") &&
@@ -3942,15 +3962,19 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       cr_emit_recv(g, recv, b);
       buf_printf(b, ".try { |%s| %s.%s(", tmp, tmp, mname);
       int sav2 = g->nil_ok;
+      int savcr = g->class_render;
       if (sp_streq(name, "p") || sp_streq(name, "puts") || sp_streq(name, "print") ||
-          sp_streq(name, "pp"))
+          sp_streq(name, "pp")) {
         g->nil_ok = 1;
+        g->class_render = 1;
+      }
       for (int i = 0; i < argc; i++) {
         if (i) buf_puts(b, ", ");
         if (CR_POLY_BOXED && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
         else cr_emit_expr(g, argv[i], b);
       }
       g->nil_ok = sav2;
+      g->class_render = savcr;
       buf_puts(b, ")");
       /* The block belongs INSIDE the `try` braces: `x&.m { }` is a call of `m`
          with a block, so it must read `try { |t| t.m() { ... } }`. Appending it
@@ -3969,15 +3993,19 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   /* Ruby's output helpers all accept nil (p prints it, puts/print skip it), and
      Crystal's do too, so a possibly-missing read must not raise before the print. */
   int sav2 = g->nil_ok;
+  int savcr = g->class_render;
   if (sp_streq(name, "p") || sp_streq(name, "puts") || sp_streq(name, "print") ||
-      sp_streq(name, "pp"))
+      sp_streq(name, "pp")) {
     g->nil_ok = 1;
+    g->class_render = 1;
+  }
   for (int i = 0; i < argc; i++) {
     if (i) buf_puts(b, ", ");
     if (CR_POLY_BOXED && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
     else cr_emit_expr(g, argv[i], b);
   }
   g->nil_ok = sav2;
+  g->class_render = savcr;
   buf_puts(b, ")");
 
   if (block >= 0) cr_emit_block(b, g, block, 0, recv, name);
@@ -5521,6 +5549,46 @@ char *codegen_program_crystal(const NodeTable *nt) {
     "  def ruby_options : Int32\n"
     "    o = options\n"
     "    (o.ignore_case? ? 1 : 0) | (o.extended? ? 2 : 0) | (o.multiline? ? 4 : 0)\n"
+    "  end\n"
+    "end\n\n");
+  /* Ruby's `obj.class` renders the bare class name and Ruby's scalar names
+     (Integer, Float, TrueClass, FalseClass); Crystal's `obj.class` carries the
+     generic type arguments (Range(Int64, Int64)) and spells scalars Int64 /
+     Float64 / Bool. This shim renders the CRuby name for p/puts/inspect and
+     for `.name`. */
+  buf_puts(&b,
+    "class SpClassName\n"
+    "  getter name : String\n"
+    "  def initialize(@name : String)\n"
+    "  end\n"
+    "  def inspect(io : IO) : Nil\n"
+    "    io << @name\n"
+    "  end\n"
+    "  def to_s(io : IO) : Nil\n"
+    "    io << @name\n"
+    "  end\n"
+    "  def ==(other : SpClassName) : Bool\n"
+    "    @name == other.@name\n"
+    "  end\n"
+    "end\n"
+    "def sp_class_of(x) : SpClassName\n"
+    "  SpClassName.new(sp_ruby_class_name(x))\n"
+    "end\n"
+    "def sp_ruby_class_name(x) : String\n"
+    "  return x ? \"TrueClass\" : \"FalseClass\" if x.is_a?(Bool)\n"
+    "  n = x.class.name\n"
+    "  b = n.index('(')\n"
+    "  n = n[0, b] if b\n"
+    "  return \"Enumerator\" if n.includes?(\"Iterator\")\n"
+    "  case n\n"
+    "  when \"Int8\", \"Int16\", \"Int32\", \"Int64\", \"Int128\", \"UInt8\", \"UInt16\", \"UInt32\", \"UInt64\", \"UInt128\", \"BigInt\"\n"
+    "    \"Integer\"\n"
+    "  when \"Float32\", \"Float64\"\n"
+    "    \"Float\"\n"
+    "  when \"Nil\"\n"
+    "    \"NilClass\"\n"
+    "  else\n"
+    "    n\n"
     "  end\n"
     "end\n\n");
   /* Ruby's Math.lgamma answers [log|Gamma(x)|, sign]; Crystal's answers the log
