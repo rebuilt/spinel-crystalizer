@@ -2900,6 +2900,14 @@ static const char *cr_enum_passthrough(const char *name, TyKind recv_ty, char *r
     if (!ty_is_array(recv_ty) && recv_ty != TY_RANGE) return NULL;
     return "skip_while";
   }
+  if (CR_ENUM_IS("find_index")) {
+    /* Crystal's Array#index / Range#index answer Ruby's find_index (the first
+       index where the block holds, or of an equal element). A Hash has no such
+       form and a widened receiver could be one, so only an Array/Range receiver
+       is mapped. */
+    if (!ty_is_array(recv_ty) && recv_ty != TY_RANGE) return NULL;
+    return "index";
+  }
   static const char *const same[] = { "each_with_object", "count", "none?" };
   for (size_t i = 0; i < sizeof same / sizeof same[0]; i++)
     if (CR_ENUM_IS(same[i])) return same[i];
@@ -3700,6 +3708,16 @@ static int cr_emit_call_special(CrGen *g, int id, const char *name, int recv,
     return 1;
   }
 
+  /* Ruby's Range#% is an alias for Range#step (`(1..10) % 3`); Crystal's Range
+     has no `%`, so emit the step call. */
+  if (recv >= 0 && argc == 1 && sp_streq(name, "%") &&
+      (comp_ntype(g->c, recv) == TY_RANGE || comp_ntype(g->c, recv) == TY_STR_RANGE)) {
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ".step(");
+    cr_emit_expr(g, argv[0], b);
+    buf_puts(b, ")");
+    return 1;
+  }
   if (cr_emit_binop_call(g, id, name, recv, argc, argv, block, b)) return 1;
 
   /* index read: Crystal uses bracket syntax, not a .[]() call.

@@ -84,7 +84,7 @@ PASS     test_array_get_oob_negative
 REFUSED   test_array_grep_empty_literal
 REFUSED   test_array_grep
 REFUSED   test_array_index_and_write
-REFUSED   test_array_index_block
+PASS     test_array_index_block
 REFUSED   test_array_index_gap
 REFUSED   test_array_index_int_opt_narrow
 REFUSED   test_array_index_op_write_poly_rhs
@@ -849,7 +849,7 @@ REFUSED   test_const_defined_invalid_name
 REFUSED   test_const_env_defined_parity
 REFUSED   test_const_get_builtin
 REFUSED   test_const_get_class_name
-BUILDFAIL test_const_get_implicit_self
+REFUSED   test_const_get_implicit_self
 REFUSED   test_const_get_literal_escapes_one_class
 REFUSED   test_const_get_literal
 REFUSED   test_const_inherit_flag
@@ -973,7 +973,7 @@ REFUSED   test_dig_multi_step_typeerror
 REFUSED   test_dig_recv_hold_rest
 REFUSED   test_dig_with_splat_keys
 REFUSED   test_dir_chdir_forwarded_block
-DIFF     test_dir_entries_children
+BUILDFAIL test_dir_entries_children
 PASS     test_dir_exist
 BUILDFAIL test_dir_for_fd_and_enumerable
 REFUSED   test_dir_full_surface
@@ -1007,7 +1007,7 @@ REFUSED   test_dynamic_send_many_literals
 REFUSED   test_dynamic_send
 REFUSED   test_dynamic_send_symbol_constants
 REFUSED   test_each_break_no_setjmp
-BUILDFAIL test_each_cons_block_destructure
+PASS     test_each_cons_block_destructure
 BUILDFAIL test_each_cons_map_types
 REFUSED   test_each_cons_with_index_map_no_double_gets
 REFUSED   test_each_entry_returns_receiver
@@ -1967,7 +1967,7 @@ PASS     test_issue_2921
 PASS     test_issue_2923
 BUILDFAIL test_issue_2924
 REFUSED   test_issue_2925
-PASS     test_issue_2926
+DIFF     test_issue_2926
 REFUSED   test_issue_2927
 PASS     test_issue_2928
 PASS     test_issue_2929
@@ -2287,7 +2287,7 @@ REFUSED   test_issue_3272
 REFUSED   test_issue_3273
 REFUSED   test_issue_3281
 BUILDFAIL test_issue_3283
-PASS     test_issue_3284_loadpath_preamble
+REFUSED   test_issue_3284_loadpath_preamble
 PASS     test_issue_3285_singleton_name_override
 REFUSED   test_issue_3288
 REFUSED   test_issue_3289
@@ -2645,7 +2645,7 @@ REFUSED   test_module_const_set
 REFUSED   test_module_cvars
 BUILDFAIL test_module_def_self_ivar
 REFUSED   test_module_dispatch_param_widen
-PASS     test_module_extend_self
+REFUSED   test_module_extend_self
 REFUSED   test_module_function_dead_method_dce
 REFUSED   test_module_function_extend_include
 PASS     test_module_function_include
@@ -3053,7 +3053,7 @@ REFUSED   test_poly_hash_index_dispatch
 REFUSED   test_poly_hash_inspect
 REFUSED   test_poly_hash_is_int_with_user_hash
 BUILDFAIL test_poly_hash_key_p_kinds
-REFUSED   test_poly_hash_slice_recv_from_dispatch
+BUILDFAIL test_poly_hash_slice_recv_from_dispatch
 REFUSED   test_poly_hash_slice_under_poly_user_slice
 REFUSED   test_poly_hash_surface
 PASS     test_poly_hash_with_range
@@ -3417,7 +3417,7 @@ PASS     test_range_bsearch
 BUILDFAIL test_range_case_eq_range
 BUILDFAIL test_range_case_eq_type_mismatch
 REFUSED   test_range_comparable_wave8
-REFUSED   test_range_conformance_batch2
+BUILDFAIL test_range_conformance_batch2
 PASS     test_range_container_equality
 REFUSED   test_range_cycle_block
 PASS     test_range_each_fusion
@@ -3649,7 +3649,7 @@ REFUSED   test_rightward_pattern_checks
 BUILDFAIL test_rindex_regexp_polypoly_merge
 REFUSED   test_root_scoped_constant_in_method
 REFUSED   test_round_half_mode
-REFUSED   test_ruby_engine_dead_branch
+DIFF     test_ruby_engine_dead_branch
 REFUSED   test_ruby_engine_name
 REFUSED   test_ruby_engine_shadowed_by_multi_write
 REFUSED   test_ruby_engine_shadowed_by_path_or_write
@@ -3931,7 +3931,7 @@ REFUSED   test_string_partition_regex_and_puts
 REFUSED   test_string_plus_heap_gc
 BUILDFAIL test_string_range_accessors
 PASS     test_string_range_each_inspect
-REFUSED   test_string_range_step
+DIFF     test_string_range_step
 PASS     test_string_range_to_a
 REFUSED   test_string_regexp_group_index
 REFUSED   test_string_replace_prepend_insert_clear
