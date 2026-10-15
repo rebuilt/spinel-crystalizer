@@ -45,6 +45,10 @@ int comp_class_is_module(Compiler *c, ClassInfo *ci);
    Crystal's own type, so it gets neither a per-class sp_box overload nor a
    generated dispatch arm. */
 int is_builtin_reopen(const char *name);
+/* True when class `ci` is a subclass of a Ruby exception class (codegen.c):
+   walks the superclass chain to a builtin exception name. Used to carry a
+   Crystal exception base for a user exception class whose Ruby base has none. */
+int class_is_exc_subclass(Compiler *c, int ci);
 
 /* ---- emitter state ---- */
 typedef struct { char **names; int n, cap; } NameSet;
@@ -1196,6 +1200,27 @@ static const char *cr_missing_const(const char *path, const char *leaf) {
   return NULL;
 }
 
+/* The name cr_emit_class actually writes for class `ci`: the chain of `name`s
+   from the enclosing class outward, joined with "::". cr_emit_class nests each
+   class in its enclosing one and prints `ci->name`, so this is the qualified
+   name a `rescue`/`raise` must spell to reach it. It differs from the C
+   backend's class_ruby_name only for a qualify_colliding_classes rename
+   ("Mod__Leaf"), which this emitter does not apply to a class header either, so
+   the two agree on every class a rescue can actually name. */
+static const char *cr_emitted_class_name(Compiler *c, int ci, char *buf, size_t n) {
+  int chain[16], depth = 0;
+  for (int k = ci; k >= 0 && depth < 16; k = c->classes[k].enclosing_class)
+    chain[depth++] = k;
+  buf[0] = '\0';
+  for (int i = depth - 1; i >= 0; i--) {
+    const char *seg = c->classes[chain[i]].name;
+    if (!seg) continue;
+    if (buf[0]) strncat(buf, "::", n - strlen(buf) - 1);
+    strncat(buf, seg, n - strlen(buf) - 1);
+  }
+  return buf;
+}
+
 /* ---- exception classes ----
    Crystal 1.21 defines only a handful of exception classes (Exception,
    ArgumentError, IndexError, KeyError, RuntimeError, DivisionByZeroError,
@@ -1215,9 +1240,17 @@ static const char *cr_missing_const(const char *path, const char *leaf) {
               `rescue` catches StandardError, a strict subset, so this is a
               documented widening rather than an exact match) */
 static const char *cr_exception_name(CrGen *g, const char *ruby) {
-  for (int i = 0; i < g->c->nclasses; i++)
-    if (sp_streq(g->c->classes[i].name, ruby)) return ruby;  /* a user class wins */
   if (!ruby) return "";
+  /* A user class wins. `rescue App::Error` names one by the qualified path its
+     header was emitted under; `rescue Error` inside `module App` names it by the
+     leaf (.name), which Crystal resolves lexically to the same type. The
+     qualified form used to fall through to the stdlib table and be refused as
+     "no Crystal equivalent" -- for a class the emitter had just written itself. */
+  for (int i = 0; i < g->c->nclasses; i++) {
+    if (sp_streq(g->c->classes[i].name, ruby)) return ruby;  /* a user class wins */
+    char qb[256];
+    if (sp_streq(cr_emitted_class_name(g->c, i, qb, sizeof qb), ruby)) return ruby;
+  }
   /* Same name in both languages. These are the whole of Crystal 1.21's
      hierarchy apart from Exception itself, minus the ones with no Ruby
      counterpart (TypeCastError, NilAssertionError, InvalidByteSequenceError are
@@ -1234,6 +1267,30 @@ static const char *cr_exception_name(CrGen *g, const char *ruby) {
      and Crystal raises DivisionByZeroError. Both catch the same condition. */
   if (sp_streq(ruby, "ZeroDivisionError")) return "DivisionByZeroError";
   return NULL;
+}
+
+/* The Crystal superclass to write for a user EXCEPTION class whose Ruby base has
+   no emitted Crystal class of its own (`class MyErr < StandardError`, `<
+   NoMethodError`, `< FrozenError`, ...). Emitting no parent lost the message
+   constructor, so `MyErr.new("boom")` failed to compile ("wrong number of
+   arguments for 'MyErr.new' (given 1, expected 0)"). Naming the base through
+   cr_exception_name keeps the bases Crystal HAS exact (ArgumentError,
+   RuntimeError, ZeroDivisionError->DivisionByZeroError) and falls back to
+   Exception when the Ruby base has no Crystal name. That widening is invisible
+   in the subset: the ancestor relation is only observable through is_a? /
+   superclass / ancestors (all refused), and the one broad rescue (StandardError
+   and the bare form) already maps to Exception. NULL for a non-exception class. */
+static const char *cr_exception_superclass(CrGen *g, ClassInfo *ci) {
+  int cidx = (int)(ci - g->c->classes);
+  if (cidx < 0 || cidx >= g->c->nclasses) return NULL;
+  if (!class_is_exc_subclass(g->c, cidx)) return NULL;
+  int par = ci->parent;
+  const char *pn = (par >= 0 && par < g->c->nclasses) ? g->c->classes[par].name : NULL;
+  if (pn) {
+    const char *cn = cr_exception_name(g, pn);
+    if (cn && *cn) return cn;
+  }
+  return "Exception";
 }
 
 /* The dotted/colon name of an exception operand in a rescue clause, e.g.
@@ -3450,6 +3507,18 @@ static int cr_emit_kernel_call(CrGen *g, const CrCall *c, Buf *b) {
       const char *cn = nm ? cr_exception_name(g, nm) : NULL;
       if (cn && *cn) { buf_printf(b, "raise(%s.new)", cn); return 1; }
     }
+    /* Ruby's `raise "message"` raises a RuntimeError; Crystal's raise(String)
+       raises a bare Exception. Emitting the String straight through makes
+       `rescue RuntimeError` miss the raise and `$!.class` render Exception
+       where CRuby renders RuntimeError. A String ARGUMENT is always the
+       message, so build the RuntimeError explicitly. */
+    if (cls >= 0 && (nt_kind(g->nt, cls) == NK_StringNode ||
+                     nt_kind(g->nt, cls) == NK_InterpolatedStringNode)) {
+      buf_puts(b, "raise(RuntimeError.new(");
+      cr_emit_expr(g, cls, b);
+      buf_puts(b, "))");
+      return 1;
+    }
   }
 
   /* Ruby's exit(true/false) maps success/failure to a status code; Crystal's
@@ -5262,8 +5331,14 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
      since `< Object` would drag in a superclass the emitter does not model. */
   {
     int par = is_module ? -1 : cr_emitted_parent(g, ci);
-    if (par >= 0) buf_printf(b, "%s %s < %s\n", "class", ci->name,
-                             g->c->classes[par].name);
+    const char *sup = NULL;
+    if (par >= 0) sup = g->c->classes[par].name;
+    /* A user exception class whose Ruby base is not an emitted user class
+       (StandardError, NoMethodError, FrozenError, ...) still needs a Crystal
+       superclass that carries the message constructor; see
+       cr_exception_superclass. */
+    else if (!is_module) sup = cr_exception_superclass(g, ci);
+    if (sup)     buf_printf(b, "%s %s < %s\n", "class", ci->name, sup);
     else         buf_printf(b, "%s %s\n", is_module ? "module" : "class", ci->name);
   }
   /* typed ivar declarations (classes only; modules carry none). Crystal needs the
