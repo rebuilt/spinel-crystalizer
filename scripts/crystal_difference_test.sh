@@ -301,6 +301,35 @@ rescue => e
 end
 p $!.nil?'
 
+# P24: a class the program defines is emitted with the closest Crystal exception
+# base, so it inherits Crystal's Exception#initialize and can be raised with a
+# message; a namespaced user class resolves in rescue/raise (qualified emitted
+# name). `raise "message"` becomes raise(RuntimeError.new(...)) because Crystal's
+# raise(String) raises a bare Exception, not Ruby's RuntimeError.
+expect_agree "p24_user_exception_message" 'class MyErr < StandardError; end
+begin
+  raise MyErr, "kaput"
+rescue MyErr => e
+  p e.message
+end'
+
+expect_agree "p24_namespaced_exception_rescue" 'module App
+  class Error < StandardError; end
+end
+begin
+  raise App::Error, "boom"
+rescue App::Error => e
+  p e.message
+  p e.class
+end'
+
+expect_agree "p24_raise_string_is_runtime_error" 'begin
+  raise "boom"
+rescue RuntimeError => e
+  p e.message
+  p e.class
+end'
+
 # ---- REFUSE: no Crystal counterpart, so refuse cleanly and name it ----------
 
 expect_refuse "ForNode"                          'for x in [1,2]; p x; end'
@@ -490,6 +519,13 @@ expect_diverge "p23_dollar_bang_inspect" "Crystal's Exception#inspect omits the 
 rescue
   p $!
 end'
+
+# P24: a user exception class now inherits Crystal's Exception, whose #message is
+# nil when unset; Ruby's defaults to the class name. The inspect space above and
+# the non-String to_s family (test_exception_nonstring_message,
+# test_exception_own_to_s) are the same residual message-text divergence.
+expect_diverge "p24_default_message_is_class_name" "Ruby's Exception#message defaults to the class name; Crystal's is nil" 'class MyErr < StandardError; end
+p MyErr.new.message'
 
 # A string INDEX read is a Char in Crystal and a 1-character String in Ruby
 # (`"abc"[0]` is "a" in Ruby, 'a' here). General, but it is what makes a

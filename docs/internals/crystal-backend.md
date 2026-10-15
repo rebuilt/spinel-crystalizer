@@ -975,6 +975,65 @@ PASS. `$!` is a single program-wide slot with save/restore rather than a
 per-thread, per-clause stack; nesting is handled (each clause saves and restores)
 but a `Thread` running a rescue would share it.
 
+## P24: user exception classes carry a Ruby exception base
+
+A program's own exception class could be declared and rescued, but not raised
+with a message. With `class MyErr < StandardError`, `StandardError` has no
+Crystal type, so `cr_emitted_parent` dropped the base and the emitter wrote a
+plain `class MyErr; end`. `Exception#initialize` then had no Crystal
+counterpart, and `raise MyErr, "boom"` — which emits `MyErr.new("boom")` — failed
+to build: *wrong number of arguments for 'MyErr.new' (given 1, expected 0)*.
+
+**Mechanism.** Three fixes, all in the class/rescue path:
+
+- A user exception class now writes a Crystal base (`cr_exception_superclass`):
+  when the Ruby superclass is an exception class that is not itself an emitted
+  user class, the header becomes `class MyErr < <mapped Crystal exception>`.
+  Crystal's own name is used where it exists (`ArgumentError`, `RuntimeError`,
+  `IndexError`, …) and `Exception` otherwise. The fallback is invisible in the
+  subset — `is_a?`, `superclass` and `ancestors` are refused, and the one broad
+  rescue already maps to `Exception`.
+- `rescue App::Error` / `raise App::Error` resolve the **qualified** emitted name
+  (`cr_emitted_class_name`: the `enclosing_class` chain joined with `::`). Before,
+  a namespaced user class was refused as *"the exception class 'App::Error' has
+  no Crystal equivalent"* for a class the emitter had just written itself. The
+  leaf match still handles `rescue Error` inside `module App`.
+- `raise "message"` now emits `raise(RuntimeError.new(...))`. Crystal's
+  `raise(String)` raises a bare `Exception`, not Ruby's `RuntimeError`, so
+  `rescue RuntimeError` missed it and `$!.class` rendered `Exception`.
+
+**Measured effect (P24).** **+6 PASS, +5 DIFF, −9 BUILDFAIL, −2 REFUSED**, zero
+PASS regressions (gate PASS, 475 baselined), on the 7,162-program corpus:
+
+- REFUSED → PASS: `rescue_namespaced_exception`;
+- BUILDFAIL → PASS: `class_new_block_named`,
+  `exception_override_message_unqueried`, `exception_uncaught_class_display`,
+  `raise_user_subclass`, `rescue_target_reused_local`;
+- BUILDFAIL → DIFF: `exception_inspect_empty_message`,
+  `exception_namespaced_default_message`, `exception_nonstring_message`,
+  `exception_own_to_s`, `modifier_rescue_standard_error`;
+- REFUSED → BUILDFAIL: `i1041`.
+
+The five BUILDFAIL → DIFF are **unmasked pre-existing message divergences**, not
+new ones: they needed a user exception class to build at all, and once it does,
+the *text* Crystal reports differs. Crystal's `Exception#message` is `String?`
+and nil when unset (Ruby's defaults to the class name), `inspect` omits the space
+before the message, and a subclass that redefines `to_s` to a non-String has no
+Crystal spelling. `i1041` is the same shape: `"caught: " + e.message` needs the
+nilable `String?` coerced, which the emitter does not do. These are pinned in
+the difference ledger rather than fixed.
+
+**What was decided against.** Mapping the *missing stdlib* exception classes
+(`TypeError`, `NoMethodError`, `FrozenError`, …) onto a shim was measured and
+rejected: 208 refused programs reference them, but only 55 have that as their
+sole obstacle and none raise one themselves — they test a *runtime* `TypeError`
+that Crystal rejects at compile time or answers as a different class. A shim
+would unmask BUILDFAIL with no PASS to gain, and a `rescue TypeError` that
+silently misses is exactly the "compiles and disagrees" outcome the rejection
+discipline forbids. They stay refused, now naming the class. A
+`StandardError < Exception` shim was rejected too: it would narrow the existing
+broad rescue (which maps to `Exception`) and regress PASS.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -1105,6 +1164,18 @@ split 47 PASS / 21 DIFF / 113 BUILDFAIL / 2,584 REFUSED, so the re-baseline adds
 47 free PASSes to the gate's protection. One dead row
 (`test_byref_poly_receiver_keeps_value_abi`, deleted upstream in `cc510f850`) was
 dropped. From here on, "the corpus" means the full 7,162-program list.
+
+**Second upstream merge and re-baseline (2026-10-15).** `upstream/master` moved
+another 597 commits (`4983b60dc` → `bcba2dbb7`) and rewrote the shared analyzer
+and codegen again. The merge was clean, the backend compiled unchanged, and the
+7,162 programs already baselined showed **zero transitions attributable to the
+merge** — the only twelve transitions among them are P24's own (above). The list
+grew to **7,347** programs (185 new upstream tests); a fresh run of it measures
+**484 PASS / 86 DIFF / 347 BUILDFAIL / 6,430 REFUSED**, and
+`test/crystal_corpus_baseline.txt` is re-baselined to that result (7,347 rows).
+The 185 new programs split 3 PASS / 3 DIFF / 7 BUILDFAIL / 172 REFUSED; the
+emitting few are upstream `.class`/poly-container tests and their BUILDFAILs are
+the same allowlisted-call gaps the corpus already tracks, not merge damage.
 
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
@@ -1783,6 +1854,17 @@ would be a bug: `rescue TypeError` becoming `rescue Exception` catches everythin
 so a clause that should fall through would take the handler branch. That is a
 silent wrong answer, so it is refused — the same discipline the rest of the
 backend follows for anything outside the subset.
+
+**A class the program defines is a different matter and now carries a Crystal
+base (P24).** The missing *stdlib* classes above are still refused, but a user
+class (`class MyErr < StandardError`) is emitted with the closest Crystal base —
+the exact Crystal name where one exists, else `Exception`
+(`cr_exception_superclass`) — so it inherits Crystal's `Exception#initialize` and
+can be raised with a message, and a namespaced class (`rescue App::Error`)
+resolves the qualified name the emitter wrote. The `Exception` fallback is
+unobservable in the subset (`is_a?`/`superclass`/`ancestors` are refused, and the
+one broad rescue already maps to `Exception`); the residual differences are in
+the message *text* (see [P24](#p24-user-exception-classes-carry-a-ruby-exception-base)).
 
 One ordering is refused for the same reason. A catch-all clause followed by a
 specific one is meaningful in Ruby, because a bare `rescue` matches only

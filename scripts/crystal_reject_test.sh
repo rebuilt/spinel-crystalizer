@@ -39,6 +39,14 @@ expect_refuse "the constant 'Queue'"         'q = Queue.new; p q'
 expect_refuse "the constant 'RUBY_ENGINE'"   'p RUBY_ENGINE'
 expect_refuse "the constant 'Float::NAN'"    'p Float::NAN'
 
+# ---- exception classes with no Crystal counterpart ---------------------------
+# A Ruby exception class Crystal does not define is refused by name in a
+# rescue/raise. A shim mapped onto a broad class would silently miss (a
+# `rescue TypeError` that never fires), which is the "compiles and disagrees"
+# trap; a program's OWN exception class is emitted with a Crystal base (P24).
+expect_refuse "the exception class 'TypeError' has no Crystal equivalent" 'begin; p 1; rescue TypeError; end'
+expect_refuse "the constant 'TypeError' (Crystal has no TypeError exception class)" 'p TypeError'
+
 # ---- methods that do not exist on this receiver ------------------------------
 expect_refuse "method 'start' is not available on this receiver" 'GC.start'
 expect_refuse "method 'stat' is not available on this receiver"  'p GC.stat'

@@ -2,14 +2,17 @@ REFUSED   test_absolute_class_reopen_inside_module
 PASS     test_abstract_raise_override_return
 REFUSED   test_addrinfo_family_predicates
 REFUSED   test_alias_attr_reader_source
+REFUSED   test_alias_builtin_in_builtin_subclass
 REFUSED   test_alias_capture_outlives_redefined_alias
 REFUSED   test_alias_captures_def_twice
 REFUSED   test_alias_captures_earlier_def
 REFUSED   test_alias_chain_over_builtin
 REFUSED   test_alias_global
 REFUSED   test_alias_in_builtin_reopen
+REFUSED   test_alias_inherited_method_keeps_body
 REFUSED   test_alias_inherited_method
 REFUSED   test_alias_inherited_method_self_dispatch
+REFUSED   test_alias_inherited_method_visibility
 REFUSED   test_alias_inherited_then_rebound
 REFUSED   test_alias_in_included_and_extended_module
 REFUSED   test_alias_inspect_to_s_implicit_calls
@@ -18,6 +21,7 @@ REFUSED   test_alias_method_dispatch
 REFUSED   test_alias_method_return_value
 REFUSED   test_alias_method_string_names
 REFUSED   test_alias_object_builtin
+REFUSED   test_alias_object_builtin_value
 REFUSED   test_alias_of_alias_only_last_called
 REFUSED   test_alias_of_inherited_method
 REFUSED   test_alias_reader_bool_and_ostruct
@@ -25,6 +29,7 @@ REFUSED   test_alias_reader_subclass_ivar
 REFUSED   test_alias_rebind_elsewhere_same_name
 REFUSED   test_alias_respond_to_builtin
 REFUSED   test_alias_sibling_redefined
+REFUSED   test_alias_then_accessor_same_name
 REFUSED   test_alias_to_reader_call
 REFUSED   test_alias_under_modifier
 REFUSED   test_alias_visibility
@@ -49,11 +54,13 @@ REFUSED   test_anon_splat_forward_shapes
 REFUSED   test_anon_struct_class_value
 REFUSED   test_anon_struct_local
 REFUSED   test_anon_struct_name_nil
+REFUSED   test_anon_struct_new_beside_user_cnew
 REFUSED   test_anon_superclass_reflection_unreached
 BUILDFAIL test_anon_superclass_user_reflection_method
 REFUSED   test_any_key_hash_pattern_and_forward
 REFUSED   test_append_as_bytes_rooted
 REFUSED   test_append_codepoint_empty_literal
+REFUSED   test_append_hash_literal_through_untyped_index
 REFUSED   test_append_through_delegating_reader
 REFUSED   test_append_through_reader_reached_twice
 PASS     test_arg_assigned_in_sequence
@@ -73,6 +80,7 @@ PASS     test_argv_gc
 REFUSED   test_arity_keyword_argument_errors
 REFUSED   test_array_assoc_rassoc
 PASS     test_array_at_out_of_bounds
+REFUSED   test_array_at_runtime_range_index
 REFUSED   test_array_bad_literal_argument
 BUILDFAIL test_array_boolean_index_errors
 REFUSED   test_array_bounds_guards
@@ -163,6 +171,7 @@ REFUSED   test_array_literal_empty_elem
 REFUSED   test_array_literal_minmax_inline
 REFUSED   test_array_literal_minmax_splat
 REFUSED   test_array_literal_range_past_end
+REFUSED   test_array_literal_splat_keeps_nil
 REFUSED   test_array_local_append_prepend_widen
 REFUSED   test_array_map_bang
 REFUSED   test_array_member_empty_var
@@ -209,6 +218,7 @@ REFUSED   test_array_pattern_element_check
 REFUSED   test_array_pattern_match_basic
 REFUSED   test_array_pattern_poly_scrutinee
 REFUSED   test_array_permutation
+PASS     test_array_plus_assign_mixed
 REFUSED   test_array_plus_mixed_kind_gc_root
 REFUSED   test_array_predicate_no_block_param
 REFUSED   test_array_predicate_no_block
@@ -241,6 +251,7 @@ REFUSED   test_array_slice_bang
 REFUSED   test_array_slice_before_after
 REFUSED   test_array_slice_sample_methods
 REFUSED   test_array_slice_start_oob_nil
+REFUSED   test_array_slice_unused_block
 REFUSED   test_array_slice_when_chunk
 REFUSED   test_array_sort_by_bang
 REFUSED   test_array_sort_by_schwartzian
@@ -248,6 +259,7 @@ REFUSED   test_array_spaceship
 REFUSED   test_array_splat_basicobject_to_a
 REFUSED   test_array_splice_exceptions
 REFUSED   test_array_splice_kinds
+REFUSED   test_array_splice_nilable_number
 REFUSED   test_array_splice_poly_source
 REFUSED   test_array_splice
 REFUSED   test_array_splice_to_ary
@@ -257,6 +269,7 @@ REFUSED   test_array_subclass_boxed_convert
 REFUSED   test_array_subclass_boxed_methods
 REFUSED   test_array_subclass_boxed_own
 REFUSED   test_array_subclass_boxed
+BUILDFAIL test_array_subclass_long_local_name
 REFUSED   test_array_subclass_marshal
 REFUSED   test_array_subclass_methods
 REFUSED   test_array_subclass_new_from_class_value
@@ -330,6 +343,7 @@ REFUSED   test_autoload_dir_interpolation
 REFUSED   test_autoload_literal_path
 REFUSED   test_back_ref
 REFUSED   test_backtick_long_output_thread_gc
+REFUSED   test_backtick_pipe_not_inherited
 REFUSED   test_bang_boxed_local_answer_kept
 REFUSED   test_bang_exception_object
 REFUSED   test_bang_methods_bind_like_calls
@@ -353,6 +367,7 @@ REFUSED   test_bare_gets_defers_to_own_gets
 REFUSED   test_bare_gets_reads_argf
 REFUSED   test_bare_module_body_cmethod_call
 REFUSED   test_bare_new_container_element_read
+REFUSED   test_bare_new_default_reads_self
 REFUSED   test_bare_new_in_class_method_nil_int_arg
 REFUSED   test_bare_new_struct_unknown_keyword
 REFUSED   test_bare_raise_in_ensure
@@ -390,6 +405,7 @@ REFUSED   test_bigint_compare_object_operand
 REFUSED   test_bigint_div_by_zero
 REFUSED   test_bigint_float_compare_exact
 REFUSED   test_bigint_float_mixed_arith
+REFUSED   test_bigint_format_negative_radix
 REFUSED   test_bigint_if_value_temp
 REFUSED   test_bigint_inner_chain_assign
 REFUSED   test_bigint_literal_pow
@@ -406,6 +422,7 @@ REFUSED   test_bigint_pow_shift
 REFUSED   test_bigint_propagation_chain
 REFUSED   test_bigint_result_normalizes
 REFUSED   test_bigint_return_int_literal
+REFUSED   test_bigint_shift_count_and_quo
 REFUSED   test_bigint_shift_limbs
 REFUSED   test_bigint_slot_nil
 REFUSED   test_bigint_to_s_is_a_heap_string
@@ -423,8 +440,10 @@ REFUSED   test_bignum_rational_basic
 REFUSED   test_bignum_receiver_bitwise
 REFUSED   test_bignum_receiver_methods
 REFUSED   test_bignum_recv_int_ord_float_toi
+REFUSED   test_bignum_shift_op_assign
 REFUSED   test_bignum_shift_poly_count
 REFUSED   test_bignum_size_magnitude
+REFUSED   test_bignum_step_blockless_enumerator
 REFUSED   test_bignum_to_f
 REFUSED   test_bignum_to_i_slot_width
 REFUSED   test_bignum_to_s_base_rooted
@@ -437,6 +456,7 @@ REFUSED   test_binary_string_append_integer_byte
 REFUSED   test_binary_string_charset_bytes
 REFUSED   test_binary_string_index_byte_offsets
 REFUSED   test_binary_string_length_bytes
+REFUSED   test_binary_string_split_pieces
 REFUSED   test_binary_strip_boxed
 REFUSED   test_binary_tag_survives
 REFUSED   test_bind_call_class_value
@@ -489,6 +509,7 @@ REFUSED   test_block_forward_recv_typed
 REFUSED   test_block_forward_self_call
 REFUSED   test_block_forward_two_level
 REFUSED   test_block_forward_value_callable
+REFUSED   test_block_given_blockless_tail_yield_value
 REFUSED   test_block_given_block_param
 REFUSED   test_block_given_else_arm_overflow_modes
 REFUSED   test_block_given_guard_nested_blockless
@@ -592,6 +613,7 @@ REFUSED   test_boxed_array_named_set_ops
 REFUSED   test_boxed_bignum_integer_class
 REFUSED   test_boxed_bignum_upto
 REFUSED   test_boxed_block_call_beside_class_method
+REFUSED   test_boxed_block_sub_user_method
 REFUSED   test_boxed_builtin_int_arg_strict
 REFUSED   test_boxed_chr_bignum_range
 REFUSED   test_boxed_chr_pack_unpack1_receiver
@@ -776,6 +798,7 @@ REFUSED   test_break_from_block_in_poly_dispatch
 REFUSED   test_break_from_block_passed_as_proc
 REFUSED   test_break_wrapper_void_receiver
 REFUSED   test_bsearch_find_any_mixed
+REFUSED   test_bsearch_nilable_int_elements
 REFUSED   test_builtin_answer_kinds
 REFUSED   test_builtin_arg_errors
 REFUSED   test_builtin_arg_type_error_class
@@ -827,6 +850,8 @@ REFUSED   test_builtin_reopen_poly_slot
 REFUSED   test_builtin_reopen_range_time
 REFUSED   test_builtin_reopen_runtime_name_clash
 REFUSED   test_builtin_reopen_self_class
+REFUSED   test_builtin_reopen_self_cmethod
+REFUSED   test_builtin_reopen_self_const
 REFUSED   test_builtin_reopen_strbuf_poly
 REFUSED   test_builtin_reopen_super_reaches_builtin
 REFUSED   test_builtins_comparable
@@ -958,6 +983,7 @@ REFUSED   test_by_key_block_shapes
 REFUSED   test_byref_gather_lead_block_super
 REFUSED   test_byref_keyword_rest_splat_param
 REFUSED   test_byref_optional_param
+REFUSED   test_byref_param_beside_block_forward
 REFUSED   test_byref_param_captured_by_lifted_block
 REFUSED   test_byref_param_name_group
 REFUSED   test_byref_param_rebound_fresh_handed_on
@@ -966,6 +992,8 @@ REFUSED   test_byref_poly_receiver_takes_handle
 REFUSED   test_byref_string_arg_in_rescue_method
 REFUSED   test_byref_string_param_instance_method
 REFUSED   test_byref_string_selective_volatile
+REFUSED   test_bytesplice_all_forms
+REFUSED   test_bytesplice_huge_span
 REFUSED   test_bytesplice_param_shared
 REFUSED   test_cached_element_literal_eq
 REFUSED   test_cached_index_nil_cold
@@ -1032,6 +1060,7 @@ REFUSED   test_case_in_hash_pattern
 REFUSED   test_case_in_matchdata_deconstruct
 REFUSED   test_case_in_mixed_result_type
 REFUSED   test_case_in_nested_array
+REFUSED   test_case_in_nilable_typed_subject
 REFUSED   test_case_in_no_match_error
 REFUSED   test_case_in_nullable_string_class
 REFUSED   test_case_in_paren_empty_subject
@@ -1071,6 +1100,7 @@ REFUSED   test_case_when_qualified_class
 REFUSED   test_case_when_qualified_exception
 PASS     test_case_when_regex
 REFUSED   test_case_when_scalar_nil
+REFUSED   test_case_when_splat_boxed_subject
 REFUSED   test_case_when_splat_regexp_match
 PASS     test_case_when_string_range_nil_bound
 REFUSED   test_case_when_string_range
@@ -1094,11 +1124,13 @@ REFUSED   test_cell_value_struct_time_capture
 REFUSED   test_cext_no_extension_names
 REFUSED   test_chain_append_captured_strbuf
 PASS     test_chained_aset_on_poly_hash_recv
+REFUSED   test_chained_attr_write_empty_hash
 REFUSED   test_chained_ivar_write_call_rhs
 REFUSED   test_chained_write_literal_slot
 REFUSED   test_checked_double_splat_arity
 REFUSED   test_chr_boxed_nil_recv
 REFUSED   test_chunk_family_enumerator_value
+REFUSED   test_chunk_family_nil_elem
 REFUSED   test_chunk_family_size_nil
 REFUSED   test_chunk_first_class
 REFUSED   test_chunk_slice_float
@@ -1164,12 +1196,14 @@ REFUSED   test_class_inherited_hook_defined_later
 REFUSED   test_class_inherited_hook_index
 REFUSED   test_class_inherited_hook
 REFUSED   test_class_is_a_extended_module
+REFUSED   test_class_ivar_accessor_scalar
 REFUSED   test_class_ivar_empty_literal_with_other_writes
 REFUSED   test_class_ivar_in_class_method
 REFUSED   test_class_ivar_not_inherited
 REFUSED   test_class_ivar_reader_override_local
 REFUSED   test_class_ivar_save_restore
 REFUSED   test_class_ivar_set_through_constant
+REFUSED   test_class_level_bool_ivar_nil
 REFUSED   test_class_level_ivar_string_alias
 REFUSED   test_class_level_ivar_string
 REFUSED   test_class_literal_constructors
@@ -1200,7 +1234,7 @@ REFUSED   test_class_new_anonymous_identity
 REFUSED   test_class_new_anonymous_name
 REFUSED   test_class_new_arity
 REFUSED   test_class_new_block_local
-BUILDFAIL test_class_new_block_named
+PASS     test_class_new_block_named
 REFUSED   test_class_new_default_frozen_empty_hash_const
 REFUSED   test_class_new_dispatch_arity
 PASS     test_class_new_factory_without_identity
@@ -1282,6 +1316,7 @@ REFUSED   test_class_value_new_rest_posts
 REFUSED   test_class_value_new_self_ctor_param
 REFUSED   test_class_value_new_splat
 REFUSED   test_class_value_new_struct_custom_init
+REFUSED   test_class_value_new_struct_omitted_nil
 REFUSED   test_class_value_new_user_selfnew_arms
 REFUSED   test_class_value_new_user_selfnew
 REFUSED   test_class_value_new_widens_ctor_param
@@ -1317,8 +1352,12 @@ REFUSED   test_closure_capture_float
 REFUSED   test_closure_captures_class_value
 REFUSED   test_closure_captures_object_array
 REFUSED   test_closure_captures_pointer_locals
+REFUSED   test_cls_fact_builtin_only_alias
 REFUSED   test_cls_fact_call_or_write
+REFUSED   test_cls_fact_data_bare_new_members
 REFUSED   test_cls_fact_instance_exec_block_ivar
+REFUSED   test_cls_fact_super_builtin_answers_self
+REFUSED   test_cls_fact_toplevel_include_bare_call
 REFUSED   test_cls_method_specialization_boxer
 PASS     test_cls_set_overlap_merge
 REFUSED   test_cls_value_cmethod_token
@@ -1355,6 +1394,7 @@ REFUSED   test_coerce_non_numeric_argument
 REFUSED   test_coerce_operator_param
 REFUSED   test_coerce_poly_operand
 REFUSED   test_coerce_result_reader_local
+REFUSED   test_combination_blockless_boxed_enumerator
 REFUSED   test_combination_boxed_count
 REFUSED   test_combination_chain_in_destructured_block
 REFUSED   test_combination_returns_enumerator
@@ -1412,9 +1452,11 @@ REFUSED   test_computed_ivar_get_direct
 REFUSED   test_computed_ivar_get_poly
 REFUSED   test_computed_ivar_get_self
 REFUSED   test_computed_ivar_set_issue_example
+REFUSED   test_computed_ivar_set_skips_reopened_builtin
 REFUSED   test_computed_ivar_supported_receivers
 REFUSED   test_computed_ivar_table_reflection
 REFUSED   test_computed_require_literal_path
+REFUSED   test_computed_require_load_error
 REFUSED   test_computed_send_builtin_inherited
 REFUSED   test_computed_send_builtin_receiver
 REFUSED   test_computed_send_container_arm_prelude
@@ -1441,6 +1483,8 @@ REFUSED   test_condvar_wait_result
 REFUSED   test_condvar_wait_timeout
 REFUSED   test_condvar_wait_timeout_single
 REFUSED   test_connect_nonblock_sockaddr_1arg
+BUILDFAIL test_const_alias_class_case_when
+REFUSED   test_const_alias_class_is_a
 REFUSED   test_const_aliased_class_reopen_include
 BUILDFAIL test_const_alias_method_call
 REFUSED   test_const_alias_of_nil_int_element
@@ -1452,13 +1496,16 @@ REFUSED   test_constant_path_write_class_value
 REFUSED   test_constant_path_write
 REFUSED   test_constant_path_write_receiver
 REFUSED   test_constant_path_write_undeclared
+REFUSED   test_constants_bare_in_class_method
 PASS     test_constants
 REFUSED   test_constant_write_as_value
 REFUSED   test_const_array_known_length_reads
 REFUSED   test_const_attr_op_assign
 REFUSED   test_const_compound_assign
+REFUSED   test_const_defined_bare_in_class_method
 REFUSED   test_const_defined_invalid_name
 REFUSED   test_const_defined_object_own
+REFUSED   test_const_defined_runtime_name
 REFUSED   test_const_env_defined_parity
 REFUSED   test_const_get_builtin
 REFUSED   test_const_get_builtin_receiver
@@ -1469,9 +1516,12 @@ REFUSED   test_const_get_implicit_self
 REFUSED   test_const_get_leaf_shared_by_class_and_value
 REFUSED   test_const_get_literal_escapes_one_class
 REFUSED   test_const_get_literal
+REFUSED   test_const_get_qualified_path
 REFUSED   test_const_get_receiver_first
 REFUSED   test_const_get_runtime_name_table
 REFUSED   test_const_get_self_class_method_subclass
+REFUSED   test_const_get_variable_receiver_nested
+REFUSED   test_const_get_variable_receiver_no_toplevel
 REFUSED   test_const_inherit_flag
 PASS     test_const_init_block_param_scan
 REFUSED   test_const_int_rows_destructure
@@ -1491,6 +1541,7 @@ REFUSED   test_const_path_message_is_written_path
 REFUSED   test_const_path_no_toplevel
 REFUSED   test_const_path_struct_class_value
 REFUSED   test_const_path_unresolved_require
+REFUSED   test_const_path_write_beside_toplevel
 REFUSED   test_const_read_before_assignment
 REFUSED   test_const_receiver_reaches_only_its_method
 REFUSED   test_const_recv_yield_inline
@@ -1516,6 +1567,7 @@ REFUSED   test_control_flow_until_modifier_method
 PASS     test_control_flow_while_modifier_method
 REFUSED   test_control
 REFUSED   test_conv_bridge_boxed_answer
+REFUSED   test_conversion_keyword_hash_argument_errors
 REFUSED   test_conv_typeerror_names_the_right_class
 REFUSED   test_core_class_respond_to_private
 PASS     test_count_block_poly_pred
@@ -1616,9 +1668,11 @@ REFUSED   test_default_rescue_forced_inline
 REFUSED   test_default_retry_counts_up
 REFUSED   test_def_delegators_const_splat
 REFUSED   test_def_delegator_setter
+REFUSED   test_def_delegators_quoted_const_path
 REFUSED   test_defined_bare_builtin_method
 REFUSED   test_defined_classification
 REFUSED   test_defined_class_level_ivar
+REFUSED   test_defined_constant_in_source_library
 REFUSED   test_defined_const_fallback
 REFUSED   test_defined_cvar_before_assignment
 REFUSED   test_defined_globals_methods
@@ -1645,6 +1699,7 @@ REFUSED   test_define_method_computed_name_implicit_rescue
 REFUSED   test_define_method_each_block_params
 REFUSED   test_define_method_in_dead_branch
 REFUSED   test_define_method_in_uncalled_method
+PASS     test_define_method_other_module_unbound
 REFUSED   test_define_method_parameters
 REFUSED   test_define_method_proc_body
 REFUSED   test_define_method_rest_block_params
@@ -1660,6 +1715,7 @@ REFUSED   test_def_unless_method_defined
 REFUSED   test_def_value_symbol_used
 BUILDFAIL test_destructure_splat_underflow
 PASS     test_destructure_typed_ptr_array_return
+REFUSED   test_desugar_builtin_calls_beside_reopen
 REFUSED   test_devirt_call_return_box
 REFUSED   test_dig_multi_step_typeerror
 REFUSED   test_dig_recv_hold_rest
@@ -1693,6 +1749,7 @@ REFUSED   test_dispatch_override_param_list
 REFUSED   test_dispatch_positional_layout
 PASS     test_dispatch_unused_param_nil
 REFUSED   test_display_method_optional_params
+REFUSED   test_display_noarg_sibling_hidden
 REFUSED   test_display_user_method
 REFUSED   test_dlx_subclass_ring_attr
 REFUSED   test_dns_lookup_leaves_world
@@ -1704,6 +1761,7 @@ REFUSED   test_drop_while_stops_asking
 REFUSED   test_dup_drops_singleton_methods
 REFUSED   test_dup_drops_singleton
 REFUSED   test_dup_in_base_method_subclass
+REFUSED   test_dup_in_proc_declares_pool
 REFUSED   test_duplicate_underscore_params
 REFUSED   test_dup_untyped_index_write_shape
 PASS     test_dynamic_class_new_defaults
@@ -1727,6 +1785,8 @@ REFUSED   test_dynamic_send_skips_initialize
 REFUSED   test_dynamic_send_splat
 REFUSED   test_dynamic_send_symbol_constants
 REFUSED   test_dynamic_send_variadic_args
+REFUSED   test_dyn_send_arm_param_kind_scalar
+REFUSED   test_dyn_send_arm_param_kind_unrelated
 REFUSED   test_dyn_send_close_nil_answer
 REFUSED   test_dyn_send_kwsplat_forwarded
 REFUSED   test_dyn_send_splat_builtin
@@ -1735,11 +1795,13 @@ REFUSED   test_each_codepoint_block
 BUILDFAIL test_each_codepoint_with_index_boxed
 PASS     test_each_cons_block_destructure
 BUILDFAIL test_each_cons_map_types
+REFUSED   test_each_cons_slice_chain_nil_elem
 REFUSED   test_each_cons_with_index_map_no_double_gets
 REFUSED   test_each_elem_into_mutated_param
 REFUSED   test_each_entry_returns_receiver
 REFUSED   test_each_entry_reverse_each
 REFUSED   test_each_index_forwarded_proc
+REFUSED   test_each_line_nil_separator_and_paragraph_chomp
 REFUSED   test_each_line_param_shared_handle
 REFUSED   test_each_line_separator_with_chomp
 REFUSED   test_each_pair_boxed_receiver_key
@@ -1828,6 +1890,7 @@ REFUSED   test_empty_symbol_literal
 REFUSED   test_encoding_ascii_compatible
 REFUSED   test_encoding_class_queries
 REFUSED   test_encoding_constant_compare
+REFUSED   test_encoding_constant_names
 BUILDFAIL test_encoding_find_runtime_name
 REFUSED   test_encoding_inspect_binary
 BUILDFAIL test_encoding_list
@@ -1853,6 +1916,7 @@ REFUSED   test_enum_chain_with_index_object
 REFUSED   test_enum_ctor_receiver_root
 REFUSED   test_enum_each_family_receiver
 REFUSED   test_enum_each_with_index_values
+REFUSED   test_enum_each_with_object_memo_beside_open_yield
 REFUSED   test_enumerable_chain_enumerator
 REFUSED   test_enumerable_chain_more
 REFUSED   test_enumerable_def_nomethod_name
@@ -1917,6 +1981,7 @@ REFUSED   test_enumerator_wave10
 DIFF     test_enumerator_with_index_gc
 REFUSED   test_enumerator_with_index_generator_runs
 REFUSED   test_enumerator_yielder_forms
+REFUSED   test_enumerator_yielder_yield_value
 REFUSED   test_enumerator_yield_no_values
 REFUSED   test_enum_for_boxed_builtin_only
 REFUSED   test_enum_for_boxed_receiver
@@ -1925,11 +1990,13 @@ REFUSED   test_enum_for_guard_block_value
 REFUSED   test_enum_for_method_args
 REFUSED   test_enum_hop_no_collection
 REFUSED   test_enum_index_reduce
+REFUSED   test_enum_label_alias_and_hash_walks
 REFUSED   test_enum_map_chain
 REFUSED   test_enum_map_yielded_values
 REFUSED   test_enum_method_mark
 REFUSED   test_enum_mixed_arity_yield
 REFUSED   test_enum_optional_arg_false
+REFUSED   test_enum_own_arm_typed_receiver
 REFUSED   test_enum_pair_chain_lone_param
 REFUSED   test_enum_reverse_each_answer
 REFUSED   test_enum_reverse_each_chain
@@ -2004,7 +2071,7 @@ REFUSED   test_exception_exception_self
 REFUSED   test_exception_exception_subclass_copy
 REFUSED   test_exception_explicit_cause_replaces
 REFUSED   test_exception_freeze
-BUILDFAIL test_exception_inspect_empty_message
+DIFF     test_exception_inspect_empty_message
 REFUSED   test_exception_inspect
 REFUSED   test_exception_introspection_accessors
 REFUSED   test_exception_is_a_class_value
@@ -2014,16 +2081,16 @@ REFUSED   test_exception_message_override
 REFUSED   test_exception_message_super_private_def
 REFUSED   test_exception_message_super_tail
 REFUSED   test_exception_module_hierarchy
-BUILDFAIL test_exception_namespaced_default_message
+DIFF     test_exception_namespaced_default_message
 REFUSED   test_exception_nested_builtin_name
 REFUSED   test_exception_new_nil_message
-BUILDFAIL test_exception_nonstring_message
+DIFF     test_exception_nonstring_message
 REFUSED   test_exception_nonstring_to_s
 REFUSED   test_exception_nullable_message
 REFUSED   test_exception_object_methods
 REFUSED   test_exception_object_surface
-BUILDFAIL test_exception_override_message_unqueried
-BUILDFAIL test_exception_own_to_s
+PASS     test_exception_override_message_unqueried
+DIFF     test_exception_own_to_s
 REFUSED   test_exception_real_objects
 REFUSED   test_exception_reflection_surface
 REFUSED   test_exception_reopen_initialize
@@ -2043,7 +2110,7 @@ REFUSED   test_exception_subclass_raise_2arg
 REFUSED   test_exception_subclass_result_slot
 REFUSED   test_exception_super_interpolated_message
 REFUSED   test_exception_super_message
-BUILDFAIL test_exception_uncaught_class_display
+PASS     test_exception_uncaught_class_display
 REFUSED   test_exception_user_method_dispatch
 REFUSED   test_exception_user_method_generic_receiver
 REFUSED   test_exception_user_subclass
@@ -2085,6 +2152,7 @@ REFUSED   test_fallback_block_argument
 REFUSED   test_fallback_block_gets_the_missing_key
 REFUSED   test_features
 REFUSED   test_ffi_array_specs_decl
+REFUSED   test_ffi_array_wrong_kind
 REFUSED   test_ffi_binstr_recv
 REFUSED   test_ffi_binstr_ws_frame
 REFUSED   test_ffi_bool_return_low_byte
@@ -2123,6 +2191,7 @@ REFUSED   test_ffi_str_arg_rooted
 REFUSED   test_ffi_str_borrow_callback
 REFUSED   test_ffi_str_borrow
 REFUSED   test_ffi_str_spec_aliases_arg
+REFUSED   test_ffi_struct_boxed_scalar_members
 REFUSED   test_ffi_struct
 REFUSED   test_ffi_type_list_forms
 REFUSED   test_ffi_variadic
@@ -2158,6 +2227,8 @@ REFUSED   test_fiber_resume_root_refused
 REFUSED   test_fiber_return_local_jump_error
 REFUSED   test_fiber_root_from_thread_refused
 REFUSED   test_fiber_shared_capture
+REFUSED   test_fiber_stack_cache_guard
+REFUSED   test_fiber_stack_cache_reuse
 REFUSED   test_fiber_storage_gc_keep
 REFUSED   test_fiber_storage_key_kinds
 BUILDFAIL test_fiber_storage_nil
@@ -2194,11 +2265,13 @@ REFUSED   test_file_open_poly_mode
 BUILDFAIL test_file_path_predicates
 BUILDFAIL test_file_pid_closed
 BUILDFAIL test_file_read_count
+REFUSED   test_file_read_length_at_run_time
 REFUSED   test_file_readlines_long_line
 REFUSED   test_file_readlines_missing_raises
 REFUSED   test_file_readlines
 BUILDFAIL test_file_read_negative_length
 BUILDFAIL test_file_read_nil_length
+REFUSED   test_file_read_offset
 BUILDFAIL test_file_read_to_eof
 DIFF     test_file_reopen_closed
 BUILDFAIL test_file_seek_tell_rewind
@@ -2210,8 +2283,11 @@ REFUSED   test_file_surface_extended
 PASS     test_file_unlink_rename
 REFUSED   test_file_utime_nanoseconds
 PASS     test_file_write_at_tail_position
+REFUSED   test_file_write_perm_nil_evaluated
 REFUSED   test_file_write_perm
+REFUSED   test_filter_bang_nil_elem
 REFUSED   test_filter_map_next_guard_conditional_tail
+REFUSED   test_filter_map_object_rows
 REFUSED   test_filter_map_poly_receiver
 REFUSED   test_filter_map
 REFUSED   test_filter_return_through_rescue_ensure
@@ -2341,6 +2417,7 @@ REFUSED   test_for_over_range_value
 REFUSED   test_for_range_nil_bound
 REFUSED   test_for_var_two_element_types
 REFUSED   test_forwardable_def_delegators_trailing_comma
+REFUSED   test_forwardable_delegates_block
 REFUSED   test_forwardable_instance_single_operator
 REFUSED   test_forwardable_multiline
 REFUSED   test_forwardable_operator_names_ending_in_equals
@@ -2364,6 +2441,7 @@ REFUSED   test_forwarded_block_stored_new_super
 REFUSED   test_forwarded_block_stored
 REFUSED   test_forwarded_block_tail_return
 REFUSED   test_forwarded_block_to_iterator
+REFUSED   test_forwarded_block_unused_builtin_read
 REFUSED   test_forwarded_block_value_differs_by_site
 REFUSED   test_forwarded_nil_guarded_block
 REFUSED   test_forwarded_proc_to_poly_iterator
@@ -2404,6 +2482,7 @@ REFUSED   test_frozen_string_literal_per_file
 REFUSED   test_frozen_string_literal_pragma
 REFUSED   test_frozen_to_s_name
 REFUSED   test_fused_window_with_index_operands
+REFUSED   test_fwd_args_into_proc_call_same_name
 REFUSED   test_fwd_new_struct_data
 REFUSED   test_gc_alloc_fast_flag_threads
 REFUSED   test_gc_alloc_front_sizes
@@ -2420,6 +2499,7 @@ REFUSED   test_gc_locality_build
 REFUSED   test_gc_mark_stack_growth
 REFUSED   test_gc_minor_barrier_holders
 REFUSED   test_gc_minor_byref_lent_slot
+REFUSED   test_gc_minor_byref_param_cond_store
 REFUSED   test_gc_minor_byref_param_same_name_cell
 REFUSED   test_gc_minor_never_young_store
 REFUSED   test_gc_minor_thread_local_slot
@@ -2534,6 +2614,7 @@ REFUSED   test_hash_each_enumerator
 REFUSED   test_hash_each_key_value
 REFUSED   test_hash_each_next
 REFUSED   test_hash_each_store_beside_appending_aset
+REFUSED   test_hash_each_value_into_mutable_string_param
 PASS     test_hash_each_value_key_enumerator
 BUILDFAIL test_hash_each_value_with_index_types
 REFUSED   test_hash_each_with_index_answers_hash
@@ -2596,6 +2677,7 @@ REFUSED   test_hash_merge_block_value_widens_user_merge
 REFUSED   test_hash_merge_boxed_argument
 REFUSED   test_hash_merge_cross_layout
 REFUSED   test_hash_merge_default_proc_own_hash
+REFUSED   test_hash_merge_exception_arg_typeerror
 REFUSED   test_hash_merge_except_splat
 REFUSED   test_hash_merge_into_refuses_foreign_kind
 REFUSED   test_hash_merge_runtime_proc_beside_user_merge
@@ -2680,6 +2762,7 @@ REFUSED   test_hash_store_boxed_unbounded
 REFUSED   test_hash_store_operand_gc_root
 REFUSED   test_hash_store_through_widened_param
 REFUSED   test_hash_string_key_copied_on_insert
+REFUSED   test_hash_string_key_write_other_keys
 PASS     test_hash_strstr_merge
 BUILDFAIL test_hash_str_value_poly_coerce
 BUILDFAIL test_hash_subclass_class_new_block
@@ -2687,6 +2770,7 @@ REFUSED   test_hash_subclass_indifferent
 REFUSED   test_hash_subclass_methods
 REFUSED   test_hash_subclass_own_methods
 BUILDFAIL test_hash_subclass_store
+REFUSED   test_hash_subclass_transform_bang_builtin
 REFUSED   test_hash_sum_array_init
 REFUSED   test_hash_sum_no_block
 REFUSED   test_hash_symbol_fold
@@ -2729,6 +2813,7 @@ DIFF     test_hoisted_arg_keeps_nil
 REFUSED   test_hoisted_begin_value_held
 REFUSED   test_hoisted_read_after_nil_store
 DIFF     test_hoisted_store_clears_nil_bit
+REFUSED   test_hook_param_class
 REFUSED   test_i1006
 DIFF     test_i1007
 REFUSED   test_i1009
@@ -2740,7 +2825,7 @@ REFUSED   test_i1021
 REFUSED   test_i1027
 REFUSED   test_i1031
 REFUSED   test_i1035
-REFUSED   test_i1041
+BUILDFAIL test_i1041
 REFUSED   test_i709
 REFUSED   test_i898
 BUILDFAIL test_i912
@@ -2822,8 +2907,10 @@ REFUSED   test_index_op_write_user_class
 REFUSED   test_index_op_write_value_position
 REFUSED   test_index_or_write_empty_hash
 REFUSED   test_index_or_write_module_class_index
+REFUSED   test_index_or_write_poly_value
 REFUSED   test_index_or_write_user_recv
 REFUSED   test_index_read_unsettled_local
+REFUSED   test_index_store_unsettled_local
 REFUSED   test_index_write
 REFUSED   test_index_write_widens_global_param_array
 REFUSED   test_indirect_writer_nil_integer
@@ -2851,6 +2938,7 @@ REFUSED   test_inject_forwarded_own_block
 REFUSED   test_inject_runtime_operator
 REFUSED   test_inject_seed_keeps_its_class
 REFUSED   test_inject_splat_args
+REFUSED   test_inject_splat_reopened_core
 REFUSED   test_inject_symbol_op
 REFUSED   test_inject_symbol_root
 REFUSED   test_inject_symbol_to_proc
@@ -2872,6 +2960,7 @@ REFUSED   test_inlined_yielder_return_in_proc
 REFUSED   test_inlined_yield_self_locals
 REFUSED   test_inline_ensure_return_preserves_rescue
 REFUSED   test_inline_forward_proc_value_under_block
+REFUSED   test_inline_long_renamed_names
 REFUSED   test_inline_nested_yield_ivar_self
 BUILDFAIL test_inline_rbs_signatures
 REFUSED   test_inline_recv_hold_more
@@ -2892,6 +2981,7 @@ PASS     test_inline_yield_value_type_result
 BUILDFAIL test_inner_container_alias_string_mutated
 REFUSED   test_inspect
 REFUSED   test_inspect_result_survives_gc
+REFUSED   test_inspect_subclass_in_parent_slot
 REFUSED   test_instance_call_arity
 REFUSED   test_instance_class_new
 REFUSED   test_instance_eval_bare_object_methods
@@ -2941,8 +3031,10 @@ REFUSED   test_instance_exec_mixed_args
 REFUSED   test_instance_exec_module_builder
 REFUSED   test_instance_exec_moved_scope_shadow
 REFUSED   test_instance_exec_nested
+REFUSED   test_instance_exec_new_block_receiver
 REFUSED   test_instance_exec_next
 REFUSED   test_instance_exec_nonlocal_return
+REFUSED   test_instance_exec_non_proc_block_arg_once
 REFUSED   test_instance_exec_numbered
 REFUSED   test_instance_exec_override
 REFUSED   test_instance_exec_parity
@@ -2957,6 +3049,7 @@ REFUSED   test_instance_exec_toplevel_method
 REFUSED   test_instance_exec_trampoline
 REFUSED   test_instance_exec_trampoline_receiverless
 REFUSED   test_instance_exec_trampoline_result
+REFUSED   test_instance_exec_untraced_proc
 REFUSED   test_instance_exec_value
 REFUSED   test_instance_exec_valuetype
 REFUSED   test_instance_exec_valuetype_trampoline
@@ -3085,6 +3178,7 @@ REFUSED   test_int_round_large_precision
 REFUSED   test_int_sentinel_class_nilclass
 REFUSED   test_int_slot_rational_complex_empty
 REFUSED   test_int_step_array_too_large
+REFUSED   test_int_step_blockless_enumerator
 REFUSED   test_int_succ_pred_overflow
 REFUSED   test_int_to_enum_times
 REFUSED   test_int_unbox_nil_ops
@@ -3096,9 +3190,11 @@ REFUSED   test_io_buffer_io_integration
 REFUSED   test_io_buffer_set_value_boxed
 REFUSED   test_io_captured_buffer_rebind
 REFUSED   test_io_class_methods_surface
+REFUSED   test_io_close_cancels_waiting_accept
 REFUSED   test_io_closed_stream_raises
 REFUSED   test_io_closed_stream
 REFUSED   test_io_close_handler_watermark
+REFUSED   test_io_close_under_inflight_read
 REFUSED   test_io_close_wakes_parked_reader
 REFUSED   test_io_console_raw_noecho
 REFUSED   test_io_console_respond_to
@@ -3144,6 +3240,7 @@ REFUSED   test_io_read_outbuf_eof
 REFUSED   test_io_read_outbuf_other_class
 REFUSED   test_io_read_outbuf_string_handle
 REFUSED   test_io_read_short_read_rooted
+REFUSED   test_io_reopen_closed_after_failed_reopen
 REFUSED   test_io_reopen_dispatch
 REFUSED   test_io_reopen_nearest_visibility
 REFUSED   test_io_reopen_to_io
@@ -3165,6 +3262,7 @@ REFUSED   test_io_syswrite_arity
 REFUSED   test_io_syswrite_offset
 REFUSED   test_io_tty_winsize_poly_handle
 REFUSED   test_io_wait_eagain_ewouldblock_same
+REFUSED   test_io_waiters_leave_out_of_order
 REFUSED   test_io_wait_timeout_parks_thread
 REFUSED   test_iow_float_nil_rhs
 REFUSED   test_io_winsize_set_poly_handle
@@ -3633,6 +3731,7 @@ REFUSED   test_iter_block_autosplat
 REFUSED   test_iter_block_string_share
 REFUSED   test_iter_bound_evaluated_once
 REFUSED   test_iter_boxed_param_nil_elem
+REFUSED   test_iter_cmp_index_nil_elem
 REFUSED   test_iter_elem_handed_to_appender
 REFUSED   test_iter_recv_evaluated_once
 REFUSED   test_iter_shadow_param_nil_elem
@@ -3843,6 +3942,7 @@ REFUSED   test_lazy_size
 REFUSED   test_lazy_source_once
 REFUSED   test_lazy_stage_block_param_boxed
 REFUSED   test_lazy_stage_gathered_params
+REFUSED   test_lazy_to_a_beside_user_to_a
 REFUSED   test_lazy_unfused_terminal
 REFUSED   test_leading_optional_params
 REFUSED   test_leading_splat_scalar_massign
@@ -3903,6 +4003,7 @@ PASS     test_main_singleton_def
 REFUSED   test_map_bang_element_kind
 REFUSED   test_map_bang_empty_receiver
 REFUSED   test_map_bang_fresh_receiver
+REFUSED   test_map_bang_nil_elem
 BUILDFAIL test_map_bang_widens_element_type
 REFUSED   test_map_bang_with_index
 REFUSED   test_map_block_string_new_join
@@ -4047,6 +4148,7 @@ REFUSED   test_method_kernel_output_any_args
 PASS     test_method_level_rescue_return
 REFUSED   test_method_level_rescue_return_string
 REFUSED   test_method_missing_explicit
+REFUSED   test_method_name_behind_shadow
 REFUSED   test_method_named_like_runtime_helper
 REFUSED   test_method_name_symbol
 REFUSED   test_method_obj_bare_resolves_like_call
@@ -4097,17 +4199,20 @@ REFUSED   test_minmax_static_literal_order
 REFUSED   test_misc
 BUILDFAIL test_missing_positional_arg_warns
 REFUSED   test_missing_require_names_the_library
+REFUSED   test_mixin_method_rescue_binding
 PASS     test_mixin
 PASS     test_mixin_to_s_inspect
 REFUSED   test_modifier_rescue_frame
 REFUSED   test_modifier_rescue_keeps_cause
 REFUSED   test_modifier_rescue_return_pops
-BUILDFAIL test_modifier_rescue_standard_error
+DIFF     test_modifier_rescue_standard_error
 REFUSED   test_modifier_rescue_valueless_fallback
 REFUSED   test_module_acc_dispatch_param_box
 REFUSED   test_module_accessor_delete_chain
 REFUSED   test_module_accessor_nil_check
 REFUSED   test_module_alias_class_own_def
+REFUSED   test_module_alias_not_own_method
+REFUSED   test_module_alias_overridden_target
 REFUSED   test_module_attr_alias_include
 REFUSED   test_module_body_ivar_in_block
 PASS     test_module_body_string_const_interp
@@ -4139,6 +4244,7 @@ PASS     test_module_function_include
 REFUSED   test_module_function_includer_self
 REFUSED   test_module_function_in_reopened_body
 REFUSED   test_module_function_namespace
+REFUSED   test_module_function_of_alias
 REFUSED   test_module_function_shadows_kernel
 PASS     test_module_function_str_method_param
 REFUSED   test_module_included_class_and_toplevel
@@ -4214,6 +4320,7 @@ REFUSED   test_narrowed_element_local_pin
 REFUSED   test_narrowed_local_other_writes
 REFUSED   test_native_binding_poc
 REFUSED   test_native_bool_return_width
+REFUSED   test_native_boxed_scalar_args
 REFUSED   test_native_class_leaf_collision
 REFUSED   test_native_decls_in_engine_branch
 REFUSED   test_native_func_bare_call_in_module
@@ -4225,6 +4332,7 @@ REFUSED   test_native_method_splat_args
 REFUSED   test_native_object_protocol
 REFUSED   test_native_singleton_override
 REFUSED   test_native_struct_poly_dispatch_with_args
+REFUSED   test_native_writer_multiple_assign
 REFUSED   test_native_writer_statement_with_user_attr
 PASS     test_negative_range_slice
 PASS     test_nested_array_element_narrows
@@ -4243,6 +4351,7 @@ REFUSED   test_nested_container_array_surface
 REFUSED   test_nested_ensure_handler
 REFUSED   test_nested_ensure_self
 REFUSED   test_nested_fiber_body_ensure
+BUILDFAIL test_nested_hash_param_store_other_key
 BUILDFAIL test_nested_index_write_poly_index
 REFUSED   test_nested_massign_poly
 REFUSED   test_nested_massign
@@ -4280,6 +4389,8 @@ REFUSED   test_next_value_map
 REFUSED   test_next_value_select
 REFUSED   test_next_value_side_effect
 REFUSED   test_next_value_types_a_yield_call
+REFUSED   test_nilable_container_class_tests
+REFUSED   test_nilable_int_constant_default_and_return
 BUILDFAIL test_nilable_int_slot_boxed_nil
 REFUSED   test_nilable_poly_array
 REFUSED   test_nilable_time_strftime
@@ -4389,6 +4500,7 @@ REFUSED   test_numeric_convert_exception_false
 REFUSED   test_numeric_convert_nil_exception
 REFUSED   test_numeric_ctor_exception_kwarg
 REFUSED   test_numeric_divide_operand_class
+REFUSED   test_numeric_division_non_number
 REFUSED   test_numeric_edges_wave10
 REFUSED   test_numeric_iter_boxed_recv_value
 REFUSED   test_numeric_method_displaced_by_user
@@ -4499,6 +4611,7 @@ REFUSED   test_or_write_captured_poly_local
 REFUSED   test_or_write_ivar_poly_setter
 REFUSED   test_or_write_method_reader_boxed_attr
 REFUSED   test_or_write_scalar_nil
+REFUSED   test_ostruct_case_when
 REFUSED   test_ostruct_dup_clone
 REFUSED   test_ostruct_frozen_error_names_receiver
 REFUSED   test_ostruct_nil_slot_inspect
@@ -4527,6 +4640,7 @@ PASS     test_param_body_array_hash_inference
 REFUSED   test_param_body_hash_inference
 REFUSED   test_param_container_foreign_writes
 REFUSED   test_param_default_assigns_local_read_by_body
+REFUSED   test_param_default_hash_poly_keys
 REFUSED   test_param_default_references_sibling
 REFUSED   test_param_include_body_widen
 PASS     test_param_inference_if_predicate
@@ -4593,6 +4707,7 @@ REFUSED   test_poly_arm_leading_optional
 PASS     test_poly_arm_subclass_attr_reader_over_inherited_def
 REFUSED   test_poly_arm_unbound_keywords
 BUILDFAIL test_poly_array_assoc
+REFUSED   test_poly_array_at_user_at
 REFUSED   test_poly_array_boxed_index
 REFUSED   test_poly_array_break_no_setjmp
 PASS     test_poly_array_compact_bang
@@ -4775,6 +4890,7 @@ BUILDFAIL test_poly_first_last_n
 REFUSED   test_poly_flatten_user_set_defines
 REFUSED   test_poly_float_conversions
 REFUSED   test_poly_float_next_float_beside_class_method
+REFUSED   test_poly_forwarded_block_builtin_read
 REFUSED   test_poly_from_typed_array_widen_root
 REFUSED   test_poly_frozen_string_mutation
 REFUSED   test_poly_gather_string_handle
@@ -4809,6 +4925,7 @@ REFUSED   test_poly_index_not_proc
 REFUSED   test_poly_index_op_write_hoisted_key
 REFUSED   test_poly_index_op_write_sym_key
 REFUSED   test_poly_index_or_op_write_user_aref
+REFUSED   test_poly_index_range_forms
 REFUSED   test_poly_index_range_typed
 REFUSED   test_poly_index_user_keywords
 REFUSED   test_poly_inherited_attr_writer_siblings
@@ -4846,6 +4963,7 @@ BUILDFAIL test_poly_ivar_slice_bound
 PASS     test_poly_join_value_type_receiver
 REFUSED   test_poly_keyed_hash_method_dedup
 REFUSED   test_poly_keyed_hash_pipeline
+REFUSED   test_poly_key_readers_user_keywords
 PASS     test_poly_length_on_scalar_hash
 REFUSED   test_poly_length_size_nomethod
 PASS     test_poly_length_string_tag
@@ -4939,7 +5057,12 @@ REFUSED   test_poly_recv_args_first
 BUILDFAIL test_poly_recv_aset_poly_key
 REFUSED   test_poly_recv_block_dispatch_blk_param
 REFUSED   test_poly_recv_block_dispatch_no_candidate
+REFUSED   test_poly_recv_builtin_name_class_method
 REFUSED   test_poly_recv_bytes_boxed_local
+DIFF     test_poly_recv_class_method_string_face
+DIFF     test_poly_recv_class_value_array_face_meet
+PASS     test_poly_recv_class_value_array_join
+BUILDFAIL test_poly_recv_class_value_split_limit
 REFUSED   test_poly_recv_default_ivar
 REFUSED   test_poly_recv_default_ivar_variants
 PASS     test_poly_recv_default_value_type
@@ -4955,6 +5078,8 @@ REFUSED   test_poly_recv_map_join
 PASS     test_poly_recv_range_sym_hash_dispatch
 REFUSED   test_poly_recv_repeated_each_index
 REFUSED   test_poly_recv_runtime_regex_scan
+REFUSED   test_poly_recv_string_shortcut_beside_class_method
+BUILDFAIL test_poly_recv_str_transform_class_method
 REFUSED   test_poly_recv_to_i_user
 REFUSED   test_poly_recv_two_arg_slice
 REFUSED   test_poly_recv_user_operator_arg
@@ -5045,6 +5170,7 @@ REFUSED   test_poly_to_sym
 REFUSED   test_poly_unary_minus_tower
 REFUSED   test_poly_unpack1_offset
 REFUSED   test_poly_unsettled_user_answer
+REFUSED   test_poly_user_at_builtin_arm
 REFUSED   test_poly_user_binop_object_result
 REFUSED   test_poly_user_builtin_iter_names
 REFUSED   test_poly_user_each_index
@@ -5081,6 +5207,7 @@ REFUSED   test_predicate_block_short_circuit
 REFUSED   test_predicate_class_arg
 REFUSED   test_predicates_on_boxed_array
 REFUSED   test_pre_execution
+REFUSED   test_prepend_constant_alias
 REFUSED   test_prepend_in_class_reopen
 REFUSED   test_prepend_in_mixed_in_module
 REFUSED   test_prepend_keeps_visibility
@@ -5282,6 +5409,7 @@ REFUSED   test_queue_boxed_close
 REFUSED   test_queue_boxed_close_user_class
 REFUSED   test_queue_boxed_nonblock
 REFUSED   test_queue_boxed_receiver
+REFUSED   test_queue_handoffs_under_own_lock
 REFUSED   test_queue_ivar_pop_nb
 REFUSED   test_queue_local_basic
 REFUSED   test_queue_local_pop_nb
@@ -5314,7 +5442,7 @@ REFUSED   test_raise_rejects_invalid_arguments
 DIFF     test_raise_reraise_in_def
 REFUSED   test_raise_shortform_default_args
 PASS     test_raise_unless_isa_narrow
-BUILDFAIL test_raise_user_subclass
+PASS     test_raise_user_subclass
 REFUSED   test_raising_arm_nil_receiver
 REFUSED   test_raising_arm_typed_conditional
 REFUSED   test_raising_call_value_slot
@@ -5450,6 +5578,7 @@ REFUSED   test_rational_to_i_from_sum
 REFUSED   test_rb_equal_identity_first
 REFUSED   test_reader_alias_takes_handle
 REFUSED   test_reader_dispatch_struct_member_handle
+REFUSED   test_reader_index_write
 REFUSED   test_reader_named_after_builtin
 REFUSED   test_reader_named_after_string_method
 BUILDFAIL test_reader_operands_pure_read
@@ -5603,9 +5732,11 @@ REFUSED   test_reopened_builtin_class_method_missing
 REFUSED   test_reopened_builtin_key_without_own_method
 REFUSED   test_reopened_builtin_kwrest_keys
 REFUSED   test_reopened_builtin_optional_block
+REFUSED   test_reopened_iter_with_block_and_args
 REFUSED   test_reopened_module_superclass_method
 REFUSED   test_reopened_operator_op_assign
 REFUSED   test_reopen_receiver_runs_first
+REFUSED   test_reopen_redef_versions
 REFUSED   test_reopen_self_defaults
 REFUSED   test_reopen_split_superclass_dispatch
 REFUSED   test_reopen_yielding_forwarded_block
@@ -5613,6 +5744,7 @@ REFUSED   test_reopen_yielding_method_call
 REFUSED   test_reopen_yield_return
 REFUSED   test_replace_typed_array_from_boxed
 REFUSED   test_report_on_exception_surface
+REFUSED   test_require_computed_as_condition
 REFUSED   test_require_computed_name_loaderror
 REFUSED   test_required_file_return_in_branch
 PASS     test_required_file_return_sugar_lines
@@ -5648,13 +5780,13 @@ REFUSED   test_rescue_modifier_assign
 REFUSED   test_rescue_modifier_next_into_typed_slot
 REFUSED   test_rescue_modifier_stmt_std_only
 REFUSED   test_rescue_module_bare_reader
-REFUSED   test_rescue_namespaced_exception
+PASS     test_rescue_namespaced_exception
 REFUSED   test_rescue_operand_before_exception
 REFUSED   test_rescue_operand_validation
 REFUSED   test_rescue
 REFUSED   test_rescue_return_with_ensure
 REFUSED   test_rescue_roots_under_collection
-BUILDFAIL test_rescue_target_reused_local
+PASS     test_rescue_target_reused_local
 REFUSED   test_rescue_value_empty_container
 REFUSED   test_rescue_var_subclass_method
 REFUSED   test_rescue_walks_class_hierarchy
@@ -5753,6 +5885,7 @@ REFUSED   test_safe_nav_builtin_scalar
 REFUSED   test_safe_nav_chain_receiver_once
 BUILDFAIL test_safe_nav_chunk_family
 REFUSED   test_safe_nav_class_value_hoisted_arg
+REFUSED   test_safe_nav_hash_face_boxed
 REFUSED   test_safe_navigation_returns_nil
 BUILDFAIL test_safe_nav_int_into_nullable_slot
 REFUSED   test_safe_nav_iter_stmt
@@ -5781,8 +5914,11 @@ REFUSED   test_scan_boxed_string_pattern
 PASS     test_scan_locals_def_boundary
 REFUSED   test_scan_tail_value_subject
 PASS     test_scan_walkers_def_boundary
+REFUSED   test_sched_busy_worker_still_takes_turns
 REFUSED   test_sched_main_wake_targeted
 REFUSED   test_sched_stats_on_exit
+REFUSED   test_sclass_attr_body_masgn_ivar
+REFUSED   test_sclass_const_visibility
 REFUSED   test_sclass_def_default_self
 REFUSED   test_scope_callers_alias_chain
 REFUSED   test_scoped_builtin_class_values
@@ -5793,6 +5929,7 @@ REFUSED   test_select_with_index_truthy
 REFUSED   test_self_attr_empty_array_write
 PASS     test_self_call_beats_toplevel_def
 REFUSED   test_self_call_in_module_body
+REFUSED   test_self_call_skips_class_method
 REFUSED   test_self_class_cmethod_civ_per_subclass
 REFUSED   test_self_class_cmethod_dispatch
 REFUSED   test_self_class_const_from_included_module
@@ -5880,6 +6017,7 @@ REFUSED   test_setter_value_nil_int_param_returned
 REFUSED   test_setter_value_poly_root
 REFUSED   test_setter_value_temp_many_inlines
 REFUSED   test_setter_yields_assigned_value
+REFUSED   test_sg_reader_object_after_respond_to
 PASS     test_shareable_constant
 REFUSED   test_share_between_handle_bound
 REFUSED   test_shared_copy_beside_alloc_arg
@@ -5930,9 +6068,11 @@ REFUSED   test_signal_default_interrupt
 REFUSED   test_signal_module_surface
 REFUSED   test_signal_trap_stub
 REFUSED   test_singleton_accessor_class_ivar
+REFUSED   test_singleton_accessor_through_inherited_cmethod
 REFUSED   test_singleton_accessor_via_object_class
 REFUSED   test_singleton_accessor_writer_value
 REFUSED   test_singleton_alias_and_civ
+REFUSED   test_singleton_alias_beside_instance_method
 REFUSED   test_singleton_attr_class_slot_dispatch
 REFUSED   test_singleton_attr_inherited
 REFUSED   test_singleton_attr_writer_only
@@ -5942,10 +6082,12 @@ REFUSED   test_singleton_class_block
 REFUSED   test_singleton_class_body_constants
 REFUSED   test_singleton_class_body_runs
 REFUSED   test_singleton_class_conditional_def
+REFUSED   test_singleton_class_declarations
 REFUSED   test_singleton_class_define_method
 REFUSED   test_singleton_class_object
 REFUSED   test_singleton_class_of_const_attr
 REFUSED   test_singleton_class_prepend_in_body
+REFUSED   test_singleton_class_value
 REFUSED   test_singleton_class_visibility_def
 REFUSED   test_singleton_def_class_receivers
 REFUSED   test_singleton_def_on_new_block_param
@@ -5953,6 +6095,7 @@ REFUSED   test_singleton_def_on_variable
 REFUSED   test_singleton_dsm_local
 REFUSED   test_singleton_extend_timing
 REFUSED   test_singleton_method_object
+REFUSED   test_singleton_prepend_ahead_of_own
 REFUSED   test_sized_poly_array_nil_n
 REFUSED   test_sized_queue_inspect_class
 REFUSED   test_size_nil_by_receiver
@@ -5999,6 +6142,7 @@ BUILDFAIL test_sort_by_array_key
 REFUSED   test_sort_by_bool_key
 REFUSED   test_sort_by_incomparable_keys
 REFUSED   test_sort_by_rational_key
+REFUSED   test_sort_by_time_key
 BUILDFAIL test_sort_by_with_index_offset
 PASS     test_sort_by_with_index
 BUILDFAIL test_sort_min_max_block_comparator
@@ -6009,9 +6153,11 @@ REFUSED   test_source_file
 REFUSED   test_source_file_required
 REFUSED   test_spaceship_incomparable_nil
 REFUSED   test_spaceship_nil_guard_poly_compare
+REFUSED   test_spawn_inherits_no_runtime_descriptors
 REFUSED   test_sp_crypto_basic
 REFUSED   test_sp_crypto_sha1
 REFUSED   test_sp_crypto_threads
+REFUSED   test_splat_boxed_scalar_into_builtin
 REFUSED   test_splat_builtin_beside_rest_method
 REFUSED   test_splat_builtin_predicate_family
 REFUSED   test_splat_call
@@ -6020,6 +6166,7 @@ REFUSED   test_splat_delete_and_block_tail_iter
 REFUSED   test_splat_destructure_poly
 REFUSED   test_splat_destructure
 REFUSED   test_splat_empty_array_arguments
+REFUSED   test_splat_forwarded_block_aref
 REFUSED   test_splat_forwarding_args
 REFUSED   test_splat_gsub_runtime_length
 REFUSED   test_splat_heterogeneous_call
@@ -6027,6 +6174,7 @@ REFUSED   test_splat_index_runtime_length
 REFUSED   test_splat_into_builtin_name_user_method
 REFUSED   test_splat_into_fixed_arity_builtin
 REFUSED   test_splat_into_p_puts_print
+REFUSED   test_splat_into_unlisted_builtin
 REFUSED   test_splat_into_zero_arity_builtin
 REFUSED   test_splat_local_alias_length
 REFUSED   test_splat_map_lambda_into_rest
@@ -6044,6 +6192,7 @@ REFUSED   test_splat_slice_keys
 REFUSED   test_splat_spreads_boxed_range_and_enumerator
 REFUSED   test_splat_then_positional_args
 REFUSED   test_splat_trailing_positional_keywords
+REFUSED   test_splat_typed_scalar_into_builtin
 REFUSED   test_splat_user_to_a
 REFUSED   test_splat_value_positions
 REFUSED   test_splice_gap_marking
@@ -6083,12 +6232,16 @@ REFUSED   test_stdout_reassigned_stringio
 REFUSED   test_std_stream_singleton_gc
 REFUSED   test_std_streams_not_reassigned
 REFUSED   test_std_stream_stat
+REFUSED   test_step_boxed_nil_limit_endless
 REFUSED   test_step_boxed_operands
+REFUSED   test_step_keyword_args_source_order
 REFUSED   test_step_nil_limit_boxed_recv
 BUILDFAIL test_step_noarg_boxed_recv
 REFUSED   test_step_prelude_order
 REFUSED   test_step_remaining_forms
+REFUSED   test_step_stmt_receiver_before_begin_arg
 REFUSED   test_stored_block_call_returns_value
+REFUSED   test_stored_block_param_fresh_yields
 REFUSED   test_stored_enumerator_each_method
 REFUSED   test_stored_enumerator_find_ifnone
 REFUSED   test_stored_enumerator_pair_yield
@@ -6158,6 +6311,7 @@ REFUSED   test_string_append_as_bytes_no_args
 REFUSED   test_string_append_binary_safe
 REFUSED   test_string_append_boxed_integer
 REFUSED   test_string_append_call_receiver_order
+REFUSED   test_string_append_chain_long
 REFUSED   test_string_append_chain_prepend
 REFUSED   test_string_append_grows_in_place
 REFUSED   test_string_append_interp_int
@@ -6232,6 +6386,7 @@ REFUSED   test_string_embedded_nul_ops
 REFUSED   test_string_embedded_nul_transform
 REFUSED   test_string_empty_constructor_encoding
 REFUSED   test_string_empty_leading_nul
+REFUSED   test_string_encode_arguments
 REFUSED   test_string_encode_binary_utf8
 REFUSED   test_string_encoding
 REFUSED   test_string_enum_arg_forms
@@ -6299,7 +6454,9 @@ REFUSED   test_string_handle_yield_nil_local
 REFUSED   test_string_handle_yield_nil
 REFUSED   test_string_handle_yield_paths
 REFUSED   test_string_handle_yield_splat
+REFUSED   test_string_hash_alias_block_param_store
 REFUSED   test_string_hash_fresh_value_compat
+REFUSED   test_string_hash_key_block_param_store
 REFUSED   test_string_hash_read_or_bang_self
 REFUSED   test_string_hash_value_block_append
 REFUSED   test_string_identity_tap_then
@@ -6433,6 +6590,7 @@ BUILDFAIL test_string_split_empty_separator_limit
 REFUSED   test_string_split_inline_arg_gc_root
 REFUSED   test_string_squeeze_empty_set
 PASS     test_string_squeeze_no_trailing_nul
+REFUSED   test_string_subclass_alias_captures_builtin
 REFUSED   test_string_subclass_form_data
 REFUSED   test_string_subclass_poly
 REFUSED   test_string_subclass
@@ -6473,6 +6631,7 @@ REFUSED   test_str_oct_prefix
 REFUSED   test_str_opassign_poly_gvar_cvar
 REFUSED   test_str_ord_empty
 REFUSED   test_str_param_borrow_changed
+REFUSED   test_str_param_borrow_forward
 REFUSED   test_str_param_borrow
 REFUSED   test_str_param_borrow_unseen
 REFUSED   test_str_plus_literal_and_int_to_s_digits
@@ -6490,10 +6649,13 @@ PASS     test_str_squeeze_arg
 BUILDFAIL test_str_str_hash_nullable_bracket_assign
 REFUSED   test_str_to_i_overflow
 REFUSED   test_str_tr_negation
+REFUSED   test_struct_attr_accessor_dynamic_new
 REFUSED   test_struct_attr_not_member
 REFUSED   test_struct_bare_super_initialize
 REFUSED   test_struct_block_ancestors
+REFUSED   test_struct_block_anonymous_name
 REFUSED   test_struct_block_attr_not_member
+REFUSED   test_struct_block_bare_self_calls
 REFUSED   test_struct_block_constant_init
 REFUSED   test_struct_block_declarations
 REFUSED   test_struct_block_included_hook
@@ -6550,6 +6712,7 @@ BUILDFAIL test_struct_member_size_reader
 PASS     test_struct_member_write
 REFUSED   test_struct_methods
 REFUSED   test_struct_minmax
+REFUSED   test_struct_new_splat_constant
 REFUSED   test_struct_new_splat_members
 REFUSED   test_struct_qualified_name_members
 PASS     test_struct
@@ -6557,6 +6720,7 @@ REFUSED   test_struct_reopen_method
 REFUSED   test_struct_string_member_gc_root
 REFUSED   test_struct_string_member_handle
 REFUSED   test_struct_subclass
+REFUSED   test_struct_superclass_member_super
 REFUSED   test_struct_super_member_nil_default
 REFUSED   test_struct_super_splat_kwsplat
 PASS     test_struct_to_a_values
@@ -6602,7 +6766,9 @@ REFUSED   test_super_arg_handle_pull
 REFUSED   test_super_attr_mid_redeclare
 REFUSED   test_super_block_arg_explicit
 REFUSED   test_super_block_yields_on
+REFUSED   test_superclass_constant_alias
 REFUSED   test_super_class_hooks
+BUILDFAIL test_super_class_method_class_ivar
 REFUSED   test_superclass_self_in_class_body
 REFUSED   test_super_ensure_discarded_return
 REFUSED   test_super_forward_block_given
@@ -6652,6 +6818,7 @@ REFUSED   test_symbol_pool_grows_thread
 REFUSED   test_symbol_proc_absent_method
 REFUSED   test_symbol_proc_pair_block_locals
 REFUSED   test_symbol_range_enum
+REFUSED   test_symbol_reduce_user_method
 REFUSED   test_symbol_string_methods
 REFUSED   test_symbol_to_proc_after_positional
 PASS     test_symbol_to_proc_call
@@ -6663,6 +6830,7 @@ REFUSED   test_sym_int_hash_missing_key_nil
 REFUSED   test_sym_poly_hash_merge
 PASS     test_sym_poly_hash_merge_sym_int
 REFUSED   test_sym_proc_block_lowered_on_tree
+REFUSED   test_synchronize_block_argument
 REFUSED   test_syscall_errno
 REFUSED   test_system_argument_list
 REFUSED   test_system_as_block_tail
@@ -6722,6 +6890,7 @@ REFUSED   test_thread_io_wake_storm
 REFUSED   test_thread_join_timeout_nil
 REFUSED   test_thread_join_timeout
 REFUSED   test_thread_join_timeout_returns_early
+REFUSED   test_thread_join_wakes_every_joiner
 REFUSED   test_thread_kill_errinfo
 REFUSED   test_thread_kill_poly_receiver
 REFUSED   test_thread_kill_raise
@@ -6736,6 +6905,7 @@ REFUSED   test_thread_new_value
 REFUSED   test_thread_pass_fairness
 REFUSED   test_thread_pass_in_fiber
 REFUSED   test_thread_pass_in_transferred_fiber
+REFUSED   test_thread_pass_wakes_pinned_reader
 REFUSED   test_thread_pipe_read_parks
 REFUSED   test_thread_pipe_slurp_parks
 BUILDFAIL test_thread_poly_join_answers_thread
@@ -6746,10 +6916,12 @@ REFUSED   test_thread_raise_answers_nil
 REFUSED   test_thread_raise_boxed_receiver
 REFUSED   test_thread_raise_class_value
 REFUSED   test_thread_raise_main
+REFUSED   test_thread_raise_reaches_main
 REFUSED   test_thread_regexp_shared_pattern
 REFUSED   test_thread_report_flag_truthiness
 REFUSED   test_thread_rescue_message_rooted
 REFUSED   test_thread_sized_queue
+REFUSED   test_thread_sleep_wakeup_short
 REFUSED   test_thread_stack_overflow_rescued
 REFUSED   test_thread_stack_overflow_unhandled
 REFUSED   test_thread_start_fork
@@ -6829,8 +7001,11 @@ REFUSED   test_time_year_zero_padded
 REFUSED   test_time_zone_argument_validation
 REFUSED   test_time_zone_inplace
 REFUSED   test_to_enum_builtin_reopen
+REFUSED   test_to_enum_each_with_rescue_loop
 REFUSED   test_to_enum_enum_for
 REFUSED   test_to_enum_guard_block_param
+REFUSED   test_to_enum_in_inherited_class_method
+REFUSED   test_to_enum_multi_value_yield
 REFUSED   test_to_enum_toplevel_method
 REFUSED   test_to_enum_value_tail
 REFUSED   test_to_enum_with_size_block
@@ -6857,6 +7032,7 @@ REFUSED   test_toplevel_def_redefined_body
 REFUSED   test_toplevel_def_redefined
 REFUSED   test_toplevel_extend_block_param
 REFUSED   test_toplevel_extend_module
+REFUSED   test_toplevel_include_copied_method_nil_arg
 REFUSED   test_toplevel_include_module_function
 REFUSED   test_toplevel_include_module_method
 REFUSED   test_toplevel_include_yielding_method
@@ -6884,6 +7060,7 @@ REFUSED   test_transform_values_block_argument
 REFUSED   test_trap_no_reentry
 REFUSED   test_trap_raise_pending
 REFUSED   test_trap_raise_rescued
+REFUSED   test_trap_runs_outside_signal_handler
 REFUSED   test_trap_throw_pending
 REFUSED   test_truncate_module_method
 REFUSED   test_try_convert_boxed_argument
@@ -6941,6 +7118,7 @@ REFUSED   test_undef_respond_to
 REFUSED   test_unicode_case_latin1
 REFUSED   test_uninit_const_raises_nameerror
 PASS     test_uninit_ivar_returns_nil
+REFUSED   test_uniq_bang_block_result
 REFUSED   test_uniq_block_boxed_receiver
 BUILDFAIL test_uniq_block_pair_splat
 REFUSED   test_uniq_block
@@ -7000,11 +7178,13 @@ PASS     test_user_respond_to_dispatched
 REFUSED   test_user_round_arity_poly_numeric
 REFUSED   test_user_self_new_forwarding
 REFUSED   test_user_tap_then_literal_block
+REFUSED   test_user_then_blockless
 REFUSED   test_user_to_hash_splat
 REFUSED   test_user_to_json_nested
 REFUSED   test_user_to_proc_block_arg
 REFUSED   test_user_to_set_not_rewritten
 REFUSED   test_user_value_object_freeze
+BUILDFAIL test_value_class_self_call_in_initialize
 REFUSED   test_valued_break_deep
 REFUSED   test_valued_break_ensure
 REFUSED   test_valued_break_proc
@@ -7064,6 +7244,7 @@ REFUSED   test_while_tail_return_type
 REFUSED   test_while_until_as_value
 REFUSED   test_widened_param_reaches_its_callee
 BUILDFAIL test_with_index_enumerator
+REFUSED   test_with_index_poly_recv_nil_elem
 PASS     test_with_index
 REFUSED   test_write_payload_untyped
 REFUSED   test_yield_argument_diverging_block_types
@@ -7101,6 +7282,7 @@ REFUSED   test_yield_membership_single_site_poly_arg
 PASS     test_yield_method_block_tail_value
 REFUSED   test_yield_method_call_in_method_body
 REFUSED   test_yield_method_only_in_subclass
+REFUSED   test_yield_method_printer_beside_appender
 PASS     test_yield_mixed_block_types
 REFUSED   test_yield_nested_block_alias
 REFUSED   test_yield_no_block_raises
@@ -7127,6 +7309,7 @@ REFUSED   test_yield_splice_redo_and_break
 REFUSED   test_yield_string_mutator_tail
 REFUSED   test_yield_string_param_block_append
 REFUSED   test_yield_tail_early_return_binding
+REFUSED   test_yield_tail_index_op_write_value
 REFUSED   test_yield_tail_tap_value
 REFUSED   test_yield_through_forwarded_block_no_append
 REFUSED   test_yield_through_forwarded_proc_context
@@ -7144,6 +7327,7 @@ REFUSED   test_yield_value_slot_types
 REFUSED   test_yield_value_through_poly_receiver
 REFUSED   test_zip_argument_each
 REFUSED   test_zip_block_many_operands
+DIFF     test_zip_block_nil_elem
 REFUSED   test_zip_block_tuples
 REFUSED   test_zip_block_unrelated_method
 REFUSED   test_zip_boxed_receiver_argument_order
@@ -7156,6 +7340,7 @@ REFUSED   test_zip_typed_recv_poly_arg
 REFUSED   test_zsuper_default_reads_parent_param
 REFUSED   test_zsuper_fills_parent_params
 REFUSED   test_zsuper_fills_parent_rest_block
+REFUSED   test_zsuper_forwarding_params_hash_subclass
 REFUSED   test_zsuper_gather_lead_lent
 REFUSED   test_zsuper_in_proc_captures_params
 REFUSED   test_zsuper_keywords_into_keywordless_parent
