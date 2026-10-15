@@ -1014,6 +1014,22 @@ load-path preamble), an upstream test change, or spun's own expected output
 emitter followed (`cr_emit_args`/`CrCall`/`cr_emit_index_call`). The corpus was
 re-baselined in place to this state.
 
+**Full-list re-baseline (2026-10-15).** The upstream merge also brought ~2,765 new
+top-level `test/*.rb` programs, but `crystal_corpus_list.sh`'s output and the
+committed baseline were never reconciled: every count above (and every reported
+metric since the merge) described only the fork's 4,398-program subset, leaving
+39% of the current corpus outside every metric — including programs the backend
+already passes. The *full* list is now 7,162 programs; a fresh run of it
+(`scripts/crystal_corpus.sh "$(scripts/crystal_corpus_list.sh)" …`) measures
+**468 PASS / 73 DIFF / 322 BUILDFAIL / 6,299 REFUSED**, and
+`test/crystal_corpus_baseline.txt` is re-baselined to that result (7,162 rows).
+The 4,398-program subset reproduced its baseline with **zero transitions**,
+which is the determinism check on the harness; the 2,765 newly included programs
+split 47 PASS / 21 DIFF / 113 BUILDFAIL / 2,584 REFUSED, so the re-baseline adds
+47 free PASSes to the gate's protection. One dead row
+(`test_byref_poly_receiver_keeps_value_abi`, deleted upstream in `cc510f850`) was
+dropped. From here on, "the corpus" means the full 7,162-program list.
+
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
 P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`, P12 `9f4e8772`,
@@ -1490,6 +1506,9 @@ silently change results; it stays an honest refusal until member-wise equality l
 Reproduce with `scripts/crystal_corpus_list.sh` (the deterministic file list) and
 `scripts/crystal_corpus.sh` (the runner):
 `scripts/crystal_corpus.sh "$(scripts/crystal_corpus_list.sh)" /tmp/run 12`.
+The list is every top-level `test/*.rb` except `test/promote_*.rb` and
+`test/crystal_struct.rb`; as of the 2026-10-15 re-baseline it is **7,162
+programs**, and the committed baseline covers all of them.
 Check the result against the committed baseline with
 `scripts/crystal_corpus_gate.sh /tmp/run/results.txt`, which fails on any PASS
 regression. The runner gives every build its own `CRYSTAL_CACHE_DIR` (a shared
