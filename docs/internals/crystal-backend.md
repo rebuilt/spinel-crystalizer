@@ -899,6 +899,82 @@ regressions and no other transition (gate PASS, 369 baselined):
 and names the obstruction. P22i's two trades are now both cleared. The ledger pins the
 refusal.
 
+## P23: `$!` (the last-error slot)
+
+`$!` — the exception the innermost rescue clause is handling — was refused by
+name (the bare `GlobalVariableReadNode` node kind), and it is the one global the
+corpus leans on heavily: 324 programs spell it 1,186 times, almost always as
+`(operation rescue $!.class)` / `$!.message`, the idiomatic "call something that
+raises and report what it raised".
+
+**Mechanism.** Crystal has no per-thread error variable, so the slot is a module
+class variable:
+
+```crystal
+module SpErr
+  @@last : Exception? = nil
+  def self.last : Exception?; @@last; end
+  def self.last=(v : Exception?); @@last = v; end
+end
+```
+
+Every rescue clause sets it to the exception it caught and restores the previous
+value when the clause finishes; the restore lives in an `ensure`, so the clause's
+*value* is still its body's last expression (Crystal's `begin`/`ensure` is an
+expression). The `rescue`-modifier form gets the same treatment around its
+fallback. A whole-program pre-pass (`cr_mentions_last_error`) decides whether the
+program mentions `$!` at all, and both the slot and the save/restore are emitted
+only when it does — so a program that never spells `$!` is byte-identical to
+before, and the gate sees zero transitions outside the programs below.
+
+`$!` in a value/receiver position emits `SpErr.last.not_nil!` (inside a clause it
+is never nil); in a nil-tolerant position (`p $!`, a `.nil?` receiver, an `||`
+left arm) it keeps the nilable slot so `p $!` still answers `nil` outside a
+clause, as Ruby's does. **A write to `$!` is refused by name** — Ruby's `$!` is
+read-only (`$! = e` raises `NameError`), so there is nothing faithful to emit —
+and so is every other global, now by name (`$log`, `$stdout`, `$~`, `$stdin`, …)
+rather than as a node kind.
+
+**Measured effect (P23).** **+7 PASS, +5 DIFF, +27 BUILDFAIL, −39 REFUSED**, zero
+PASS regressions (gate PASS, 468 baselined), full 7,162-program corpus:
+
+- REFUSED → PASS: `instance_eval_rescue_modifier`, `issue_2979`, `issue_3130`,
+  `issue_3132`, `issue_3312_transpose_reduce`, `numeric_step_zero`,
+  `range_step_endless_block`;
+- REFUSED → DIFF: `basicobject_dup_rescued`, `file_reopen_closed`, `issue_2978`,
+  `string_clamp_ranges`, `struct_index_dynamic`.
+
+**The 27 REFUSED → BUILDFAIL are exposed pre-existing gaps, not new ones.** These
+programs used `$!`, so the `$!` refusal was *all* that stood between them and the
+compiler; once `$!` emits, the operation they are testing — a call that Ruby
+accepts specifically so it raises — turns out not to have a translatable Crystal
+form. This is the P22g pattern (a real feature that unmasks latent gaps), and the
+gaps belong to the allowlisted-call path, not to `$!`:
+
+- Crystal lacks the method or constant: `File.pid`, `File::LOCK_EX`, `Kernel`,
+  `Range#last`, `Dir#pos=`, `Dir.home(user)` (arity), `Range::ItemIterator#peek`;
+- the argument type cannot type-check in Crystal: `Array#fill` with a `String`
+  offset, `Hash#dig` with a mismatched key type, `File#read`/`File.join`/`#[]=`
+  with a `Nil` or wrong type, `Float#+ Nil`, `String#+` with no argument,
+  `Time.utc(Int, String, Int)`;
+- dispatch on a nilable/union receiver: `Nil#instance_eval`, `Nil#<=>`,
+  `Regex::MatchData? #deconstruct_keys`, a `Dir | Int64` union;
+- `reduce` invoked without a block.
+
+Two of these signatures (`expected argument`, `Range#last`) already occur among
+the pre-existing 322 BUILDFAILs, so the gap *classes* are known; the remaining
+work is to convert them to named refusals (a type/arity check on the
+allowlisted-call path) or to fix them. Until then, the honest statement is that
+`$!` is supported and these 27 programs fail to build on an unrelated, already
+untranslatable operation.
+
+**Divergences that remain.** `$!` holds the exception *object*; `p $!` and
+`$!.class` still render Crystal's class name and message text, which are not
+always Ruby's, so most `(op rescue $!.message)` programs are DIFF rather than
+PASS. `$!` is a single program-wide slot with save/restore rather than a
+per-thread, per-clause stack; nesting is handled (each clause saves and restores)
+but a `Thread` running a rescue would share it.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -1720,6 +1796,14 @@ The remaining divergence is documented rather than fixed: a bare `rescue` widens
 from `StandardError` to `Exception`. This is observable only when a non-
 `StandardError` is raised, and it accounts for most of the `Exception` versus
 `StandardError` diffs among the newly emitting programs.
+
+`$!` is now translated (see [P23](#p23--the-last-error-slot)): a rescue clause
+records the exception it caught in a runtime slot, so `$!.class`, `$!.message`
+and `$!` itself work inside the clause, and the slot is restored when the clause
+exits. The class *name* it renders is still Crystal's, not Ruby's, so a
+`rescue` that catches a Ruby exception class the mapping covers reports it
+correctly, while one that catches a builtin raise (a `TypeError` from an
+operation that Crystal type-checks away) cannot be reproduced at all.
 
 ## Known gaps and limitations
 

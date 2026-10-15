@@ -111,6 +111,11 @@ typedef struct {
   struct { int value; int class_render; } ctx, cur_ctx;
   int tmp_seq;          /* counter for synthetic emitter-local names, so two
                            desugarings in one method never collide */
+  int uses_last_error;  /* set by a whole-program pre-pass when any `$!` read or
+                           write exists. The SpErr slot and the save/restore
+                           around every rescue clause are emitted only then, so a
+                           program that never spells `$!` keeps its exact
+                           previous output. */
 } CrGen;
 
 /* A CallNode's shape, bundled so the call handlers take (g, c, b) instead of
@@ -874,6 +879,29 @@ static void cr_scan_nil_uses(CrGen *g, int id, NilUseTally *out, int safe) {
   }
 }
 
+/* Whole-program pre-pass: does anything read or write `$!`? The last-error slot
+   it needs -- and the save/restore around each rescue clause that keeps `$!`
+   faithful -- is emitted only when the answer is yes, so a program that never
+   spells `$!` keeps byte-identical output. */
+static int cr_mentions_last_error(CrGen *g, int id) {
+  if (id < 0) return 0;
+  NodeKind k = nt_kind(g->nt, id);
+  if (k == NK_GlobalVariableReadNode || k == NK_GlobalVariableWriteNode ||
+      k == NK_GlobalVariableOrWriteNode || k == NK_GlobalVariableAndWriteNode ||
+      k == NK_GlobalVariableOperatorWriteNode || k == NK_GlobalVariableTargetNode) {
+    const char *n = nt_str(g->nt, id, "name");
+    if (n && sp_streq(n, "$!")) return 1;
+  }
+  for (int i = 0; i < nt_num_refs(g->nt, id); i++)
+    if (cr_mentions_last_error(g, nt_ref_at(g->nt, id, i))) return 1;
+  for (int i = 0; i < nt_num_arrs(g->nt, id); i++) {
+    int n = 0; const int *a = nt_arr_at(g->nt, id, i, &n);
+    for (int j = 0; j < n; j++)
+      if (cr_mentions_last_error(g, a[j])) return 1;
+  }
+  return 0;
+}
+
 /* ---- string escaping (Crystal double-quoted literal body) ---- */
 static void cr_emit_escaped(Buf *b, const char *s) {
   for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
@@ -1348,7 +1376,30 @@ static void cr_emit_rescue(CrGen *g, int id, Buf *b, int indent) {
     if (nexc == 0) saw_catchall = 1;
     const char *save = g->rescue_var;
     g->rescue_var = vn;
-    cr_emit_stmts(g, nt_ref(g->nt, clause, "statements"), b, indent + 1);
+    int cl_stmts = nt_ref(g->nt, clause, "statements");
+    if (g->uses_last_error) {
+      /* `$!` answers this clause's exception while its body runs, and Ruby
+         restores the enclosing `$!` when the clause finishes. Set it here and
+         restore it in an `ensure`, so the clause's VALUE is still its body's
+         last expression (Crystal's begin/ensure is an expression). */
+      char prev[32];
+      snprintf(prev, sizeof prev, "_sp_err%d", g->tmp_seq++);
+      cr_indent(b, indent + 1);
+      buf_printf(b, "%s = SpErr.last\n", prev);
+      cr_indent(b, indent + 1);
+      buf_printf(b, "SpErr.last = %s\n", vn);
+      cr_indent(b, indent + 1);
+      buf_puts(b, "begin\n");
+      cr_emit_stmts(g, cl_stmts, b, indent + 2);
+      cr_indent(b, indent + 1);
+      buf_puts(b, "ensure\n");
+      cr_indent(b, indent + 2);
+      buf_printf(b, "SpErr.last = %s\n", prev);
+      cr_indent(b, indent + 1);
+      buf_puts(b, "end\n");
+    } else {
+      cr_emit_stmts(g, cl_stmts, b, indent + 1);
+    }
     g->rescue_var = save;
     clause = nt_ref(g->nt, clause, "subsequent");
   }
@@ -2344,6 +2395,48 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
     case NK_TrueNode:  buf_puts(b, "true");  return;
     case NK_FalseNode: buf_puts(b, "false"); return;
     case NK_NilNode:   buf_puts(b, "nil");   return;
+    case NK_GlobalVariableReadNode: {
+      /* `$!` is the exception the innermost rescue clause is handling; outside
+         a clause it is nil in Ruby. A value/receiver position wants the non-nil
+         type, while a nil-tolerant position (p/puts/print, a `.nil?` receiver,
+         an `||` left arm) keeps the nilable slot so `p $!` still answers nil.
+         Every other global is outside the subset. */
+      const char *n = nt_str(g->nt, id, "name");
+      if (n && sp_streq(n, "$!")) {
+        buf_puts(b, saved_nil_ok ? "SpErr.last" : "SpErr.last.not_nil!");
+        return;
+      }
+      cr_mark_unsupportedf(g, id, "the global variable '%s' ($! is the only "
+                                  "global in the subset)", n ? n : "?");
+      buf_puts(b, "nil");
+      return;
+    }
+    case NK_GlobalVariableWriteNode: {
+      /* `$!` is read-only in Ruby (`$! = e` raises `NameError: $! is a
+         read-only variable`), and every other global is outside the subset --
+         so no global assignment is emitted. Refuse, naming which. */
+      const char *n = nt_str(g->nt, id, "name");
+      if (n && sp_streq(n, "$!"))
+        cr_mark_unsupported(g, id, "an assignment to $! (it is read-only in Ruby)");
+      else
+        cr_mark_unsupportedf(g, id, "an assignment to the global variable '%s' "
+                                    "($! is the only global in the subset)",
+                             n ? n : "?");
+      buf_puts(b, "nil");
+      return;
+    }
+    case NK_GlobalVariableOrWriteNode:
+    case NK_GlobalVariableAndWriteNode:
+    case NK_GlobalVariableOperatorWriteNode: {
+      /* `$x ||= …` / `$x &&= …` / `$x op= …`: no global assignment is in the
+         subset, so name the global rather than the node kind. */
+      const char *n = nt_str(g->nt, id, "name");
+      cr_mark_unsupportedf(g, id, "an assignment to the global variable '%s' "
+                                  "($! is the only global in the subset)",
+                           n ? n : "?");
+      buf_puts(b, "nil");
+      return;
+    }
     case NK_LocalVariableReadNode: {
       const char *n = nt_str(g->nt, id, "name");
       /* A read of a boxed local that the analyzer NARROWED to a concrete type
@@ -2507,7 +2600,20 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       const char *save = g->rescue_var;
       g->rescue_var = "_sp_rm";
       buf_puts(b, "\nrescue _sp_rm\n");
-      cr_emit_expr(g, r, b);
+      if (g->uses_last_error) {
+        /* `$!` is this exception while the fallback runs; restore it after. */
+        char prev[32];
+        snprintf(prev, sizeof prev, "_sp_err%d", g->tmp_seq++);
+        buf_printf(b, "%s = SpErr.last\n", prev);
+        buf_puts(b, "SpErr.last = _sp_rm\n");
+        buf_puts(b, "begin\n");
+        cr_emit_expr(g, r, b);
+        buf_puts(b, "\nensure\n");
+        buf_printf(b, "SpErr.last = %s\n", prev);
+        buf_puts(b, "end\n");
+      } else {
+        cr_emit_expr(g, r, b);
+      }
       buf_puts(b, "\nend)");
       g->rescue_var = save;
       return;
@@ -5653,6 +5759,9 @@ char *codegen_program_crystal(const NodeTable *nt) {
   g.first_unsup = -1;
   g.ctx.value = 1;
   g.cur_class = -1;
+  /* Pre-pass over the whole program for `$!`: its slot and the save/restore
+     around each rescue clause are emitted only when it is actually mentioned. */
+  g.uses_last_error = cr_mentions_last_error(&g, c->scopes[0].body);
 
   Buf b; memset(&b, 0, sizeof b);
   buf_puts(&b, "# Generated by Spinel (Crystal proof-of-concept backend)\n");
@@ -5661,6 +5770,20 @@ char *codegen_program_crystal(const NodeTable *nt) {
      before every user class so SpObject is a visible base and sp_box is in
      scope at every boxing site. */
   buf_puts(&b, CR_RUNTIME);
+  /* `$!` answers the exception of the innermost rescue clause in flight.
+     Crystal has no per-thread error variable, so the slot is a module class
+     variable that each rescue clause sets on entry and restores on exit (see
+     cr_emit_rescue); a program that never mentions `$!` does not get it. */
+  if (g.uses_last_error) buf_puts(&b,
+    "module SpErr\n"
+    "  @@last : Exception? = nil\n"
+    "  def self.last : Exception?\n"
+    "    @@last\n"
+    "  end\n"
+    "  def self.last=(v : Exception?)\n"
+    "    @@last = v\n"
+    "  end\n"
+    "end\n\n");
   /* CRuby's Hash#inspect / #to_s spelling. Crystal prints symbol keys as
      `{:a => 1}`; CRuby (4.0) prints `{a: 1}` for a plain-label key and
      `{"a-b": 1}` for one that is not, and `p` / `puts` / interpolation all go

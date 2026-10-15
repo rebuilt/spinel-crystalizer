@@ -289,6 +289,18 @@ expect_agree "exist_to_exists" 'p File.exist?("/dev/null")'
 # leading loop.
 expect_agree "trailing_while" 'n = 3; n -= 1 while n > 0; p n'
 
+# P23: `$!` is the exception the innermost rescue clause is handling. The slot
+# is a runtime class variable the clause sets on entry and restores on exit, so
+# `$!` is that exception inside the clause and nil outside it; `.class` renders
+# through the same name shim as any other receiver.
+expect_agree "p23_last_error" 'begin
+  raise ArgumentError, "boom"
+rescue => e
+  p $!.class
+  p $!.message
+end
+p $!.nil?'
+
 # ---- REFUSE: no Crystal counterpart, so refuse cleanly and name it ----------
 
 expect_refuse "ForNode"                          'for x in [1,2]; p x; end'
@@ -463,7 +475,21 @@ class Derived < Base
 end
 puts Derived.new.m'
 
+# P23: only `$!` is in the global subset. Another global read is refused by name
+# (Ruby would answer nil), and `$!` is read-only in Ruby, so even a write to it
+# is refused rather than emitted with different semantics.
+expect_refuse "the global variable '\$x' (\$! is the only global in the subset)" 'p $x'
+expect_refuse "an assignment to \$! (it is read-only in Ruby)" '$! = nil'
+
 # ---- DIVERGE: emitted, but differs from CRuby on a known edge ---------------
+
+# P23: `$!` holds the exception object, but Crystal's Exception#inspect spells
+# `#<ArgumentError:x>` where CRuby spells `#<ArgumentError: x>` (no space).
+expect_diverge "p23_dollar_bang_inspect" "Crystal's Exception#inspect omits the space CRuby uses" 'begin
+  raise ArgumentError, "x"
+rescue
+  p $!
+end'
 
 # .each returns nil in Crystal (not the receiver), so it cannot be chained.
 expect_diverge "each_returns_nil" ".each yields nil, not the receiver" 'p [1,2].each { }'
