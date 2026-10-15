@@ -491,6 +491,13 @@ rescue
   p $!
 end'
 
+# A string INDEX read is a Char in Crystal and a 1-character String in Ruby
+# (`"abc"[0]` is "a" in Ruby, 'a' here). General, but it is what makes a
+# `File.binread` result diverge on byte access: Ruby reads ASCII-8BIT bytes,
+# Crystal's `File.read` reads a UTF-8 String. The encoding itself is not
+# observable (`.encoding` / `.valid_encoding?` are refused), so `bytes` agrees.
+expect_diverge "string_index_read" "Crystal String#[] yields a Char; Ruby a 1-char String" 'p "abc"[0]'
+
 # .each returns nil in Crystal (not the receiver), so it cannot be chained.
 expect_diverge "each_returns_nil" ".each yields nil, not the receiver" 'p [1,2].each { }'
 

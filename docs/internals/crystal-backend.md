@@ -1857,6 +1857,12 @@ program compiles but can differ on edge inputs.
   break out of the enclosing method, so these would need emulation (exceptions /
   CPS). This is the sharpest *semantic* gap for a full port and was deliberately
   left out of the corpus.
+ - **A string index read is a `Char`, not a one-character `String`.** `s[0]` is
+  `"a"` in Ruby and `'a'` in Crystal, a general divergence pinned in the ledger
+  (`string_index_read`). It is what makes a `File.binread` result diverge on byte
+  access — Ruby reads ASCII-8BIT bytes, Crystal's `File.read` reads a UTF-8
+  `String` — although the encoding itself is not observable (`.encoding` and
+  `.valid_encoding?` are refused) and `bytes` agrees.
 - **Out of subset entirely:** class inheritance (`< Parent`) and `super`, FFI,
   Thread/Fiber (the concurrency model is not replicated — `Thread#value`,
   `Fiber#transfer`, `Thread#join(timeout)` and the like are refused, Phase 13),
