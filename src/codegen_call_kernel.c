@@ -158,9 +158,12 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
        the channel; fall back to the definition's name when nothing wrote it
        (a direct call, or a path with no write). __method__ always answers the
        definition's name (#3729). */
-    if (s && s->name && s->name[0] && sp_streq(name, "__callee__"))
-      buf_printf(b, "(_sp_cal ? sp_sym_intern(_sp_cal) : (sp_sym)%d)", comp_sym_intern(c, s->name));
-    else if (s && s->name && s->name[0]) buf_printf(b, "(sp_sym)%d", comp_sym_intern(c, s->name));
+    /* (a method a prepend or an extend moved behind another of its name
+       runs under a shadow name, `__prep_0_go`: the name as written) */
+    const char *mn = s ? comp_prep_user_name(s->name) : NULL;
+    if (mn && mn[0] && sp_streq(name, "__callee__"))
+      buf_printf(b, "(_sp_cal ? sp_sym_intern(_sp_cal) : (sp_sym)%d)", comp_sym_intern(c, mn));
+    else if (mn && mn[0]) buf_printf(b, "(sp_sym)%d", comp_sym_intern(c, mn));
     else buf_puts(b, "sp_box_nil()");
     return 1;
   }
@@ -1506,8 +1509,8 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         int dhandle = repr_call_returns_handle(c, id);
         /* --share-strings: a variable's handle is read as a copy of its
            bytes, which reach unsetenv past sp_env_str's allocation */
-        char kref[1024];
-        int key_handle = repr_share_rule(c) && strbuf_slot_ref(c, eav[0], kref, sizeof kref);
+        Buf kref; memset(&kref, 0, sizeof kref);
+        int key_handle = repr_share_rule(c) && strbuf_slot_text(c, eav[0], &kref);
         /* a key the operand builds (`ENV.delete(key(1))`) is a new String
            nothing else holds, and it too reaches unsetenv past that
            allocation; a variable's or a literal's is held where it is */
@@ -1544,13 +1547,13 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
             if (repr_share_rule(c) && repr_of_slot(c, dlv).handle) {
               if (!key_handle && !key_new && nt_kind(nt, eav[0]) != NK_StringNode) buf_printf(b, "SP_GC_ROOT(_t%d); ", t1);
               buf_printf(b, "sp_String *lv_%s = ", rename_local(dp0));
-              if (key_handle) buf_puts(b, kref);
+              if (key_handle) buf_puts(b, kref.p);
               else buf_printf(b, "sp_String_new_shared(_t%d)", t1);
               buf_printf(b, "; SP_GC_ROOT(lv_%s); ", rename_local(dp0));
             }
             else if (dpt == TY_POLY && key_handle)
               buf_printf(b, "sp_RbVal lv_%s = sp_box_nullable_obj(%s, SP_BUILTIN_STRBUF); SP_GC_ROOT_RBVAL(lv_%s); ",
-                         rename_local(dp0), kref, rename_local(dp0));
+                         rename_local(dp0), kref.p, rename_local(dp0));
             else if (dpt == TY_POLY)
               buf_printf(b, "sp_RbVal lv_%s = sp_box_str(_t%d); (void)lv_%s; ",
                          rename_local(dp0), t1, rename_local(dp0));
@@ -1571,6 +1574,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           }
           buf_puts(b, "} ");
         }
+        free(kref.p);
         buf_printf(b, "_t%d; })", result);
         return 1;
       }

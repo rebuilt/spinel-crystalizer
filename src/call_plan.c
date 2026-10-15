@@ -700,6 +700,21 @@ static int ct_resolve(Compiler *c, int id, int *out) {
   return n;
 }
 
+int cplan_target_binds(Compiler *c, int id, int mi) {
+  const NodeTable *nt = c->nt;
+  if (id < 0 || mi < 0 || mi >= c->nscopes || nt_kind(nt, id) != NK_CallNode) return 1;
+  int args = nt_ref(nt, id, "arguments"), argc = 0;
+  const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  for (int a = 0; a < argc; a++) {
+    NodeKind k = nt_kind(nt, argv[a]);
+    if (k == NK_SplatNode || k == NK_KeywordHashNode || k == NK_ForwardingArgumentsNode ||
+        k == NK_BlockArgumentNode)
+      return 1;
+  }
+  char exp[256];
+  return poly_arm_count(c, &c->scopes[mi], -1, argc, -1, exp, sizeof exp) >= 0;
+}
+
 int cplan_targets(Compiler *c, int id, int *out, int cap) {
   if (id < 0 || id >= c->node_cap) return 0;
   if (g_ct_c != c || g_ct_cap < c->node_cap) {
@@ -940,9 +955,6 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
   if (!name) return NULL;
   if (is_raise_alias(name) && nt_int(nt, id, "class_new_capture", 0) && cplan_reachable(c, id))
     return "Class.new or Module.new with a block that captures outer locals is not supported; see docs/limitations.md";
-  if (is_raise_alias(name) && nt_int(nt, id, "struct_block_name", 0) && cplan_reachable(c, id))
-    return "the name of a Struct.new or Data.define class read in its own block (where CRuby has "
-           "not named it yet) is not supported; see docs/limitations.md";
   if (is_raise_alias(name) && nt_int(nt, id, "cond_def_class_new", 0) && cplan_reachable(c, id))
     return "a def under a condition only the run time decides, in a Class.new, Module.new, "
            "Struct.new or Data.define block, is not supported: write the class with `class`; "
@@ -956,8 +968,8 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
            "respond_to?, method_defined?, instance_methods and their kin (it would answer as if "
            "the branch had run); see docs/limitations.md";
   if (is_raise_alias(name) && nt_int(nt, id, "sclass_self", 0) && cplan_reachable(c, id))
-    return "self inside class << X is X's singleton class, which Spinel does not model: only its "
-           "declarations and defs are supported there; see docs/limitations.md";
+    return "the ancestry and the method table of a singleton class are not modeled: its name, "
+           "identity, instance_methods(false) and method_defined? are; see docs/limitations.md";
   if (is_raise_alias(name) && nt_int(nt, id, "class_new_superclass", 0) && cplan_reachable(c, id))
     return "Class.new with a non-constant superclass is not supported; "
            "use a constant superclass (see docs/limitations.md)";
@@ -1080,6 +1092,9 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
   };
   int hit = -1;
   for (int k = 0; tbl[k].m; k++) if (sp_streq(name, tbl[k].m)) { hit = k; break; }
+  /* a class's singleton class is a value of its own (sp_sclass_id); an
+     object's is not modeled */
+  if (hit >= 0 && sp_streq(name, "singleton_class") && sclass_value_call(c, id)) hit = -1;
 
   /* The receiver's constant name, for the limits that are keyed on it. */
   const char *rty = recv >= 0 ? nt_type(nt, recv) : NULL;
@@ -1570,8 +1585,14 @@ static int cpoly_native_conv(TyKind mret, TyKind ret, int is_setter_val) {
   return cpoly_conv(ret, mret);
 }
 
-/* Can user arm `ks` take the call's argument types (arm_key_incompat in
-   emit_poly_method_dispatch)? */
+/* Can user arm `ks` take the call's argument types? Two different concrete
+   kinds, either of them a builtin pointer kind (a Hash, an Exception, a Proc,
+   a Regexp, an Array variant), cannot be passed raw: the other is a different
+   C struct, a scalar, or an `sp_PtrArray *` holding other elements, so the
+   arm is dropped, in either direction. Two object arrays stay (one
+   `sp_PtrArray *`). The same test is
+   arm_key_incompat in poly_user_arm_n_replay (codegen_poly_plan.c); the two
+   must stay identical. */
 int cplan_arm_args_fit(Compiler *c, Scope *ks, const ArgLayout *L, int pos_argc,
                               const TyKind *atmp_ty, int kwall_any) {
   for (int a = 0; a < ks->nparams; a++) {
@@ -1592,7 +1613,7 @@ int cplan_arm_args_fit(Compiler *c, Scope *ks, const ArgLayout *L, int pos_argc,
           obj_class_unrelated(c, ty_object_class(pt0), ty_object_class(at0))) ||
          ty_is_struct_valued(pt0) || ty_is_struct_valued(at0) ||
          (pt0 == TY_BOOL) != (at0 == TY_BOOL) ||
-         (ty_is_hash(pt0) && ty_is_hash(at0)) || (ty_is_array(pt0) && ty_is_array(at0))))
+         (ty_is_builtin_ptr(pt0) || ty_is_builtin_ptr(at0))))
       return 0;
   }
   int kslot = L->kwh_slot;

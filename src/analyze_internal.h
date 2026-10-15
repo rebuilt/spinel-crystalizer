@@ -87,6 +87,10 @@ int proc_to_proc_method_nodes(Compiler *c, int recv, int **out);
 int local_sole_range_node(Compiler *c, int recv);
 int const_array_elems_all_int_array(Compiler *c, const char *cname);
 int *an_parent_map(const NodeTable *nt);
+const int *comp_parent_map(Compiler *c);
+/* --share-strings: is node n an Array literal refused the String handle
+   Array form for good (share_strh_gate)? */
+int share_strh_node_no(const Compiler *c, int n);
 /* The definite-assignment walk (analyze.c), shared with the nil facts
    (analyze_nil.c): the program's parent map, each statement's place in its
    list (filled one list at a time, -1 for a node not in its parent's list),
@@ -148,10 +152,12 @@ int builtin_kernel_fn_span(const char *name, int with_block, int *lo, int *hi);
 int builtin_arity_violation(Compiler *c, int id);
 int is_handler_proc_block(Compiler *c, int id);
 int builtin_class_id(const char *name);
+int stdlib_name_from_source(const char *n);
 int builtin_class_parent_id(int id);
 int desugar_builtin_reopen_named_superclass(Compiler *c);
 int desugar_builtin_reopen_self_class(Compiler *c);
 int desugar_time_singleton_bare_ctor(Compiler *c);
+int desugar_builtin_reopen_self_cmethods(Compiler *c);
 const char *class_ruby_name(Compiler *c, int ci); /* codegen.c */
 int builtin_object_method_known(const char *m);
 int core_method_name(const char *n);   /* analyze_desugar.c: a core class's public method */
@@ -274,6 +280,7 @@ TyKind method_call_ret(Compiler *c, int mi, int call_id);
 /* A program's own Object method serving a call on a builtin receiver of
    class `cls` that does not have the name itself (see analyze_infer.c). */
 int object_reopen_answers(Compiler *c, const char *cls, int call_id, TyKind *out);
+int sclass_value_call(Compiler *c, int id);   /* analyze_infer.c */
 /* is_proc_constant / is_proc_literal are declared in analyze.h (codegen needs them). */
 /* 1 if `id` is any proc-creating literal: a proc/lambda/Proc.new call (above)
    or a `->(){}` LambdaNode. */
@@ -286,6 +293,7 @@ int widen_hash_arg_for_store(Compiler *c, int arg, TyKind hk, TyKind hv);
 int pivs_settle_hash_stores(Compiler *c);
 int pivs_hash_stores_widened(Compiler *c);
 int subtree_has_side_effect(Compiler *c, int id);   /* codegen_util.c */
+int call_unused_block(Compiler *c, int id);   /* codegen_util.c */
 
 /* Shared cached local-write index (analyze_pass.c): bucket walk over
    (scope, name) for "every write of local X in scope S" queries, instead of
@@ -326,6 +334,7 @@ const char *builtin_class_of_type(TyKind t);
 /* Whether method `m` can take call `call_id`'s arguments (analyze_pass.c) */
 int method_takes_call_args(Compiler *c, Scope *m, int call_id);
 const char *resolve_class_alias(Compiler *c, const char *cname);
+const char *resolve_class_alias_chain(Compiler *c, const char *cname);
 const char *const_alias_source(Compiler *c, const char *cname);
 void walk_scope(Compiler *c, int id, int scope_idx, int class_id);
 int scope_own_defaults(Compiler *c, int di);
@@ -401,6 +410,7 @@ TyKind an_builtin_answer(Compiler *c, int id);
 /* the kind of a value of class self_cls: a reopened builtin's own (Time -> TY_TIME),
    else the object */
 TyKind infer_builtin_self(Compiler *c, int self_cls);
+TyKind an_self_node_type(Compiler *c, int id);
 int an_yield_site_builtin_answer(Compiler *c, int id, TyKind kind, TyKind *out);
 extern int g_scopes_settled;   /* analysis done (codegen_util.c) */
 int poly_expr_flows_container(Compiler *c, int node);
@@ -425,6 +435,7 @@ void arg_layout_param_map(Compiler *c, Scope *m, const int *argv, int argc, int 
 int arg_layout_param_source(Compiler *c, Scope *m, int call, int i, int *spread);
 int zsuper_param_source(Compiler *c, Scope *s, Scope *pm, int j);         /* codegen_fold.c */
 int ty_runs_no_code(TyKind t);  /* codegen_call.c: a builtin reading such a value runs no program code */
+int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);  /* codegen_call.c */
 int subtree_reads_match_globals(Compiler *c, int root);  /* codegen_call_recv.c: $~, $1.. read there */
 int rest_packable_arm(Compiler *c, Scope *s);                    /* codegen_fold.c */
 /* The type a READ of ivar slot `iv` yields (a shared-mutable string slot
@@ -454,6 +465,7 @@ TyKind infer_sum_block_ty(Compiler *c, int block);
 TyKind infer_map_block_ty(Compiler *c, int id, int block);
 /* A call written `recv&.name` (analyze_infer_recv.c). */
 int call_is_safe_nav(const NodeTable *nt, int id);
+void step_kw_positional(Compiler *c, NodeTable *nt, int id, int args, int to_v, int by_v, int by_first);
 /* A range endpoint that is the infinite Float constant (analyze_infer.c). */
 int infer_end_is_float_inf(Compiler *c, int right);
 int propagate_prep_params(Compiler *c);
@@ -532,6 +544,7 @@ int desugar_forwarding_to_rest_callee(Compiler *c);
 int desugar_anon_block_param(Compiler *c);
 int desugar_singleton_class_define_method(Compiler *c);
 int desugar_define_method_proc_arg(Compiler *c);
+int desugar_module_function_aliases(Compiler *c);
 int method_body_next_to_return(NodeTable *nt, int id);
 int desugar_define_method_captures(Compiler *c);
 int desugar_body_local_scopes(Compiler *c);
@@ -559,6 +572,7 @@ int desugar_yield_in_closure(Compiler *c);
 int desugar_index_assign_user_recv(Compiler *c);
 int desugar_method_added_hook(Compiler *c);
 int desugar_io_console_modes(Compiler *c);
+int desugar_reader_index_write(Compiler *c);
 int desugar_const_attr_op_assign(Compiler *c);
 int desugar_safe_nav_attr_write(Compiler *c);
 int desugar_body_self_call(Compiler *c);
@@ -617,6 +631,7 @@ int desugar_symbol_to_proc_call(Compiler *c);
 int desugar_call_op_write(Compiler *c);
 int desugar_reopened_op_write(Compiler *c);
 int desugar_array_at(Compiler *c);
+int desugar_unused_block_arg(Compiler *c);
 int desugar_unpack_block(Compiler *c);
 int desugar_interp_reopened_to_s(Compiler *c);
 int desugar_array_first_last(Compiler *c);
@@ -647,13 +662,15 @@ int desugar_encoding_queries(Compiler *c);
 int desugar_alias_method_string_names(Compiler *c);
 int desugar_alias_method_values(Compiler *c);
 int desugar_inherited_aliases(Compiler *c);
+int desugar_builtin_alias_calls(Compiler *c);
 int desugar_reader_aliases_before_redef(Compiler *c);
 int desugar_reassigned_block_params(Compiler *c);
 int desugar_inline_struct_blocks(Compiler *c);
+int desugar_singleton_class_meta(Compiler *c);
 int desugar_class_new_blocks(Compiler *c);
 int desugar_included_hooks(Compiler *c);
 int desugar_class_body_object_acts(Compiler *c);
-int desugar_struct_block_name_reads(Compiler *c);
+int desugar_struct_block_anonymous(Compiler *c);
 int desugar_eval_method_block(Compiler *c);
 int desugar_singleton_body_self(Compiler *c);
 int desugar_inherited_hooks(Compiler *c);
@@ -664,7 +681,7 @@ int infer_return_types(Compiler *c);
 int backprop_hash_return_types(Compiler *c);
 int backprop_call_target(Compiler *c, int call_id);
 int ivar_src_slot(Compiler *c, int v, const char **ivn);
-void cr_collect_calls(Compiler *c, const NodeTable *nt, int id, char ***out, int *n, int *cap);
+void cr_collect_calls(Compiler *c, const NodeTable *nt, int id, char ***out, int *n, int *cap, int instance_self);
 void compute_reachable(Compiler *c, int typed);
 void refuse_native_singleton_reopen(Compiler *c, Scope *s);
 void compute_instantiated(Compiler *c, int early);
@@ -744,4 +761,5 @@ int is_builtin_reopen(const char *name);
 char **dsend_candidates(Compiler *c, int *out_n);
 int exc_reopen_definers(Compiler *c, const char *mname, int *out, int max);
 
+int infer_cext_builtin_constant(Compiler *c, int node);
 #endif

@@ -806,7 +806,7 @@ static void cf_bind_block(CF *f, int mi, int blk) {
     int e = nt_ref(nt, blk, "expression");
     if (e >= 0 && nt_kind(nt, e) == NK_SymbolNode) {
       const char *sym = nt_str(nt, e, "value");
-      if (sym) { cf_dyn_add(f, sym); CFByName *b = cf_byname(f, sym); for (int i = 0; i < b->n; i++) cf_unite(f, f->yval_el[mi], f->ret_el[b->mi[i]]); }
+      if (sym) { CFByName *b = cf_byname(f, sym); for (int i = 0; i < b->n; i++) cf_unite(f, f->yval_el[mi], f->ret_el[b->mi[i]]); }
       if (!sym || sp_streq(sym, "new") || sp_streq(sym, "allocate") || cf_opaque_name(sym)) cf_all(f, f->yval_el[mi]);
     }
     else cf_unite(f, f->yval_el[mi], e);
@@ -922,15 +922,18 @@ static void cf_builtin_rule(CF *f, int v, int recv_el, const int *argv, int argc
       if (e >= 0 && nt_kind(nt, e) == NK_SymbolNode) {
         const char *sym = nt_str(nt, e, "value");
         if (!sym || sp_streq(sym, "new") || sp_streq(sym, "allocate") || cf_opaque_name(sym)) cf_all(f, v);
-        else { cf_dyn_add(f, sym); CFByName *b = cf_byname(f, sym); for (int q = 0; q < b->n; q++) cf_unite(f, v, f->ret_el[b->mi[q]]); }
+        else { CFByName *b = cf_byname(f, sym); for (int q = 0; q < b->n; q++) cf_unite(f, v, f->ret_el[b->mi[q]]); }
       }
       else cf_unite(f, v, e);
       continue;
     }
     if (k == NK_SymbolNode) {
-      /* a Symbol a builtin takes may name a method it calls (`inject(:+)`,
-         `map(&:name)` is the block form above) */
-      cf_dyn_add(f, nt_str(nt, argv[i], "value"));
+      /* `to_enum(:m)`: the Enumerator yields what m yields, so its values
+         are m's yield arguments (as each's are, cf_protocol_returns) */
+      if (i == 0 && (sp_streq(nm, "to_enum") || sp_streq(nm, "enum_for"))) {
+        CFByName *b = cf_byname(f, nt_str(nt, argv[i], "value"));
+        for (int q = 0; q < b->n; q++) for (int y = 0; y < CF_YARGS; y++) cf_unite(f, v, f->yarg_el[b->mi[q]][y]);
+      }
       continue;
     }
     cf_unite(f, v, k == NK_SplatNode ? nt_ref(nt, argv[i], "expression") : argv[i]);
@@ -947,7 +950,7 @@ static void cf_builtin_rule(CF *f, int v, int recv_el, const int *argv, int argc
     if (e >= 0 && nt_kind(nt, e) == NK_SymbolNode) {
       const char *sym = nt_str(nt, e, "value");
       if (!sym || sp_streq(sym, "new") || sp_streq(sym, "allocate") || cf_opaque_name(sym)) cf_all(f, v);
-      else { cf_dyn_add(f, sym); CFByName *b = cf_byname(f, sym); for (int q = 0; q < b->n; q++) cf_unite(f, v, f->ret_el[b->mi[q]]); }
+      else { CFByName *b = cf_byname(f, sym); for (int q = 0; q < b->n; q++) cf_unite(f, v, f->ret_el[b->mi[q]]); }
     }
     else cf_unite(f, v, e);
   }
@@ -1157,6 +1160,18 @@ static void cf_call(CF *f, int v) {
       cf_send_writers(f, v, r);
     return;
   }
+  /* an alias that captured a builtin (`alias old_dup dup`, #8914) calls the
+     builtin: not the method the class defines of the name after it, whose
+     answer is not the receiver */
+  if (nt_int(nt, v, "builtin_only", 0)) {
+    int recv_el = r;
+    if (r < 0) {
+      int ik = cf_inst_class(f, cf_scope_of(f, v));
+      recv_el = ik >= 0 && !cf_selfless_fn(nm) ? f->self_el[ik] : -1;
+    }
+    cf_builtin_rule(f, v, recv_el, argv, argc, blk, nm);
+    return;
+  }
   if (r < 0) {
     /* a call on self: the method of self's class, or of a subclass whose
        instance runs this code; else the top-level def; else Kernel's */
@@ -1171,11 +1186,9 @@ static void cf_call(CF *f, int v) {
       if (s->is_cmethod && (sp_streq(nm, "new") || sp_streq(nm, "allocate")) &&
           comp_cmethod_in_chain(c, s->class_id, nm, NULL) < 0) {
         cf_add_set(f, v, f->desc[s->class_id]);
-        if (sp_streq(nm, "new"))
-          for (int i = 0; i < ds->n; i++) {
-            int init = comp_method_in_chain(c, ds->cls[i], "initialize", NULL);
-            if (init >= 0) cf_user_target(f, -1, init, argv, argc, blk);
-          }
+        /* each class as `X.new` builds it: its initialize, or a Struct's
+           or Data's members, which have none */
+        for (int i = 0; i < ds->n; i++) cf_construct(f, -1, ds->cls[i], argv, argc, blk, nm);
         return;
       }
       if (s->is_cmethod) {
@@ -1220,6 +1233,12 @@ static void cf_call(CF *f, int v) {
     if (!found) {
       int tl = comp_method_index(c, nm);
       if (tl >= 0 && cf_user_target(f, v, tl, argv, argc, blk)) found = 1;
+    }
+    /* a module included at top level is Object's, so its method answers a
+       bare call no class or top-level def did */
+    for (int k = 0; k < c->ntoplevel_includes && !found; k++) {
+      int mi = comp_method_in_chain(c, c->toplevel_includes[k], nm, NULL);
+      if (mi >= 0 && cf_user_target(f, v, mi, argv, argc, blk)) found = 1;
     }
     if (found) return;
     /* a native binding of the class (an ffi_func): anything */
@@ -1318,11 +1337,7 @@ static void cf_call(CF *f, int v) {
       const ClsSet *ds = &f->pool[f->desc[s->class_id]];
       cf_add_set(f, v, f->desc[s->class_id]);
       if (ds->all) { for (int i = 0; i < argc; i++) cf_all(f, argv[i]); return; }
-      if (sp_streq(nm, "new"))
-        for (int i = 0; i < ds->n; i++) {
-          int init = comp_method_in_chain(c, ds->cls[i], "initialize", NULL);
-          if (init >= 0) cf_user_target(f, -1, init, argv, argc, blk);
-        }
+      for (int i = 0; i < ds->n; i++) cf_construct(f, -1, ds->cls[i], argv, argc, blk, nm);
       return;
     }
   }
@@ -1442,8 +1457,11 @@ static void cf_node(CF *f, int v) {
     return;
   }
   case NK_SelfNode: {
-    if (cf_in_exec_block(f, v)) { cf_all(f, v); return; }
+    if (cf_in_exec_block(f, v) || nt_int(nt, v, "ie_rself", 0)) { cf_all(f, v); return; }
     int si = cf_scope_of(f, v);
+    /* a self a pass gave a call as its receiver after the scopes were
+       walked (`r` -> `self.r`) has none recorded: the call's is its */
+    if (si == 0 && f->par && v < f->nnodes && f->par[v] >= 0) si = cf_scope_of(f, f->par[v]);
     /* `def (self.class).m`: the receiver is the enclosing scope's self */
     for (int x = v, q = f->par ? f->par[v] : -1; q >= 0; x = q, q = f->par[q]) {
       if (nt_kind(nt, q) != NK_DefNode) continue;
@@ -1715,9 +1733,11 @@ static void cf_node(CF *f, int v) {
     }
     const int *mis = s->is_cmethod ? b->cmi : b->mi;
     int nmis = s->is_cmethod ? b->ncm : b->n;
+    int others = 0;
     for (int i = 0; i < nmis; i++) {
       int t = mis[i];
       if (t == mi) continue;
+      others++;
       cf_unite(f, v, f->ret_el[t]);
       if (k == NK_SuperNode) cf_bind_args(f, t, argv2, argc2);
       else {
@@ -1733,10 +1753,14 @@ static void cf_node(CF *f, int v) {
         cf_unite(f, f->yval_el[mi], f->yval_el[t]);
       }
     }
-    if (nmis == 0 && !(s->is_cmethod && sp_streq(s->name, "new"))) {
+    /* not nmis: the method itself is among those of its name */
+    if (others == 0 && !(s->is_cmethod && sp_streq(s->name, "new"))) {
       /* a builtin ancestor's method (Exception#initialize, Array#push, a
-         Struct's): its value is its own, built from the arguments */
-      cf_builtin_rule(f, v, -1, argv2, argc2, blk, s->name);
+         Struct's): its value is its own, built from the arguments, and
+         self is its receiver, as for a bare builtin call (Object#freeze
+         answers it) */
+      int ik = s->is_cmethod ? -1 : cf_inst_class(f, mi);
+      cf_builtin_rule(f, v, ik >= 0 && !cf_selfless_fn(s->name) ? f->self_el[ik] : -1, argv2, argc2, blk, s->name);
     }
     return;
   }
@@ -1767,6 +1791,19 @@ static void cf_collect_dyn(CF *f) {
     const char *cn = nt_str(nt, id, "name");
     if (!cn) continue;
     if (sp_streq(cn, "instance_variable_set") || sp_streq(cn, "instance_variable_get") || sp_streq(cn, "remove_instance_variable")) f->all_ivars = 1;
+    /* `inject(:m)`, `inject(init, :m)` and `each_with_object(x, &:m)` call m
+       with arguments the pass does not see: m takes any class */
+    {
+      int a0 = nt_ref(nt, id, "arguments"), n0 = 0;
+      const int *v0 = a0 >= 0 ? nt_arr(nt, a0, "arguments", &n0) : NULL;
+      int by_sym = sp_streq(cn, "inject") || sp_streq(cn, "reduce");
+      for (int i = 0; by_sym && i < n0; i++)
+        if (nt_kind(nt, v0[i]) == NK_SymbolNode) cf_dyn_add(f, nt_str(nt, v0[i], "value"));
+      int blk0 = nt_ref(nt, id, "block");
+      if ((by_sym || sp_streq(cn, "each_with_object")) && blk0 >= 0 &&
+          nt_kind(nt, blk0) == NK_BlockNode && nt_int(nt, blk0, "sym_proc_block", 0))
+        cf_dyn_add(f, nt_str(nt, blk0, "sym_proc"));
+    }
     if (!sp_streq(cn, "send") && !sp_streq(cn, "__send__") && !sp_streq(cn, "public_send") &&
         !sp_streq(cn, "method") && !sp_streq(cn, "public_method") && !sp_streq(cn, "instance_method") &&
         !sp_streq(cn, "define_method") && !sp_streq(cn, "define_singleton_method") &&
@@ -2151,7 +2188,8 @@ void an_cls_facts(Compiler *c) {
        to hold anything rather than nothing (#8720) */
     if (cf_protocol_name(s->name) || cf_opaque_name(s->name) || cf_is_dyn(&f, s->name) ||
         s->is_proc_form || s->is_lowered_yield ||
-        s->cs_synth || s->is_module_function || cf_prelude_scope(&f, mi)) {
+        s->cs_synth || s->is_module_function || cf_prelude_scope(&f, mi) ||
+        (c->n_cext_extensions && s->def_node >= 0 && nt_int(c->nt, s->def_node, "cext_stub", 0))) {
       f.protocol[mi] = 1;
       cf_all_params(&f, mi);
     }

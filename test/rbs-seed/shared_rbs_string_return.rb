@@ -8,7 +8,6 @@
 # of these ("that route cannot carry the shared handle yet: it would hand on
 # a copy"). The unboxing of such a tail now publishes the handle the box
 # holds, as a read of a shared String does.
-# spinel: rbs-seed-check
 module ShrsrConf
   class << self
     attr_accessor :secret_key_base
@@ -92,6 +91,18 @@ class ShrsrTails
   end
 end
 
+class ShrsrLogic
+  def initialize(s)
+    @s = s
+  end
+
+  def orlocal
+    k = ShrsrConf.secret_key_base
+    t = @s
+    k || t
+  end
+end
+
 class ShrsrRec
   def created_at_raw
     @created_at_raw
@@ -161,3 +172,10 @@ buf.replace("abc")
 got = shrsr_pass(tails.memo)
 got << "!"
 puts "memo: #{got} #{buf}"
+
+ShrsrConf.secret_key_base = nil
+buf.replace("abc")
+logic = ShrsrLogic.new(buf)
+got = shrsr_pass(logic.orlocal)
+got << "!"
+puts "orlocal: #{got} #{buf} #{got.equal?(buf)}"

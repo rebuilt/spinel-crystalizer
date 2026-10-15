@@ -71,10 +71,11 @@
      read      a taker given the bytes, kept by nothing the check sees: a
                consumer that only reads (one the share facts have no row
                for, so the plan asks the object), or a handle passed on
-               where the check cannot follow it; or an identity the plan
-               gives the handle, read as bytes the same way (an operand
-               read ahead of a comparison of its slot's handle);
-     disagree  anything else, named per node with its consumer.
+               where the check cannot follow it (an identity reads the
+               plan's form, emit_str_form: one the plan gives the handle
+               read as bytes disagrees);
+     disagree  anything else, named per node with its consumer and its
+               producer's kind (share.h's SPK_*).
    Where the plan's memo can answer the need (the node read as itself), its
    answer is compared with the live one, and a contradiction is counted
    stale. A site where it cannot (a view, an arm, a splice, a node codegen
@@ -757,17 +758,19 @@ static void sk_plan_report(Compiler *c, struct ShareAgree *A) {
       tally[form][e]++;
       /* a taker given the bytes, kept by nothing the check sees: the C
          may hand them to a consumer that only reads (one the facts have no
-         row for), or pass a handle on where the check cannot follow it;
-         so may an identity the plan gives the handle (an operand read
-         ahead of a comparison of the handle) */
-      if (e == SKE_READ && role != SPR_READ && role != SPR_TEST && (role != SPR_IDENTITY || form != SPF_BYTES)) {
+         row for), or pass a handle on where the check cannot follow it. An
+         identity reads the plan's form (emit_str_form): one the plan gives
+         the handle read as bytes is a renderer's gap */
+      if (e == SKE_READ && role != SPR_READ && role != SPR_TEST && role != SPR_IDENTITY) {
         read++;
         continue;
       }
       if (sk_plan_agrees(form, e)) { agree++; continue; }
-      char what[160];
-      snprintf(what, sizeof what, "plan %s%s, C %s (%s, %s)", share_plan_form_name(form), live ? " (live)" : "",
-               en[e], share_plan_role_name(role), sk_consumer(c, v));
+      /* (and the producer's kind, asked here, after codegen, outside any
+         view or arm) */
+      char what[192];
+      snprintf(what, sizeof what, "plan %s%s, C %s (%s, %s) [%s]", share_plan_form_name(form), live ? " (live)" : "",
+               en[e], share_plan_role_name(role), sk_consumer(c, v), share_plan_kind_name(share_plan_producer(c, v, NULL)));
       sk_line(c, A, "plan: disagree", v, what);
     }
   qsort(A->line, (size_t)A->nline, sizeof(char *), sk_cmp_line);

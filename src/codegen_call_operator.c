@@ -42,47 +42,16 @@ static void emit_int_bit_recv(Compiler *c, int recv, TyKind rt, const char *conv
   emit_scalar_operand_op(c, recv, name, b);   /* NoMethodError for nil */
 }
 
-/* Is `v` an operand of a String identity comparison that is a handle where
-   `other` is one too? A yielding call spliced in with its literal block
-   answers the handle only for a value that is one; against a literal or a
-   plain String it answers the bytes the other operand names, and wrapping
-   them in a new handle would lose their identity. */
-static int string_identity_handle_operand(Compiler *c, int v, int other) {
-  HolderRef h;
-  if (holder_of_node(c, v, &h) && h.r.share) return 1;
-  if (!strbuf_route_inline_call(c, v)) return 0;
-  return (holder_of_node(c, other, &h) && h.r.share) || strbuf_route_inline_call(c, other) ||
-         repr_call_returns_handle(c, other);
-}
-int string_identity_inline(Compiler *c, int recv, int arg) {
-  return (strbuf_route_inline_call(c, recv) && string_identity_handle_operand(c, recv, arg)) ||
-         (strbuf_route_inline_call(c, arg) && string_identity_handle_operand(c, arg, recv));
-}
-
-/* Compare String identities through their boxes, retaining shared handles
-   and evaluating the receiver before an allocating argument. */
-void emit_string_identity(Compiler *c, int recv, int arg, Buf *b) {
+/* A nullable String compared by identity with a box or nil: both
+   operands boxed, the receiver evaluated before an allocating argument
+   and rooted across it. (--share-strings compares String identities
+   through the plan, emit_str_equal.) */
+static void emit_string_identity(Compiler *c, int recv, int arg, Buf *b) {
   int operand[2] = { recv, arg }, t[2];
   buf_puts(b, "({ ");
-  for (int i = 0; i < 2; i++) {
-    int sv = -1, cops[3];
-    /* a String clamp's String is the handle of the operand it answers;
-       its read face is a copy */
-    if (strbuf_route_clamp(c, operand[i], cops)) {
-      t[i] = ++g_tmp;
-      buf_printf(b, "sp_RbVal _t%d = sp_box_nullable_obj(", t[i]);
-      emit_strbuf_route(c, operand[i], b);
-      buf_printf(b, ", SP_BUILTIN_STRBUF); SP_GC_ROOT_RBVAL(_t%d); ", t[i]);
-      continue;
-    }
-    if (string_identity_handle_operand(c, operand[i], operand[1 - i])) {
-      sv = view_push(c, operand[i], TY_STRBUF);
-      view_push_repr(c, operand[i], VR_STRBUF_BOX, 1);
-    }
+  for (int i = 0; i < 2; i++)
     t[i] = hold_operand(c, operand[i], TY_POLY, 1, ++g_tmp,
                         i == 0 && operand_may_allocate(c, arg), " ", b);
-    if (sv >= 0) { view_pop(c, sv + 1); view_pop(c, sv); }
-  }
   buf_printf(b, "sp_poly_equal(_t%d, _t%d); })", t[0], t[1]);
 }
 
@@ -297,18 +266,6 @@ static int emit_compare_lead_arms(Compiler *c, int id, const char *name, int rec
     emit_string_identity(c, recv, argv[0], b);
     return 1;
   }
-  /* A call's shared String answer is compared as its handle, including
-     against a boxed operand. Hold the receiver before the argument can
-     replace the return channel, without a fixed-size slot-text buffer.
-     So is a String clamp's answer (strbuf_route_clamp). */
-  int cops[3];
-  if (repr_share_rule(c) && recv >= 0 && argc == 1 && is_identity_query(name) && is_equality_name(name) &&
-      comp_recv_type(c, recv) == TY_STRING &&
-      (repr_call_returns_handle(c, recv) || repr_call_returns_handle(c, argv[0]) ||
-       strbuf_route_clamp(c, recv, cops) || strbuf_route_clamp(c, argv[0], cops))) {
-    emit_string_identity(c, recv, argv[0], b);
-    return 1;
-  }
   return 0;
 }
 
@@ -492,7 +449,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
     if (is_shift_op(name)) {
       buf_printf(b, "({ sp_Bigint *_t%d = ", tbl); emit_expr(c, recv, b);
       buf_printf(b, "; SP_GC_ROOT(_t%d); int64_t _t%d = ", tbl, tbr);
-      if (a0r.big) { buf_puts(b, "sp_bigint_to_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      if (a0r.big) { buf_puts(b, "sp_bigint_shift_count("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else emit_int_expr(c, argv[0], b);
       buf_printf(b, "; sp_bigint_%s(_t%d, _t%d); })", sp_streq(name, "<<") ? "shl" : "shr", tbl, tbr);
     }
@@ -584,6 +541,8 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       buf_puts(b, ", ");
       if (at0 == TY_POLY) { buf_puts(b, "sp_poly_bit_operand("); emit_expr(c, argv[0], b); buf_puts(b, ", 1)"); }
       else if (at0 == TY_FLOAT) { buf_puts(b, "sp_float_to_i_checked("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      /* a Bignum count saturates (sp_bigint_shift_count): every bit leaves */
+      else if (repr_of(c, argv[0]).big) { buf_puts(b, "sp_bigint_shift_count("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else emit_int_expr(c, argv[0], b);
       buf_puts(b, ")");
       return 1;
@@ -616,7 +575,8 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        typed as a bigint; the result slot is int, so take its low-64 bit pattern
        (sp_bigint_to_int truncates) -- this is the xorshift/64-bit-mask idiom. */
     else if (a0r.big) {
-      buf_puts(b, "sp_bigint_to_int("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+      /* (a shift count saturates instead: sp_bigint_shift_count) */
+      buf_puts(b, is_shift ? "sp_bigint_shift_count(" : "sp_bigint_to_int("); emit_expr(c, argv[0], b); buf_puts(b, ")");
     }
     else emit_expr(c, argv[0], b);
     if (shl_neg_safe) buf_puts(b, ")");
@@ -948,9 +908,9 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        through a temporary rename of the call. */
     if (ty_is_hash(lrt)) {
       Buf eqb; memset(&eqb, 0, sizeof eqb);
-      nt_node_set_str((NodeTable *)nt, id, "name", "==");
+      char *sv_nm = nt_node_swap_str((NodeTable *)nt, id, "name", "==");
       emit_expr(c, id, &eqb);
-      nt_node_set_str((NodeTable *)nt, id, "name", "<=>");
+      nt_node_restore_str((NodeTable *)nt, id, "name", sv_nm);
       oint_open(c, id, TY_INT, b);
       buf_printf(b, "((%s) ? sp_oint_of(0) : sp_oint_nil())", eqb.p ? eqb.p : "0");
       oint_close(c, id, b);
@@ -1517,20 +1477,21 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   /* String#clear consumed as a value: empty the assignable receiver in place
      and yield the now-empty string (#2332) */
   /* TY_STRBUF too: a reader handing out the shared handle is still a String
-     receiver, and the strbuf_slot_ref arm just below is the one written for
+     receiver, and the strbuf_slot_text arm just below is the one written for
      it. Gated on TY_STRING alone, the value form of `obj.buf.clear` matched
      nothing, cleared nothing and answered nil. */
   if (recv >= 0 && (rt == TY_STRING || rt == TY_STRBUF) && sp_streq(name, "clear") && argc == 0) {
     /* A shared-mutable receiver owns a buffer: empty it in place and answer
        the same string, as CRuby does. Its read is a copy out of the handle,
        not an lvalue, so the reassignment below did not even compile. */
-    { char srefC[1024];
-      if (strbuf_slot_ref(c, recv, srefC, sizeof srefC)) {
+    { Buf srefC; memset(&srefC, 0, sizeof srefC);
+      if (strbuf_slot_text(c, recv, &srefC)) {
         int tC2 = ++g_tmp;
         /* marked to hand out the handle (`r = obj.buf.clear`): the
            receiver itself, as for the appends */
         buf_printf(b, "({ sp_String *_t%d = %s; sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));",
-                   tC2, srefC, tC2);
+                   tC2, srefC.p, tC2);
+        free(srefC.p);
         if (repr_of(c, id).handle) buf_printf(b, " _t%d; })", tC2);
         else buf_printf(b, " sp_String_cstr(_t%d); })", tC2);
         return 1;

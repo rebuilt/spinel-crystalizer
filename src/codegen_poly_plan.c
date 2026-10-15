@@ -314,7 +314,7 @@ static int poly_user_arm0_decide(Compiler *c, int id, const char *name, int argc
    the deep-return pickup, so an earlier publication cannot replace them.
    A fresh result a builtin only reads, or the caller drops, keeps no alias. */
 void emit_poly_user_box(Compiler *c, int id, Scope *m, const char *call, Buf *b) {
-  if (!repr_share_rule(c) || m->ret != TY_STRING ||
+  if ((!repr_share_rule(c) && !c->n_cext_extensions) || m->ret != TY_STRING ||
       (!m->ret_handle && !(m->ret_fresh && share_node_shares(c, id) && !share_node_transient(c, id)))) {
     emit_boxed_ret_call(c, m, call, b);   /* an oint return boxes with its nil */
     return;
@@ -953,15 +953,19 @@ static int poly_user_arm_n_replay(Compiler *c, int id, const char *name, const P
             and handed its sp_bool to an sp_oint value slot, a hard C
             error; into a plain sp_int it read true as 1 */
          (pt0 == TY_BOOL) != (at0 == TY_BOOL) ||
-         /* two concretely different CONTAINER kinds. sp_StrStrHash * and
-            sp_SymPolyHash * are different structs, so the raw pass is a
-            hard C error, not a coercion that works -- the same argument
-            the collapsed-keyword slot below already makes. Without it, a
-            `merge` seeded Hash[String, String] on an unrelated class
-            took the arm for a plain Hash's call and the build stopped
-            inside that class (#4172). */
-         (ty_is_hash(pt0) && ty_is_hash(at0)) ||
-         (ty_is_array(pt0) && ty_is_array(at0)))) {
+         /* two concretely different kinds, either of them a builtin
+            pointer kind (a Hash, an Exception, a Proc, a Regexp, an Array
+            variant): the other is a different C struct, a scalar, or an
+            sp_PtrArray * holding other elements, so the raw pass is a hard C error, not a coercion that works --
+            the same argument the collapsed-keyword slot below already
+            makes. Without it, a `merge` seeded Hash[String, String] on an
+            unrelated class took the arm for a plain Hash's call and the
+            build stopped inside that class (#4172); a computed-name `send`
+            reached an unrelated `create(attrs = {})` with an Exception, an
+            object-array parameter with an Exception, or an Integer
+            parameter with a Regexp the same way. cplan_arm_args_fit
+            (call_plan.c) is this same test; keep them identical. */
+         (ty_is_builtin_ptr(pt0) || ty_is_builtin_ptr(at0)))) {
       arm_key_incompat = 1; break;
     }
   }
@@ -1390,6 +1394,12 @@ int emit_poly_user_arm_n(Compiler *c, int id, int k, const char *call, TyKind mr
   else {
     buf_printf(b, "_t%d = ", tr);
     if (ret == TY_POLY && mret != TY_POLY) { emit_poly_user_box(c, id, ms, call, b); conv = PC_BOX; }
+    else if (c->n_cext_extensions && ret == TY_STRBUF && mret == TY_STRING) {
+      int temp = ++g_tmp;
+      buf_printf(b, "({ _sp_ret_strbuf = NULL; const char *_v%d = %s; !_v%d ? NULL : ", temp, call, temp);
+      if (ms && ms->ret_handle) buf_puts(b, "_sp_ret_strbuf ? (sp_String *)_sp_ret_strbuf : ");
+      buf_printf(b, "sp_String_new_shared(_v%d); })", temp);
+    }
     else if (ret != TY_POLY && mret == TY_POLY) {
       plan_put_boxed(c, so, is_scalar_ret(ret) ? ret : TY_INT, call, b);
       conv = PC_UNBOX;
@@ -1751,7 +1761,7 @@ void emit_poly_prearms0(Compiler *c, int id, const char *name, const PolySpecial
     int fzn = sp_streq(name, "name");
     /* A Class.new class answers its name only once a constant names it: nil
        before, its display form for to_s and inspect (sp_class_val_display). */
-    if (c->has_anonymous_classes && fzn)
+    if ((c->has_anonymous_classes || comp_has_sclass_values(c)) && fzn)
       buf_printf(b, "if (_t%d.tag == SP_TAG_CLASS) { const char *_cn%d = sp_class_name_or_nil(sp_unbox_class(_t%d)); "
                     "_t%d = _cn%d ? %ssp_str_uminus_val(_cn%d)%s : %s; } else ",
                  tv, tv, tv, tr, tv, sbopen, tv, sbclose, ret == TY_POLY ? "sp_box_nil()" : "NULL");
@@ -3276,7 +3286,7 @@ void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps,
   if (is_strencode && pos_argc <= 2 && (ret == TY_POLY || ret == TY_STRING)) {
     if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_STR_ENCODE, -1, TY_UNKNOWN, PC_SAME);
     Buf eb; memset(&eb, 0, sizeof eb);
-    buf_printf(&eb, "sp_str_encode(_t%d.v.s", tv);
+    buf_printf(&eb, "sp_str_encode(_t%d.v.s, %d", tv, pos_argc);
     for (int a = 0; a < 2; a++) {
       buf_puts(&eb, ", ");
       if (a < pos_argc) {
@@ -3292,7 +3302,7 @@ void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps,
       for (int e = 0; e < kwn; e++) {
         int key = nt_ref(nt, kwels[e], "key");
         const char *kn = key >= 0 ? nt_str(nt, key, "value") : NULL;
-        if (kn && sp_streq(kn, EKW[k])) { found = e; break; }
+        if (kn && sp_streq(kn, EKW[k])) found = e;   /* the last one binds */
       }
       if (found >= 0) {
         char tn[32]; snprintf(tn, sizeof tn, "_t%d", kwtmp[found]);
@@ -3301,6 +3311,14 @@ void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps,
       else buf_puts(&eb, "sp_box_nil()");
     }
     buf_puts(&eb, ")");
+    /* an option the runtime does not read changes the bytes (xml:, the
+       newline ones): the String raises rather than answer without it */
+    const char *unread = encode_opt_unread(nt, kwels, kwn);
+    if (unread) {
+      eb.len = 0;
+      buf_printf(&eb, "(sp_raise_cls(\"NotImplementedError\", \"String#encode with the %s: option\"), (const char *)0)",
+                 unread);
+    }
     buf_printf(b, "if (_t%d.tag == SP_TAG_STR) { _t%d = ", tv, tr);
     if (ret == TY_POLY) buf_printf(b, "sp_box_str(%s)", eb.p); else buf_puts(b, eb.p);
     buf_puts(b, "; }\nelse ");
@@ -3560,10 +3578,11 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
     if (atmp_ty[0] == TY_POLY) buf_printf(b, "sp_poly_arg_int_chk(_t%d)", atmp[0]);
     else buf_printf(b, "(sp_int)_t%d", atmp[0]);
     buf_puts(b, "); ");
-    char hr[1024];
-    if (strbuf_slot_ref(c, argv[1], hr, sizeof hr)) buf_printf(b, "sp_String_set_bin(%s, _t%d); ", hr, trp);
+    Buf hr; memset(&hr, 0, sizeof hr);
+    if (strbuf_slot_text(c, argv[1], &hr)) buf_printf(b, "sp_String_set_bin(%s, _t%d); ", hr.p, trp);
     else if (nt_kind(nt, argv[1]) == NK_LocalVariableReadNode)
       buf_printf(b, "lv_%s = _t%d; ", rename_local(nt_str(nt, argv[1], "name")), trp);
+    free(hr.p);
     buf_printf(b, "_t%d = ", tr);
     if (ret == TY_POLY) buf_printf(b, "sp_box_str(_t%d)", trp);
     else buf_printf(b, "_t%d", trp);

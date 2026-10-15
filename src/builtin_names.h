@@ -157,6 +157,9 @@ int is_unary_minus(const char *n); /* -@ */
 int is_casecmp_family(const char *n); /* casecmp casecmp? */
 int is_hash_key_value_each(const char *n); /* each_key each_value */
 int is_encoding_mutator(const char *n); /* encode! force_encoding */
+/* the most arguments the arms serve: force_encoding's one (two read as a
+   refusal), encode!'s two encodings and its option hash */
+int encoding_mutator_max_argc(const char *n);
 int is_range_end_reader(const char *n); /* end last */
 int is_raise_alias(const char *n); /* fail raise */
 int is_exc_message_name(const char *n); /* message full_message detailed_message */
@@ -230,6 +233,20 @@ int is_match_family(const char *n); /* !~ =~ match match? */
 int is_integer_iteration(const char *n); /* downto step times upto */
 int is_visibility_or_module_function(const char *n); /* module_function private protected public */
 int is_mixin_call(const char *n); /* include extend prepend */
+/* The calls on a class's constant or self that answer neither the class nor
+   a block of its own (comp_class_may_be_value): new allocate name to_s
+   inspect === == ... respond_to? attr_* visibility. Not include, extend,
+   prepend, private_constant, private_class_method and public_class_method:
+   those answer their receiver. */
+int is_class_plain_query(const char *n);
+int is_class_self_answer(const char *n); /* include extend prepend private_class_method public_class_method private_constant public_constant remove_method undef_method: answer their receiver */
+int is_self_rebinding_call(const char *n); /* instance_/class_/module_ eval and exec, define_singleton_method */
+int is_class_relatives_query(const char *n); /* ancestors superclass subclasses descendants included_modules */
+int is_class_query(const char *n); /* class */
+int is_method_owner_query(const char *n); /* owner */
+int is_method_object_maker(const char *n); /* method public_method singleton_method instance_method public_instance_method */
+/* const_get const_source_location nesting attached_object each_object eval binding */
+int is_constant_or_object_reflection(const char *n);
 int is_const_set_name(const char *n); /* const_set */
 int is_const_query_name(const char *n); /* const_get const_defined? const_source_location */
 int is_constants_list_name(const char *n); /* constants */
@@ -304,6 +321,7 @@ int is_scan_name(const char *n); /* scan: a String's match iterator */
 int is_insert_name(const char *n); /* insert */
 int is_arguments_node_type(const char *t); /* ArgumentsNode */
 int is_when_node_type(const char *t);      /* WhenNode */
+int is_ensure_node_type(const char *t);    /* EnsureNode */
 int is_clear_name(const char *n); /* clear */
 int is_enumerator_with(const char *n); /* with_index with_object: an enumerator link */
 int is_lazy_name(const char *n);       /* lazy */
@@ -320,6 +338,7 @@ int is_method_object_name(const char *n); /* method public_method instance_metho
 int is_marshal_const(const char *n);     /* Marshal, whose load makes objects with any ivars */
 int is_env_const(const char *n);         /* ENV */
 int is_argv_const(const char *n);        /* ARGV */
+int is_engine_string_const(const char *n); /* RUBY_DESCRIPTION RUBY_VERSION ...: a frozen String */
 int is_proc_conversion_name(const char *n); /* to_proc curry: makes a proc */
 int is_aref_name(const char *n);         /* []: an element read */
 int is_shovel_name(const char *n);       /* <<: an append, a chain's link */
@@ -333,5 +352,38 @@ int is_untabled_native_class_name(const char *n);
 
 int is_define_method_name(const char *n); /* define_method */
 int is_alias_method_name(const char *n);  /* alias_method */
+/* --share-strings (#8328 step 5): the operations a String Array of handles
+   (TY_STRH_ARRAY) answers itself, by name, argument count and block (0
+   none, 1 a literal block, 2 a block argument). A container class one of
+   whose names takes any other stays in the poly form (share_strh_gate);
+   inference and codegen answer exactly these. */
+typedef enum {
+  STRH_NONE,
+  STRH_ELEM,     /* [](i), at(i), first, last: the element, a String */
+  STRH_STORE,    /* []=(i, v): stores v's String */
+  STRH_PUSH,     /* <<, push, append: stores each argument's String */
+  STRH_TAKE,     /* pop, shift: removes and answers the element */
+  STRH_LEN,      /* size, length */
+  STRH_EMPTY,    /* empty? */
+  STRH_EACH,     /* each { }: the receiver */
+  STRH_DUP,      /* dup: a new Array of the same Strings */
+  STRH_SELF,     /* to_a: the receiver */
+  STRH_JOIN,     /* join, join(sep) */
+  STRH_INCLUDE,  /* include?(v) */
+  STRH_EQ,       /* ==(other) */
+  STRH_INSPECT   /* inspect, to_s */
+} StrhOp;
+int strh_op(const char *n, int argc, int block);
+int is_kernel_print_name(const char *n);      /* p puts print */
+int is_identity_compare_name(const char *n);  /* equal? == != */
+int is_nil_shared_name(const char *n);        /* nil? equal? == !=: what nil answers as a String does */
+/* the receiver kind a block-taking iterator name belongs to */
+enum { BITER_NONE, BITER_ARRAY, BITER_INTEGER, BITER_STRING };
+int builtin_iter_owner(const char *n);        /* each reverse_each each_with_index / times upto downto / each_char */
+int is_frozen_query(const char *n);           /* frozen? */
+int is_pop_name(const char *n);               /* pop */
+int is_first_name(const char *n);             /* first */
 
+
+const char *encoding_const_name(const char *nm);  /* Encoding::NM's encoding name, or NULL */
 #endif

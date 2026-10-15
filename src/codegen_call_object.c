@@ -527,7 +527,7 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         /* an object slot holds nil as NULL: asked at run time below */
         if (sp_streq(cn, "NilClass"))
           yn = (at2 == TY_NIL || (aty && sp_streq(aty, "NilNode"))) ? 1 :
-               (at2 != TY_POLY && !ty_is_object(at2) ? 0 : -1);
+               (at2 != TY_POLY && at2 != TY_EXCEPTION && !ty_is_object(at2) ? 0 : -1);
         else if (sp_streq(cn, "TrueClass"))
           yn = (aty && sp_streq(aty, "TrueNode")) ? 1 : (aty && sp_streq(aty, "FalseNode")) ? 0 : (at2 != TY_BOOL && at2 != TY_POLY ? 0 : -1);
         else
@@ -826,6 +826,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
        so resolve the BlockArgumentNode to it (as `inner(&block)` does). */
     if (blk >= 0 && nt_type(nt, blk) && sp_streq(nt_type(nt, blk), "BlockArgumentNode")) {
       if (emit_ie_proc(c, id, recv, ie_self_cls, blk, ie_direct ? 0 : ie_tramp, b)) return 1;
+      if (ie_direct && recv >= 0 && nt_int(nt, id, "ie_usite", 0) && emit_ie_untraced(c, id, recv, blk, b)) return 1;
       int is_exec = sp_streq(name, "instance_exec");
       if (g_block_id < 0 && ie_direct && recv < 0 && (is_exec || argc == 0) &&
           resolve_forwarded_block(c, blk) < 0 && !g_yield_proc_ref && !g_current_scope_is_lowered) {
@@ -1109,11 +1110,11 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
    String holds, and answers the frozen face, or nil for a nil receiver.
    0 with nothing emitted for any other receiver. */
 static int emit_freeze_recv_handle(Compiler *c, int recv, Buf *b) {
-  char ref[1024];
+  Buf ref; memset(&ref, 0, sizeof ref);
   int th;
-  if (strbuf_slot_ref(c, recv, ref, sizeof ref) && !strbuf_pickup_may_nil(c, recv)) {
+  if (strbuf_slot_text(c, recv, &ref) && !strbuf_pickup_may_nil(c, recv)) {
     th = ++g_tmp;
-    buf_printf(b, "({ sp_String *_t%d = %s; ", th, ref);
+    buf_printf(b, "({ sp_String *_t%d = %s; ", th, ref.p);
   }
   else if (strbuf_assign_route(c, recv)) {
     th = ++g_tmp;
@@ -1132,7 +1133,8 @@ static int emit_freeze_recv_handle(Compiler *c, int recv, Buf *b) {
     emit_strbuf_handle_of(c, recv, b);
     buf_puts(b, "; ");
   }
-  else return 0;
+  else { free(ref.p); return 0; }
+  free(ref.p);
   buf_printf(b, "SP_GC_ROOT(_t%d); sp_String_freeze(_t%d); sp_str_freeze_val(sp_strbuf_read_pub(_t%d)); })", th, th, th);
   return 1;
 }
@@ -1234,16 +1236,21 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     }
     /* a shared String handle keeps its own frozen flag: read through it, not
        through the String value the handle is read as (a fresh copy) */
-    char fsref[1024];
+    Buf fsref; memset(&fsref, 0, sizeof fsref);
     int up = 0;
-    if (frt == TY_STRING && strbuf_self_route_slot(c, recv, &up, fsref, sizeof fsref) && !up) {
-      buf_printf(b, "sp_String_is_frozen(%s)", fsref);
+    if (frt == TY_STRING && strbuf_self_route_slot(c, recv, &up, &fsref) && !up) {
+      buf_printf(b, "sp_String_is_frozen(%s)", fsref.p);
+      free(fsref.p);
       return 1;
     }
-    if ((frt == TY_STRING || frt == TY_STRBUF) && strbuf_slot_ref(c, recv, fsref, sizeof fsref)) {
-      buf_printf(b, "sp_String_is_frozen(%s)", fsref);
+    fsref.len = 0;
+    if (fsref.p) fsref.p[0] = 0;
+    if ((frt == TY_STRING || frt == TY_STRBUF) && strbuf_slot_text(c, recv, &fsref)) {
+      buf_printf(b, "sp_String_is_frozen(%s)", fsref.p);
+      free(fsref.p);
       return 1;
     }
+    free(fsref.p);
     /* --share-strings: so does a route that hands on the handle (`String(t)`,
        `x.tap { }`, a conditional over one): its read face is an unfrozen
        copy */
@@ -1292,16 +1299,17 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       return 1;
     }
     const char *rtyf = nt_type(nt, recv);
-    char gfz[256];   /* a global holding the handle (--share-strings) */
+    /* (a global holding the handle, --share-strings) */
     int assignable_f = rtyf && (sp_streq(rtyf, "LocalVariableReadNode") || sp_streq(rtyf, "InstanceVariableReadNode") ||
                                 (repr_static_read_kind(nt_kind(nt, recv)) &&
-                                 strbuf_slot_ref(c, recv, gfz, sizeof gfz)));
+                                 strbuf_slot_has(c, recv)));
     /* a shared String handle reads back as an expression (a copy), which
        cannot be assigned to: freeze the handle, which every later mutation
        through it checks, and answer its contents frozen */
-    char fzref[1024];
-    if (assignable_f && strbuf_slot_ref(c, recv, fzref, sizeof fzref)) {
-      buf_printf(b, "({ sp_String_freeze(%s); sp_str_freeze_val(", fzref);
+    Buf fzref; memset(&fzref, 0, sizeof fzref);
+    if (assignable_f && strbuf_slot_text(c, recv, &fzref)) {
+      buf_printf(b, "({ sp_String_freeze(%s); sp_str_freeze_val(", fzref.p);
+      free(fzref.p);
       emit_expr(c, recv, b); buf_puts(b, "); })");
       return 1;
     }
@@ -1312,7 +1320,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
        is read again. */
     int fzu = unwrap_parens(c, recv);
     int fzb = !assignable_f && fzu >= 0 && nt_kind(nt, fzu) == NK_CallNode ? str_alias_chain_base(c, fzu) : fzu;
-    if (fzb != fzu && g_n_argov < MAX_ARG_OVERRIDE && strbuf_slot_ref(c, fzb, fzref, sizeof fzref)) {
+    if (fzb != fzu && g_n_argov < MAX_ARG_OVERRIDE && strbuf_slot_text(c, fzb, &fzref)) {
       int th = ++g_tmp;
       char thr[24];
       snprintf(thr, sizeof thr, "_t%d", th);
@@ -1325,7 +1333,8 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
             bop_name_mutates(nt_str(nt, k, "name"), BOP_MUT_LOCAL))
           fzrun = 1;
       }
-      buf_printf(b, "({ sp_String *%s = %s; SP_GC_ROOT(%s);", thr, fzref, thr);
+      buf_printf(b, "({ sp_String *%s = %s; SP_GC_ROOT(%s);", thr, fzref.p, thr);
+      free(fzref.p);
       if (fzrun) {
         int fzcall = nt_kind(nt, fzb) == NK_CallNode;
         int mk = fzcall ? view_bind(fzb, "%s", thr) : -1;
@@ -1468,6 +1477,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
            cannot be unfrozen. The copy and its hook run only for an
            object. */
         int nil_arm = drr.may_nil && !drr.nil_tested;
+        emit_pool_fwd(c, cid);
         buf_printf(b, "({ sp_%s *_t%d = ", cn, to);
         emit_expr(c, recv, b);
         buf_printf(b, "; SP_GC_ROOT(_t%d); ", to);
@@ -1554,8 +1564,9 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       is_self_copy(name) &&
       /* a generated READER of the name owns it, as in CRuby (#4190), and so
          does a method the class defines itself: Nokogiri's Node#dup is a deep
-         copy, and the built-in shallow copy took its place (#5450) */
-      !(ty_is_object(comp_ntype(c, recv)) &&
+         copy, and the built-in shallow copy took its place (#5450). Not for
+         a call an alias captured the builtin for (builtin_only). */
+      !(!nt_int(nt, id, "builtin_only", 0) && ty_is_object(comp_ntype(c, recv)) &&
         comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
       !(argc == 0 && repr_of(c, recv).kind == RK_BOXED && !sp_streq(name, "itself") && user_defines_or_reads(c, name))) {
     int args = nt_ref(nt, id, "arguments");
@@ -1661,7 +1672,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       return 1;
     }
     if (argc0 == 0 && !freeze_stateful && !ty_is_hash(recv_t) &&
-        !(is_dup_clone && (recv_t == TY_STRING || ty_is_array(recv_t) || recv_native))) {
+        !(is_dup_clone && (recv_t == TY_STRING || ty_is_array(recv_t) || recv_t == TY_STRH_ARRAY || recv_native))) {
       emit_expr(c, recv, b); return 1;
     }
     if (argc0 == 0 && recv_t == TY_STRING && is_dup_clone) {
@@ -1670,12 +1681,13 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       /* A shared String handle keeps its frozen flag on the handle, and reads
          back as a fresh copy that never carries it: clone asks the handle,
          as frozen? does, or the clone of a frozen String came back unfrozen. */
-      char clref[1024];
-      if (sp_streq(name, "clone") && strbuf_slot_ref(c, recv, clref, sizeof clref)) {
+      Buf clref; memset(&clref, 0, sizeof clref);
+      if (sp_streq(name, "clone") && strbuf_slot_text(c, recv, &clref)) {
         int th = ++g_tmp, tcl = ++g_tmp;
         buf_printf(b, "({ sp_String *_t%d = %s; const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
                       " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })",
-                   th, clref, tcl, th, th, tcl, th, tcl, tcl);
+                   th, clref.p, tcl, th, th, tcl, th, tcl, tcl);
+        free(clref.p);
         return 1;
       }
       buf_printf(b, "%s(", sp_streq(name, "clone") ? "sp_str_clone_val" : "sp_str_dup");
@@ -1684,10 +1696,13 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
   }
 
   /* then / yield_self: pass receiver to block, return block result -- but
-     an object whose class writes its own is called */
+     an object whose class writes its own is called, and a boxed receiver
+     that may be one goes through the dispatch, whose builtin arm comes back
+     here */
   if (recv >= 0 && (is_then_alias(name)) &&
       !(ty_is_object(comp_ntype(c, recv)) &&
-        comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) >= 0)) {
+        comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) >= 0) &&
+      !(comp_ntype(c, recv) == TY_POLY && !g_poly_builtin_arm && user_defines_or_reads(c, name))) {
     int blk = nt_ref(nt, id, "block");
     /* with NO block, an enumerator of one element -- the receiver (#4028),
        named `then` for either name, as CRuby's yield_self is then's alias */
@@ -1709,7 +1724,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         int use_shadow_th = tlv0 && tlv0->type != rtype && rtype != TY_UNKNOWN;
         /* Pin block param type early so body_ty is computed with correct cache */
         if (use_shadow_th && tlv0) {
-          tlv0->type = rtype;
+          lv_set_type(tlv0, rtype);
           arm_body_infer(c, ARM_SITE_THEN, blk, rtype, then_bb, then_bn);
         }
         /* the tail's type as the arm typed it (the fact just applied), or
@@ -1738,7 +1753,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         g_indent = save_ind;
         emit_indent(g_pre, bodyIndent); buf_printf(g_pre, "_t%d = %s;\n", tres, vb.p ? vb.p : "0"); free(vb.p);
         if (use_shadow_th) { emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n"); }
-        if (use_shadow_th && tlv0) tlv0->type = tsaved0;
+        if (use_shadow_th && tlv0) lv_set_type(tlv0, tsaved0);
         buf_printf(b, "_t%d", tres);
         return 1;
       }
@@ -2260,9 +2275,9 @@ static int emit_case_eq_identity(Compiler *c, int id, int recv, Buf *b) {
   /* a #== answering a boxed value is read for its truth, as rb_equal does */
   int boxed = c->scopes[mi].ret == TY_POLY;
   if (boxed) buf_puts(b, "sp_poly_truthy(");
-  nt_node_set_str((NodeTable *)nt, id, "name", "==");
+  char *sv_nm = nt_node_swap_str((NodeTable *)nt, id, "name", "==");
   emit_call(c, id, b);
-  nt_node_set_str((NodeTable *)nt, id, "name", "===");
+  nt_node_restore_str((NodeTable *)nt, id, "name", sv_nm);
   buf_puts(b, boxed ? "))" : ")");
   return 1;
 }
@@ -2464,9 +2479,9 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
       if (eac == 1 && ty_is_object(ert) &&
           comp_method_in_chain(c, ty_object_class(ert), "===", NULL) < 0) {
         if (emit_case_eq_identity(c, id, erecv, b)) return 1;
-        nt_node_set_str((NodeTable *)nt, id, "name", "==");
+        char *sv_nm = nt_node_swap_str((NodeTable *)nt, id, "name", "==");
         emit_call(c, id, b);
-        nt_node_set_str((NodeTable *)nt, id, "name", "===");
+        nt_node_restore_str((NodeTable *)nt, id, "name", sv_nm);
         return 1;
       }
     }
@@ -3361,8 +3376,8 @@ int emit_object_ivar_call(Compiler *c, int id, const char *name, int recv, TyKin
           buf_printf(b, "%s(%s)", oint_arg(mt), oint_nil(mt));
         }
         else if (mt == TY_STRBUF) {
-          char srefIS[1024];
-          if (strbuf_slot_ref(c, argv[1], srefIS, sizeof srefIS)) buf_puts(b, srefIS);
+          Buf srefIS; memset(&srefIS, 0, sizeof srefIS);
+          if (strbuf_slot_text(c, argv[1], &srefIS)) { buf_puts(b, srefIS.p); free(srefIS.p); }
           else {
             buf_puts(b, "sp_String_new_shared(");
             emit_str_expr(c, argv[1], b);

@@ -38,6 +38,16 @@ static ReprKind repr_kind_of_type(const Compiler *c, TyKind t) {
   return RK_PTR;
 }
 
+/* Is the node recv held boxed (repr_of(recv).kind == RK_BOXED)? Only a
+   Poly-typed node is, or a local read whose slot settled poly
+   (RS_SLOT_POLY); any other node answers no without repr_of's walk, which
+   asks the node's own receiver in turn, so asking it of every link of a
+   chain (`s << a << b << ...`) re-walked the chain below each link. */
+static int repr_recv_boxed(const Compiler *c, int recv) {
+  if (comp_ntype(c, recv) != TY_POLY && nt_kind(c->nt, recv) != NK_LocalVariableReadNode) return 0;
+  return repr_of(c, recv).kind == RK_BOXED;
+}
+
 /* The layout of a value stored as t that its type names and its kind does
    not: every Array and Hash is a pointer, and which container it points to
    -- what an Array holds its elements as (ty_array_elem), what a Hash
@@ -50,7 +60,8 @@ static ReprKind repr_kind_of_type(const Compiler *c, TyKind t) {
    same. A value with no type at all is RK_NONE, as a void one is; untyped
    tells them apart. */
 static void repr_layout(Repr *r, TyKind t) {
-  r->elem = ty_is_array(t) || ty_is_obj_array(t) ? ty_array_elem(t) : TY_UNKNOWN;
+  /* (a String Array of handles holds each String as its handle) */
+  r->elem = t == TY_STRH_ARRAY ? TY_STRBUF : ty_is_array(t) || ty_is_obj_array(t) ? ty_array_elem(t) : TY_UNKNOWN;
   r->key = ty_hash_key(t);
   r->val = ty_hash_val(t);
   r->range = t == TY_RANGE ? TY_INT : t == TY_FLOAT_RANGE ? TY_FLOAT
@@ -166,7 +177,7 @@ const NativeMethod *repr_native_arm_handle(Compiler *c, int v, int k) {
 static int repr_boxed_native_handle(Compiler *c, int v) {
   int recv = nt_ref(c->nt, v, "receiver");
   const char *nm = nt_str(c->nt, v, "name");
-  if (recv < 0 || !nm || repr_of(c, recv).kind != RK_BOXED) return 0;
+  if (recv < 0 || !nm || !repr_recv_boxed(c, recv)) return 0;
   const PolyPlan *p = cplan_poly_arms(c, v);
   int nk = 0, any = 0;
   const int *ks = poly_recv_classes(c, v, &nk);
@@ -200,7 +211,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
     const CallPlan *p = cplan_user(c, v);
     return p->dispatch == CP_DIRECT && repr_self_handle(c, p->mi) && scope_ret_handle(c, p->mi);
   }
-  if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return 0;
+  if ((!repr_share_rule(c) && !c->n_cext_extensions) || v < 0 || nt_kind(nt, v) != NK_CallNode) return 0;
   /* an attribute assignment answers its right-hand side, not what the
      writer returns: where the facts keep its value apart from the
      right-hand side's String (share_assign_unjoined), that value is the
@@ -209,7 +220,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
   if (share_assign_unjoined(c, v)) return 0;
   /* a String's value, or one the pickup marks to be stored as the handle */
   TyKind t = c->ntype[v];
-  if (t != TY_STRING && !(t == TY_STRBUF && c->strbuf_box[v])) return 0;
+  if (t != TY_STRING && !(t == TY_STRBUF && (c->strbuf_box[v] || c->n_cext_extensions))) return 0;
   if (strbuf_io_outbuf(c, v) >= 0) return 1;
   /* a Method's call: the method `method(:m)` names */
   int recv = nt_ref(nt, v, "receiver");
@@ -276,7 +287,7 @@ int repr_boxed_reader_handle(Compiler *c, int v) {
       nt_ref(nt, v, "block") >= 0 ||
       nt_ref(nt, v, "arguments") >= 0) return 0;
   int recv = nt_ref(nt, v, "receiver");
-  if (recv < 0 || repr_of(c, recv).kind != RK_BOXED ||
+  if (recv < 0 || !repr_recv_boxed(c, recv) ||
       ty_poly_face_owners(nt_str(nt, v, "name"), 0, 0, 1, 1)) return 0;
   const PolyPlan *p = cplan_poly_arms(c, v);
   if (p->n == 0) return 0;
@@ -347,6 +358,16 @@ int repr_env_store_operand(Compiler *c, int v) {
          (!(share_node_flags(c, argv[0]) & SHF_MUT) || repr_of(c, argv[0]).handle ||
           share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1])) ? argv[1] : -1;
 }
+/* Does string conversion `node` hand on a handle: the operand it ends in,
+   through further conversions, is a boxed value or a route that carries
+   one (strbuf_route_kind, the arms emit_strbuf_value takes the conversion
+   by)? */
+static int repr_conversion_hands_handle(Compiler *c, int node) {
+  int x = repr_string_conversion_operand(c, node), op, more;
+  while ((more = x >= 0 ? repr_string_conversion_operand(c, x) : -1) >= 0) x = more;
+  return x >= 0 && (repr_of(c, x).kind == RK_BOXED || strbuf_route_kind(c, x, &op) != SPK_NONE ||
+                    strbuf_cond_has_handle_leaf(c, x, 0));
+}
 /* Where the boxed form of a shared-mutable String comes from, as emit_boxed
    decides it for a node stored as (or holding) the handle. */
 static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
@@ -354,6 +375,9 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
   const NodeTable *nt = c->nt;
   NodeKind k = nt_kind(nt, node);
   if (repr_self_shared(c, node)) return RS_HANDLE;
+  /* an element a String Array of handles reads or removes is the handle
+     the Array keeps, as a String Range's endpoint is (#8328 step 5) */
+  if ((t == TY_STRING || t == TY_STRBUF) && strh_handle_call(mc, node)) return RS_HANDLE;
   if (t == TY_STRING) {
     /* a global holding the handle (--share-strings): its read boxes it */
     if (repr_static_read_kind(k)) return repr_static_share(c, node) ? RS_HANDLE : RS_NONE;
@@ -417,7 +441,12 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
   if (k == NK_CallNode) {
     /* A boxed receiver route keeps its handle beside fresh user answers. */
     if (repr_boxed_to_s_operand(mc, node) >= 0) return RS_HANDLE;
-    if (repr_string_conversion_operand(mc, node) >= 0) return RS_HANDLE;
+    /* A conversion keeps its operand's handle only where the operand has
+       one to hand on; over bytes (`split(".").last.to_s`,
+       `File.basename(p).to_s`) it is a String value, wrapped fresh where a
+       handle is demanded, as the operand alone would be. */
+    if (repr_string_conversion_operand(mc, node) >= 0)
+      return repr_conversion_hands_handle(mc, node) ? RS_HANDLE : RS_FRESH;
     int ops[3];
     if (strbuf_route_clamp(mc, node, ops)) return RS_HANDLE;
     if (repr_env_store_operand(mc, node) >= 0) return RS_HANDLE;
@@ -457,7 +486,10 @@ int repr_handle_apart(Compiler *c, int v, Repr r) {
    still dispatching as a String, which comp_recv_type answers for. That
    split is the whole point of the second array (#4363). */
 TyKind repr_stored_type(const Compiler *c, int id, TyKind t) {
-  if (t == TY_STRBUF) return c->strbuf_box[id] ? TY_STRBUF : TY_STRING;
+  /* (--share-strings: a value the analysis typed as the handle that is
+     demanded as one is stored as one, as any other demanded value is:
+     `{ |t| u = t }` spliced under a demand, the write of a handle local) */
+  if (t == TY_STRBUF) return c->strbuf_box[id] || (c->share_strings && c->strbuf_handle_demand[id]) ? TY_STRBUF : TY_STRING;
   if (c->strbuf_handle_demand[id]) return TY_STRBUF;
   return t;
 }
@@ -1010,8 +1042,8 @@ int repr_static_read_kind(NodeKind k) {
    class variable: its slot's (only the rule makes one the handle) */
 int repr_static_share(const Compiler *c, int node) {
   HolderRef h;
-  if (node < 0 || !c->share_strings || !holder_static_node(nt_kind(c->nt, node))) return 0;
-  return holder_of_node(c, node, &h) && h.r.share;
+  if (node < 0 || (!c->share_strings && !c->n_cext_extensions) || !holder_static_node(nt_kind(c->nt, node))) return 0;
+  return holder_of_node(c, node, &h) && (h.r.share || (c->n_cext_extensions && h.r.handle));
 }
 
 int repr_str_class_shares(unsigned flags, int holders) {
