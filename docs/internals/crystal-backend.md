@@ -1177,6 +1177,19 @@ The 185 new programs split 3 PASS / 3 DIFF / 7 BUILDFAIL / 172 REFUSED; the
 emitting few are upstream `.class`/poly-container tests and their BUILDFAILs are
 the same allowlisted-call gaps the corpus already tracks, not merge damage.
 
+**A flaky upstream test the merge picked up (2026-10-15).** The merge also
+brought `test/thread_sleep_wakeup_short.rb`, an upstream timing test. Its
+fastest-of-50 assertion can fail on a saturated runner, and it did: macOS CI
+failed it on the pushed merge, while upstream's own master CI failed it
+*identically* at `bcba2dbb7` — the commit merged here — and passed on a re-run,
+so the fork is not implicated (the merge leaves every shared source the test
+exercises untouched). Upstream has since rewritten the assertion in PR #9252
+(`4a55d4581`): count how many of 200 sleeps woke within 0.9 ms and ask for at
+least 20 — tolerant of a busy virtual runner, yet still failing the pre-condvar
+runtime 40 runs of 40. `04bdd4f2d` cherry-picks that fix. It touches only the
+test and its `.expected`, and the program is `REFUSED` under the Crystal target
+either way, so no metric in this document moves.
+
 (Phase commits, for the column headers: P2 `a8455324`, P3 `2b722b6d`,
 P4 `42923c6d`, P5 `d115b402`, P6 `a5eb7684`, P7 `f8ba43ac`, P8 `bc5dd918`,
 P9 `a3fc1ffd`, P10 `d06db81e`, P11 `e35d1fb3`, P12 `9f4e8772`,
