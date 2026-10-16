@@ -359,6 +359,13 @@ else
   "big"
 end)'
 
+# A multiline control-flow form in the middle of an argument list is parenthesized:
+# each form ends with `end\n`, so the NEXT argument's comma would start a new line,
+# which Crystal's parser reads as a closed call. The emitter splits `case` across
+# lines whenever a `when` body is more than one line, so the emitted
+# `p(case ... end, case ... end)` failed at the comma (`expecting token ')'`).
+expect_agree "p25_ctl_in_arglist" 'p(case :ab when Symbol then 1 else 2 end, case 1.5 when Float then 10 else 20 end)'
+
 expect_agree "p25_while_break_value" 'n = 0
 r = while true
   n += 1

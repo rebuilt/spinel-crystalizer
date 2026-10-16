@@ -3349,10 +3349,44 @@ static const char *cr_enum_passthrough(const char *name, TyKind recv_ty, char *r
    Returns 1 when it emitted the call. */
 /* Emit a call's arguments comma-separated, each as an expression. Shared by
    every call site so the separator convention lives in one place. */
+/* A multiline control-flow form (if/unless/case/while/until) sitting inside an
+   argument list has to be parenthesized: each form ends with `end\n`, so the
+   comma that introduces the NEXT argument would start a new line, and Crystal's
+   parser reads the call as already closed there (`expecting token ')'`, not
+   ','`). A surrounding parenthesis keeps the multiline form one parsed unit. */
+static int cr_is_multiline_ctl(NodeKind k) {
+  return k == NK_IfNode || k == NK_UnlessNode || k == NK_CaseNode ||
+         k == NK_WhileNode || k == NK_UntilNode;
+}
+
+/* One argument of a call. Two placement rules live here, both of them about
+   how Crystal parses a multi-line argument list:
+   - a widened (poly) position boxes the argument for the callee (untyped
+     parameters take SpValue), and
+   - a multiline control-flow form (if/unless/case/while/until -- see
+     cr_is_multiline_ctl) is wrapped in parens, because each of those forms
+     ends with `end\n` and the comma of a FOLLOWING argument would otherwise
+     start a new line, which Crystal reads as a closed call
+     (`expecting token ')', not ','`). The trailing `)` alone is fine, so a
+     multiline form as the LAST argument also needs the wrap for uniformity. */
+static void cr_emit_arg1(CrGen *g, int a, Scope *callee, int idx, Buf *b) {
+  if (CR_POLY_BOXED && callee && cr_param_poly(callee, idx)) {
+    cr_emit_boxed(g, a, b);
+    return;
+  }
+  if (cr_is_multiline_ctl(nt_kind(g->nt, a))) {
+    buf_puts(b, "(");
+    cr_emit_expr(g, a, b);
+    buf_puts(b, ")");
+    return;
+  }
+  cr_emit_expr(g, a, b);
+}
+
 static void cr_emit_args(CrGen *g, const int *argv, int argc, Buf *b) {
   for (int i = 0; i < argc; i++) {
     if (i) buf_puts(b, ", ");
-    cr_emit_expr(g, argv[i], b);
+    cr_emit_arg1(g, argv[i], NULL, i, b);
   }
 }
 
@@ -4499,8 +4533,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
       }
       for (int i = 0; i < argc; i++) {
         if (i) buf_puts(b, ", ");
-        if (CR_POLY_BOXED && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
-        else cr_emit_expr(g, argv[i], b);
+        cr_emit_arg1(g, argv[i], callee, i, b);
       }
       g->nil_ok = sav2;
       g->ctx.class_render = savcr;
@@ -4530,8 +4563,7 @@ static void cr_emit_call(CrGen *g, int id, Buf *b) {
   }
   for (int i = 0; i < argc; i++) {
     if (i) buf_puts(b, ", ");
-    if (CR_POLY_BOXED && callee && cr_param_poly(callee, i)) cr_emit_boxed(g, argv[i], b);
-    else cr_emit_expr(g, argv[i], b);
+    cr_emit_arg1(g, argv[i], callee, i, b);
   }
   g->nil_ok = sav2;
   g->ctx.class_render = savcr;
