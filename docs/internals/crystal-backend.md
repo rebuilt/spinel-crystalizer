@@ -11,8 +11,9 @@ questions, not to replace the C backend:
    translation to Crystal's block model?
 
 **Verdict: yes to both, for a concrete subset.** The parser and analyzer are
-reused verbatim; only the emitter is new. An 18-program corpus compiles through
-the Crystal path and matches CRuby byte-for-byte on stdout (see
+reused verbatim; only the emitter is new. A 7,347-program corpus now runs through
+the Crystal path: 528 compile and match CRuby byte-for-byte on stdout, and the
+rest are refused with a line-anchored reason naming the construct (see
 [Results](#results)).
 
 ## What is reused vs. new
@@ -22,7 +23,7 @@ the Crystal path and matches CRuby byte-for-byte on stdout (see
 | `src/spinel_parse.c` (libprism frontend) | yes | unchanged |
 | `src/node_table.c` (AST loader) | yes | unchanged |
 | `src/analyze*.c` (~43.8k LOC, type inference) | yes | unchanged; the `Compiler` it fills is the backend contract |
-| `src/codegen_crystal.c` (**new**, ~720 LOC) | new | walks the same `NodeTable` + `Compiler`, emits Crystal text |
+| `src/codegen_crystal.c` (**new**, 6,352 LOC) | new | walks the same `NodeTable` + `Compiler`, emits Crystal text |
 | `lib/sp_*.c` (C runtime, ~35k LOC) | **no** | replaced by the Crystal stdlib + GC; not ported |
 
 The C emitter (`src/codegen*.c`, ~88k LOC) is deliberately **not** reused: its
@@ -38,10 +39,17 @@ make bin/spinel                       # build the compiler (needs `crystal` on P
 spinel --target crystal app.rb -S     # print the generated .cr
 spinel --target crystal app.rb -c     # write app.cr only
 spinel --target crystal app.rb        # crystal build --release -> ./app, then report
- scripts/poc_crystal.sh                # run the 18-program corpus vs CRuby and print metrics
+ scripts/poc_crystal.sh                # run the 18-program PoC corpus vs CRuby and print metrics
  scripts/crystal_reject_test.sh        # assert the honesty gate refuses with a reason
  scripts/crystal_difference_test.sh    # pin each Ruby-vs-Crystal difference: agree / refuse / diverge
+ scripts/crystal_corpus_list.sh        # the corpus program list the gate measures
+ scripts/crystal_corpus.sh            # run the whole corpus vs CRuby -> results.txt
+ scripts/crystal_corpus_gate.sh        # fail if a baseline-PASS stopped passing
+ scripts/crystal_obstacle_survey.sh    # per-reason first- and sole-obstacle histograms
 ```
+
+CI runs the first three on every push and pull request that touches the backend
+(`.github/workflows/crystal.yml`), and the corpus on a weekly schedule.
 
 `--target` accepts `crystal`, `wasm32-wasi`, or `native` (both `--target=X` and
 `--target X` spellings). The default (no flag) is unchanged and still emits C.
@@ -1034,6 +1042,120 @@ discipline forbids. They stay refused, now naming the class. A
 `StandardError < Exception` shim was rejected too: it would narrow the existing
 broad rescue (which maps to `Exception`) and regress PASS.
 
+> **Reopened by the P25.0 measurement.** The obstacle survey below puts the
+> exception-class family at **117 sole-obstacle programs**, more than double the
+> 55 P24 acted on, and three names carry most of it (`NoMethodError` 35,
+> `TypeError` 27, `NameError` 13). See [the ladder the obstacle survey
+> implies](#the-ladder-the-obstacle-survey-implies).
+
+## P25.0: valued control flow, and expression forms for the value position
+
+The largest first-obstacle bucket in the P25 plan's §1 histogram was
+`ArgumentsNode`, on 180 programs. That was a **mislabel, not a design limit**:
+Prism stores even a single `return`/`next`/`break` operand inside an
+`ArgumentsNode`, and the expression walker has no case for `ArgumentsNode`. A
+valued `return` therefore fell through to the generic fallback, which names the
+node *kind* of the wrapper, and every valued return/next/break in the corpus was
+refused as `ArgumentsNode` — for a construct Crystal supports exactly
+(`return v`, `next v`, `break v`). It survived twenty-four phases because the
+first-obstacle histogram is an upper bound and nothing compiled the output.
+
+**Mechanism.** Three changes, one idea: the value position and the statement
+position must agree.
+
+- `cr_emit_ctl_value` unwraps the wrapper. No operand is a bare keyword; one
+  operand emits directly; two or more is refused **by name** — Ruby answers an
+  Array there and Crystal a Tuple, so emitting it would be the wrong shape.
+- `case`, `unless`, `while` and `until` were handled in the statement walker
+  only, so a value-position use fell through to the same fallback. All four are
+  expressions in Crystal, and `while`/`until` answer their `break` value exactly
+  as Ruby's `loop` does, so each statement emitter now serves both positions
+  (indent 0 in value position).
+- The bare node-kind fallback named a Prism type string. `cr_kind_why` maps the
+  common ones to the construct a Rubyist is looking for (`a lambda/proc`,
+  `pattern matching`, `` `defined?` ``, `a backtick/command string`, …); the
+  kind name stays for the long tail, which is greppable either way.
+
+**Found on the way — a wrong answer, not a refusal.** `unless c; a; else; b;
+end` read its else branch from `consequent`, but Prism stores an UnlessNode's
+else under `else_clause`. The read found nothing, so the else branch was
+**silently dropped** — a wrong answer that would have shipped as a DIFF, in the
+same program as a correct `unless`. Now `else_clause`. (`first_why` was also
+widened 160 → 320: several existing reasons ran past the old size and were cut
+mid-identifier, which hid the reason *and* split the survey histograms at the
+cut.)
+
+**Measured effect (P25.0).** **+44 PASS, +3 DIFF, +27 BUILDFAIL, −74 REFUSED**,
+zero PASS regressions (gate PASS, 484 baselined), on the 7,347-program corpus:
+
+```
+PASS 484 → 528    DIFF 86 → 89    BUILDFAIL 347 → 374    REFUSED 6430 → 6356
+```
+
+43 programs went REFUSED → PASS and one DIFF → PASS. The other 74 stopped being
+refused and landed on a later obstacle (27 BUILDFAIL, 4 DIFF) — which is the
+point: of 180 programs whose *first* obstacle was `ArgumentsNode`, only 44
+have no obstacle behind it.
+
+**One new wrong answer is now refused.** `loop { e.next }` is the shape Ruby's
+`loop` exists for: the block raises `StopIteration` and `loop` catches it and
+answers its result. Crystal has no `StopIteration` — `Iterator#next` answers a
+`Stop` value — so the same source never terminates. `cr_subtree_calls_next`
+refuses a `loop` whose block body calls zero-argument `next`, rather than
+emit a hang. (`e.next` outside a `loop` is untouched: nothing observes the
+raise, and a bounded walk translates exactly — the one PASS program that uses
+`e.next` does not use `loop`.)
+
+**Three new divergences are pinned in the difference ledger**, each a pre-existing
+gap the new emission exposed rather than a new bug, each with the root cause in
+its `expect_diverge` note:
+
+| program | divergence |
+|---|---|
+| `issue_2873` | `Hash#each` yields the pair as a two-element **Array** when the block takes one parameter; Crystal yields a **Tuple**. Observable only when the block looks at the pair, which the emitter cannot prove. |
+| `issue_2966` | Ruby has `TrueClass` and `FalseClass`; Crystal has one `Bool`. `TrueClass === false` is false in Ruby, true in Crystal. |
+| `poly_index_range_forms` | Ruby's `String#[]` with an Integer index answers a one-character String; Crystal answers a **Char**. |
+
+## The ladder the obstacle survey implies
+
+A program is refused at its **first** unsupported construct, so the
+first-obstacle histogram is an upper bound on what fixing a bucket buys — the
+usual suspect has a second obstacle behind it. That is what hid the
+`ArgumentsNode` bug: 180 first-obstacle programs, 44 of them clear.
+
+`SPINEL_CRYSTAL_WHYS=1` makes the emitter print **every** unsupported reason (it
+scans the whole program regardless), and `scripts/crystal_obstacle_survey.sh`
+reports, per reason, how many programs have it as their **only** obstacle — the
+real ceiling on a single fix. On the 7,347-program corpus:
+
+```
+refused 6,356   sole-obstacle 1,925  (30%)
+```
+
+| sole-obstacle family | programs | what it would take |
+|---|---|---|
+| method not in the Crystal subset | **582** | a per-name ladder; ~80 names are cheap (`block_given?` 13, `scan` 14, `downto` 7, `format` 7, `rand` 6, `to_sym` 6, `match?` 6, `inject` 5, `each_line` 5, `chr` 5, `chomp` 5, …) and a few are not (`method` reflection 32, `proc`/`lambda` 25, `Integer`/`Rational`/`Complex` 49, `catch` 6, `instance_exec` 10) |
+| method not available on this receiver | **153** | per-receiver; 69 are "Object has no such method", 43 are `String#<<` (a mutable buffer), 34 are class-object reflection |
+| exception class has no Crystal equivalent | **140** | `NoMethodError` 35, `TypeError` 27, `NameError` 13, then a long tail — **reopens the E2 shim decision** (above) |
+| class/module body side effect | **128** | reject the statement, or run class bodies at load in declaration order |
+| untyped empty container | **116** | 72 `[]` + 44 `{}`: a boxed `Array(SpValue)`/`Hash(SpValue, SpValue)` spelling of the empty literal |
+| poly/unknown ivar type | **104** | a declared type or a boxed member |
+| lambda/proc | 54 | Crystal procs cannot close over a mutated local the way Ruby's do |
+| pattern matching | 53 | `case`/`in` has no Crystal form |
+| integer overflows 64 bits | 41 | needs a BigInt shard this emitter does not pull in |
+| keyword-argument hash in a positional position | 34 | a `{k: v}` argument, not a positional Hash |
+| everything else | ~376 | the long tail (`Box` reopening 23, poly-receiver `yield` 19, keyword/rest params 18, `Regexp` 16, `super` with no superclass 16, `SplatNode` 15, a non-`$!` global 14, `Enumerator` 12, `h[k] += v` 11, …) |
+
+The order is the ladder: **the exception-class shim is the single cheapest
+large gain** (one ~15-line hierarchy, ~140 PASS), then the per-name method
+allowlist, then the boxed empty-container spelling.
+
+One caveat on the two "method" rows: the per-name counts come from the
+name-preserving view (a program naming two different globals is *not* sole
+there, but is sole once names collapse), so each named count is exact and the
+family total is the normalized one — 1,685 programs are sole under the
+stricter view against 1,925 under the normalized one.
+
 ## Ruby → Crystal divergences handled
 
 These are real semantic differences between the two languages that the emitter
@@ -1061,23 +1183,30 @@ translates for the supported surface:
 
 ## What the corpus covers (and passes)
 
-`examples/crystal_poc/` — 18 programs, each compared against CRuby:
+Two corpora, deliberately. `examples/crystal_poc/` is the 18-program
+feasibility probe — each program compared against CRuby, proving the analysis
+contract is backend-agnostic. The measurement is the C backend's own corpus:
+7,347 top-level `test/*.rb` programs, run against the committed baseline
+(`test/crystal_corpus_baseline.txt`). The PoC probe is small enough to read; the
+measurement corpus is where a regression or a gain actually shows.
 
 literals, arithmetic (incl. `**`, int vs float division), `while`/`until`,
 `if`/`elsif`/`else`/`unless`/ternary, recursion, top-level and class methods,
 classes with ivars + `attr_accessor` + `initialize`, Array/Hash/String
 operations, string interpolation, ranges (inclusive/exclusive), boolean logic,
 and blocks (`each`/`map`/`select`/`sum`/`times`, `next`, nested blocks).
-
 ## Results
 
-Measured 2026-09-28 on Crystal 1.21.0 / LLVM 20.1.8 (32-core Linux, gcc 13.3),
-CRuby as the oracle:
+Measured 2026-10-15 on Crystal 1.21.1 / LLVM 20.1.8, CRuby as the oracle, after
+P25.0 landed:
 
 ```
-programs: 18   pass: 18   diff: 0   build-fail: 0
-sum poly_sites=1   sum unsupported=0
+programs: 7347   PASS 528   DIFF 89   BUILDFAIL 374   REFUSED 6356
+gate: PASS (484 PASS baselined, 0 regressions)
 ```
+
+The 18-program PoC corpus (`examples/crystal_poc/`) remains the feasibility
+probe; the 7,347-program corpus above is the measurement.
 
 Every program's stdout is byte-identical to CRuby. `poly_sites` counts expression
 nodes the inference left as `TY_POLY`/`TY_UNKNOWN`; `unsupported` counts
@@ -1089,6 +1218,17 @@ backend without modification.**
 `test/*.rb`), the Crystal target emits cleanly on a subset and refuses the rest
 with a line-anchored diagnostic. The C backend compiles all of them, so the gap
 is entirely the Crystal subset.
+
+Measured 2026-10-15 on Crystal 1.21.1 / LLVM 20.1.8, CRuby as the oracle, as
+the P24 baseline (`test/crystal_corpus_baseline.txt`, 7,347 rows):
+
+```
+PASS 484   DIFF 86   BUILDFAIL 347   REFUSED 6,430
+```
+
+The gate's rule, and the one every phase above is held to: a change may add
+PASSes and may turn a DIFF/BUILDFAIL into a named refusal, but **must never
+make a previously-PASSing program stop passing**.
 
 Working through Crystal 1.21's removal of `untyped` revealed that the earlier
 "defer to dynamic dispatch on untyped receivers" strategy was not viable (there
@@ -1116,7 +1256,7 @@ worktree, and both sides run the top-level `test/*.rb` corpus through the fixed
 `scripts/crystal_corpus.sh`. Building each emitting program and comparing its
 output against CRuby gives:
 
-| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | P22e | P22f | P22g | P22h | P22i | P22j | P22k | P22n | P22o+p | P22q | P22r | P22s | P22t | **P22u (current)** | meaning |
+| outcome | baseline | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 | P13 | P14 | P15 | P16 | P17 | P18 | P19 | P20 | P21 | P22c | P22d | P22e | P22f | P22g | P22h | P22i | P22j | P22k | P22n | P22o+p | P22q | P22r | P22s | P22t | P24 | **P25.0 (current)** | meaning |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | corpus | 4417 | 4417 | 4418 | 4398 † | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | 4398 | **4398** | programs run |
 | emit-clean | 757 | 786 | 787 | 778 | 778 | 778 | 778 | 777 | 777 | 777 | 777 | 777 | 734 | 673 | 663 | 664 | 664 | 663 | 656 | 644 | 642 | 645 | 646 | 648 | 656 | 671 | 678 | 681 | 681 | 680 | 680 | 688 | 687 | 691 | 691 | 691 | **691** | emits Crystal at all (the rest refuse) ‡ |
@@ -1970,7 +2110,7 @@ program compiles but can differ on edge inputs.
 
 ## Effort to go beyond the PoC
 
-The emitter is ~720 LOC against an 88k-LOC C emitter, but the C emitter encodes
+The emitter is 6,352 LOC against an 88k-LOC C emitter, but the C emitter encodes
 decades of edge cases. A production Crystal backend would need: receiver-type-
 aware method translation (not a flat table), poly-container representation,
 non-local control-flow emulation, integer-width promotion, and the exact-output

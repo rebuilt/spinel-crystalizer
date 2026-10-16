@@ -1,0 +1,185 @@
+name: Crystal backend
+
+# The Crystal AOT backend has NO CI at all today: the C side gets a full matrix
+# of gcc/clang/macOS/-m32/wasm lanes (see ci.yml), but every phase of the
+# Crystal work so far has been validated only by a local run of the scripts in
+# scripts/crystal_*.sh. A change to the emitter's allowlist or to the boxed
+# runtime can therefore ship -- or worse, already be on master -- with the
+# refusal gate unexercised, which is how the ArgumentsNode refusal survived
+# twenty-four phases of corpus work: nothing ever compiled the emitted output.
+#
+# Three jobs, cheapest first, matching what each script actually needs:
+#
+#   reject      No Crystal needed: `bin/spinel` alone. This is the honesty gate
+#               (every unsupported construct must be REFUSED, naming it, never
+#               emitted as a placeholder). It is the one that catches a missing
+#               arm, so it runs on every push and pull request.
+#
+#   difference  Builds each ledger program with `crystal build --release` and
+#               byte-compares against CRuby. This is the one that catches a
+#               WRONG translation, which is the failure mode the refusal gate
+#               cannot see -- and the one the ArgumentsNode bug hid behind.
+#
+#   corpus      The 7,347-program corpus against the committed baseline. It is
+#               the only measure of net progress, but it needs ~800 `crystal
+#               build` invocations, so it runs on a weekly schedule and on a
+#               manual dispatch, not on every push.
+#
+# The corpus and difference jobs are the reason this workflow pins a Crystal
+# version rather than taking `latest`: the emitter's allowlist encodes what a
+# specific Crystal defines (see "Crystal 1.21 defines only Exception,
+# ArgumentError, ..." in src/codegen_crystal.c). A newer stdlib silently adds
+# methods the emitter does not know about, which moves PASSes without anyone
+# changing the backend -- so the pin makes a result reproducible, and bumping
+# it is a deliberate act: change the version, re-run the corpus gate, and
+# record the new PASS count in docs/internals/crystal-backend.md.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/codegen_crystal.c'
+      - 'src/crystal_runtime.h'
+      - 'scripts/crystal_*.sh'
+      - 'test/crystal_corpus_baseline.txt'
+      - 'docs/internals/crystal-backend.md'
+      - '.github/workflows/crystal.yml'
+  pull_request:
+    paths:
+      - 'src/codegen_crystal.c'
+      - 'src/crystal_runtime.h'
+      - 'scripts/crystal_*.sh'
+      - 'test/crystal_corpus_baseline.txt'
+      - 'docs/internals/crystal-backend.md'
+      - '.github/workflows/crystal.yml'
+  # A weekly full-corpus run. The per-push jobs catch refusals and wrong
+  # translations cheaply, but only the corpus measures the net, and a slow
+  # regresser (two phases each gaining a handful of programs while a third
+  # loses one) is invisible to both.
+  schedule:
+    - cron: '37 4 * * 0'
+  workflow_dispatch:
+
+# One run per branch: a superseding push cancels the queued one, so the result
+# that arrives is for the newest commit of the branch.
+concurrency:
+  group: crystal-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned on purpose -- see the header comment. Bump with a corpus re-run.
+  CRYSTAL_VERSION: '1.21.1'
+
+jobs:
+  # The refusal gate. Runs everywhere, with no Crystal installed: it builds
+  # spinel and asks it to REFUSE a list of constructs, checking the message.
+  # ~2s once spinel is built.
+  reject:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build spinel
+        run: make -j$(getconf _NPROCESSORS_ONLN) bin/spinel
+
+      - name: Run the Crystal refusal gate
+        run: bash scripts/crystal_reject_test.sh
+
+  # The difference ledger: every AGREE must build and byte-match CRuby, every
+  # REFUSE must be refused, every DIVERGE must still diverge. This needs
+  # Crystal, and it needs it at the pinned version.
+  difference:
+    runs-on: ubuntu-latest
+    # Ten-odd `crystal build --release` jobs, each of which costs about 10s:
+    # the emitted programs are small, but the backend's own boxed runtime and
+    # the compiler's own pipeline dominate. Measured ~3 minutes for the whole
+    # ledger on a 2-core runner, so 30 leaves room for a cold cache.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Install Crystal ${{ env.CRYSTAL_VERSION }}
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: ${{ env.CRYSTAL_VERSION }}
+          # The backend emits no shards dependency; installing them would add a
+          # network round trip and a `lib/` directory nothing reads.
+          install_shards: false
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build spinel
+        run: make -j$(getconf _NPROCESSORS_ONLN) bin/spinel
+
+      - name: Run the Crystal difference ledger
+        run: bash scripts/crystal_difference_test.sh
+
+  # The full corpus against the committed baseline. Scheduled only -- see the
+  # header. Fails only on a REGRESSION (a baseline-PASS that stopped passing);
+  # the other transitions are printed for review, exactly as the gate's own
+  # doc comment spells out.
+  corpus:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # 7,347 programs, ~800 of them built with `crystal build --release`. The
+    # script runs 16 builds at once, but a hosted runner has far fewer cores
+    # than the 32 this was measured on, so allow for a much slower machine.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Install Crystal ${{ env.CRYSTAL_VERSION }}
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: ${{ env.CRYSTAL_VERSION }}
+          install_shards: false
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build spinel
+        run: make -j$(getconf _NPROCESSORS_ONLN) bin/spinel
+
+      - name: Build the corpus program list
+        run: bash scripts/crystal_corpus_list.sh > /tmp/crystal-corpus.txt
+
+      # Each build needs its own CRYSTAL_CACHE_DIR (the script handles that), so
+      # the whole run writes a few GB under /tmp. The runner image has tens of
+      # GB free; if it ever does not, the failure is a build error per program
+      # rather than a misleading "compiler bug", which is why a shared cache
+      # was ruled out in the first place.
+      - name: Run the Crystal corpus
+        run: bash scripts/crystal_corpus.sh /tmp/crystal-corpus.txt /tmp/crystal-corpus 16
+
+      - name: Gate the corpus against the committed baseline
+        run: bash scripts/crystal_corpus_gate.sh /tmp/crystal-corpus/results.txt
+
+      - name: Keep the raw corpus run for review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crystal-corpus-results
+          path: /tmp/crystal-corpus/results.txt
+          # A results file is a few MB; keep it briefly, long enough to read a
+          # transition summary after the run.
+          retention-days: 14

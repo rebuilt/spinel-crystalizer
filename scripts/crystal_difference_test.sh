@@ -330,15 +330,102 @@ rescue RuntimeError => e
   p e.class
 end'
 
+# P25.0: valued control flow. Prism hides a return/next/break operand inside an
+# ArgumentsNode the walker did not model, so EVERY valued return/next/break was
+# refused as the bare node kind "ArgumentsNode" -- a bug, not a design limit,
+# since Crystal's return/next/break take the same value. The same context gap is
+# closed for `case`, `unless`, `while` and `until` in value position (all are
+# expressions in Crystal, and while/until answer their break value like Ruby).
+expect_agree "p25_return_value" 'def f(n)
+  return n if n < 2
+  f(n - 1) + f(n - 2)
+end
+p [0, 1, 5, 10].map { |i| f(i) }'
+
+expect_agree "p25_next_break_value" 'p [1, 2, 3].map { |x| next x * 10 if x == 2; x }
+p [1, 2, 3].each { |x| break x if x == 2 }'
+
+expect_agree "p25_case_value" 'a = 2
+p(case a
+  when 1 then :one
+  when 2, 3 then :few
+  else :many
+  end)'
+
+expect_agree "p25_unless_else_value" 'x = 2
+p(unless x > 1
+  "small"
+else
+  "big"
+end)'
+
+expect_agree "p25_while_break_value" 'n = 0
+r = while true
+  n += 1
+  break "stopped at #{n}" if n == 3
+end
+p r'
+
+# A multi-value return/next/break answers an Array in Ruby but a Tuple in Crystal,
+# so it is refused by name rather than emitted as the wrong shape.
+expect_refuse "a return/next/break with multiple values" 'def f; return 1, 2; end
+p f'
+
+# Ruby's `loop` catches StopIteration and answers its result, so `loop { e.next }`
+# ends when the Enumerator runs out. Crystal's Iterator#next answers a Stop value
+# instead of raising, so the same source never terminates -- refused rather than
+# emitted as a hang. (`e.next` outside a loop is fine: nothing observes the raise.)
+expect_refuse "Enumerator#next" 'e = [1, 2].each
+p loop { e.next }'
+
+# ---- DIVERGE: emitted, but differs from CRuby on a known edge ----------------
+# Each of these was REFUSED before P25.0 (a valued return/next/break or a
+# value-position case/unless/while was the first obstacle) and now emits. Three
+# of them land on a pre-existing gap the backend has never modelled, so they are
+# pinned here as known divergences rather than left as silent wrong answers. If
+# one ever starts agreeing, the ledger says to promote it to expect_agree.
+
+# Ruby's Hash#each yields the pair as a two-element Array when the block takes a
+# single parameter (`h.map { |pair| pair }` -> ["x", 1]); Crystal's Hash#each
+# yields a Tuple ({"x", 1}). The pair is only observable when the block body
+# looks at it, which the emitter cannot prove, so the shape is left diverging.
+expect_diverge "p25_diverge_hash_pair_is_array" \
+  "Hash#each yields a Tuple in Crystal, an Array in Ruby, for a single block param" \
+  'h = { "x" => 1, "y" => 2 }
+p h.map { |pair| pair.inspect }'
+
+# Ruby has TrueClass and FalseClass; Crystal has one Bool. `TrueClass === false`
+# is false in Ruby and true in Crystal, so a `case`/`===` on a Bool class literal
+# cannot be translated. (The other lines of the same program agree.)
+expect_diverge "p25_diverge_bool_class_identity" \
+  "Crystal has one Bool where Ruby has TrueClass and FalseClass" \
+  'b = true
+f = false
+p TrueClass === b
+p case b when TrueClass then :yes else :no end
+p FalseClass === f
+p TrueClass === f
+p Integer === 5
+p Integer === b'
+
+# Ruby's String#[] with an Integer index answers a one-character String; Crystal's
+# answers a Char. A boxed index that is sometimes a Range and sometimes an
+# Integer reaches the read as an Int, so the Char form is what gets emitted.
+expect_diverge "p25_diverge_string_index_char" \
+  "String#[] answers a Char in Crystal, a one-character String in Ruby" \
+  'def pick(i) = i.odd? ? (0..1) : 0
+p "abcdef"[pick(1)]
+p "abcdef"[pick(2)]'
+
 # ---- REFUSE: no Crystal counterpart, so refuse cleanly and name it ----------
 
-expect_refuse "ForNode"                          'for x in [1,2]; p x; end'
-expect_refuse "LambdaNode"                       'f = -> { 42 }; p f.call'
+expect_refuse "a \`for ... in\` loop"              'for x in [1,2]; p x; end'
+expect_refuse "a lambda/proc"                    'f = -> { 42 }; p f.call'
 expect_refuse "method 'proc' is not in the Crystal subset" 'f = proc { 42 }; p f.call'
 expect_refuse "method 'eval' is not in the Crystal subset" 'p eval("1+1")'
 expect_refuse "respond_to?' is not available on this receiver" 'p "a".respond_to?(:upcase)'
 # Regex backreference globals $`/$'/$& are not supported; use $~.pre_match etc.
-expect_refuse "BackReferenceReadNode"            '"a" =~ /a/; p $&'
+expect_refuse "a named regexp back-reference"     '"a" =~ /a/; p $&'
 # Data.define is a VALUE type (member-wise ==); a Crystal class compares by
 # identity, so we refuse it rather than emit a reference class that would answer
 # `==` wrong. (A plain Struct.new is a reference type and IS translated.)

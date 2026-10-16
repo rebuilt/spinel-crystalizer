@@ -74,7 +74,11 @@ typedef struct {
   int unsupported;    /* metric: constructs outside the PoC subset */
   int first_unsup;    /* node id of the first unsupported construct (-1 if none);
                          anchors the end-of-run refusal to a Ruby source line */
-  char first_why[160];/* what that first construct was, in words for the diagnostic */
+  /* 320, not 160: the reason names the construct in words, and several of the
+     existing ones (the exception-class list in particular) ran past 160 and
+     were cut mid-identifier, which both hid the reason and split the survey
+     histograms at the cut. */
+  char first_why[320];/* what that first construct was, in words for the diagnostic */
   int cur_class;      /* class_id of the method being emitted (-1 at top level);
                          lets a receiverless call resolve against the enclosing
                          class's own methods, like Ruby's implicit self */
@@ -144,6 +148,14 @@ static void cr_mark_unsupported(CrGen *g, int id, const char *why) {
     g->first_unsup = id;
     snprintf(g->first_why, sizeof g->first_why, "%s", why);
   }
+  /* Obstacle-set survey (E10): with SPINEL_CRYSTAL_WHYS=1 every unsupported
+     construct prints its own reason, so a survey can report the SET of a
+     program's obstacles rather than only the first. The run is still refused at
+     the end exactly as before; the extra lines go to stderr and are ignored by
+     the normal pipeline. */
+  static int all = -1;
+  if (all < 0) all = getenv("SPINEL_CRYSTAL_WHYS") != NULL;
+  if (all) fprintf(stderr, "spinel-crystal-why: %s\n", why);
 }
 
 /* Same as cr_mark_unsupported, for a reason that has a name in it. Building the
@@ -240,6 +252,9 @@ static int cr_param_omitted_anywhere(CrGen *g, Scope *s, int pi);
 static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent);
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_call(CrGen *g, int id, Buf *b);
+static void cr_emit_unless(CrGen *g, int id, Buf *b, int indent);
+static void cr_emit_while(CrGen *g, int id, Buf *b, int indent);
+static void cr_emit_until(CrGen *g, int id, Buf *b, int indent);
 /* The widest `yield` arity in a user method's body, or 0 when it has none. A
    block passed to such a method must declare exactly that many parameters --
    unlike the builtin iterators, which `ty_block_yield` describes. The arity is
@@ -278,6 +293,7 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
 static int cr_has_unverified_poly_call(CrGen *g);
 static void cr_emit_if(CrGen *g, int id, Buf *b, int indent);
 static void cr_emit_case(CrGen *g, int id, Buf *b, int indent);
+static int cr_subtree_calls_next(CrGen *g, int id);
 static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module);
 static void cr_emit_method(CrGen *g, Scope *s, Buf *b);
 static int cr_single_expr(const NodeTable *nt, int stmts_id);
@@ -2393,6 +2409,47 @@ static void cr_emit_hash_splat_chain(CrGen *g, const int *els, int n, Buf *b) {
   if (n == 1 && nsplat == 1) buf_puts(b, ".dup");
 }
 
+/* A human reason for a node kind the walkers do not model, so the diagnostic
+   names the construct, not a bare Prism type string. The unsupported long tail
+   keeps the Prism kind name: a maintainer greps for it in node_table.h, and a
+   kind this file does not model is usually one the parser just named. */
+static const char *cr_kind_why(NodeKind k, const char *ty) {
+  switch (k) {
+    case NK_LambdaNode:
+      return "a lambda/proc (`-> {}` / `lambda` / `proc`)";
+    case NK_CaseMatchNode:
+      return "pattern matching (`case ... in ...`)";
+    case NK_ForNode:
+      return "a `for ... in` loop";
+    case NK_DefinedNode:
+      return "`defined?`";
+    case NK_RationalNode:
+      return "a Rational literal";
+    case NK_ImaginaryNode:
+      return "a Complex (imaginary) literal";
+    case NK_InterpolatedSymbolNode:
+      return "an interpolated symbol literal";
+    case NK_XStringNode:
+      return "a backtick/command string";
+    case NK_InterpolatedXStringNode:
+      return "an interpolated backtick/command string";
+    case NK_NumberedReferenceReadNode:
+      return "a numbered regexp back-reference (`$1`..)";
+    case NK_BackReferenceReadNode:
+      return "a named regexp back-reference (`$&`, `$~`)";
+    case NK_RetryNode:
+      return "a `retry`";
+    case NK_RedoNode:
+      return "a `redo`";
+    case NK_SingletonClassNode:
+      return "`class << obj`";
+    case NK_KeywordHashNode:
+      return "a keyword-argument hash in a positional position";
+    default:
+      return ty ? ty : "expression";
+  }
+}
+
 static void cr_emit_expr(CrGen *g, int id, Buf *b) {
   if (id < 0) { buf_puts(b, "nil"); return; }
   /* Record whether THIS node's value is used (read by a call handler: a
@@ -2711,6 +2768,22 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
          statement and value position. */
       cr_emit_if(g, id, b, 0);
       return;
+    case NK_UnlessNode:
+      /* Crystal's unless is an expression too (its multiline form). */
+      cr_emit_unless(g, id, b, 0);
+      return;
+    case NK_CaseNode:
+      /* A `case` in value position (`p(case x; when ..; end)`) is an expression
+         in both languages; the statement emitter at indent 0 drops straight in. */
+      cr_emit_case(g, id, b, 0);
+      return;
+    case NK_WhileNode:
+    case NK_UntilNode:
+      /* Ruby's while/until answer their `break` value (or nil) in value
+         position; Crystal's answer the same, so the statement emitter is exact. */
+      if (k == NK_WhileNode) cr_emit_while(g, id, b, 0);
+      else                   cr_emit_until(g, id, b, 0);
+      return;
     case NK_CallNode: {
       /* Hand the flag to the call emitter ONLY for the reads that consult it --
          an index read, and `min`/`max` (whose `?` form keeps Ruby's nil-on-empty).
@@ -2816,7 +2889,7 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
          LambdaNode, ...). Emit a placeholder and record it; the run is refused at
          the end so this never ships as a silent `nil`. */
       const char *ty = nt_type(g->nt, id);
-      cr_mark_unsupported(g, id, ty ? ty : "expression");
+      cr_mark_unsupported(g, id, cr_kind_why(k, ty));
       buf_puts(b, "nil");
       return;
     }
@@ -2857,6 +2930,49 @@ static void cr_emit_if(CrGen *g, int id, Buf *b, int indent) {
   }
    cr_indent(b, indent);
    buf_puts(b, "end\n");
+}
+
+/* ---- unless (statement and expression) ----
+   Crystal's unless is an expression too, so the same emitter serves both
+   positions. */
+static void cr_emit_unless(CrGen *g, int id, Buf *b, int indent) {
+  int pred = nt_ref(g->nt, id, "predicate");
+  int then = nt_ref(g->nt, id, "statements");
+  /* Prism stores the else branch of an UnlessNode under `else_clause` (an
+     IfNode uses `subsequent`). The old code read `consequent`, found nothing,
+     and silently dropped the else -- a wrong answer, not a refusal. */
+  int cons = nt_ref(g->nt, id, "else_clause");
+  cr_indent(b, indent);
+  buf_puts(b, "unless ");
+  cr_emit_cond(g, pred, b);
+  buf_puts(b, "\n");
+  cr_emit_stmts(g, then, b, indent + 1);
+  if (cons >= 0 && nt_kind(g->nt, cons) == NK_ElseNode) {
+    int cs = nt_ref(g->nt, cons, "statements");
+    cr_indent(b, indent); buf_puts(b, "else\n");
+    cr_emit_stmts(g, cs, b, indent + 1);
+  }
+  cr_indent(b, indent); buf_puts(b, "end\n");
+}
+
+/* ---- while / until (statement and expression) ----
+   Crystal's while/until are valid in value position and answer their `break`
+   value (or nil), which is exactly Ruby's rule, so one emitter serves both. */
+static void cr_emit_while(CrGen *g, int id, Buf *b, int indent) {
+  int pred = nt_ref(g->nt, id, "predicate");
+  int body = nt_ref(g->nt, id, "statements");
+  cr_indent(b, indent); buf_puts(b, "while ");
+  cr_emit_cond(g, pred, b); buf_puts(b, "\n");
+  cr_emit_stmts(g, body, b, indent + 1);
+  cr_indent(b, indent); buf_puts(b, "end\n");
+}
+static void cr_emit_until(CrGen *g, int id, Buf *b, int indent) {
+  int pred = nt_ref(g->nt, id, "predicate");
+  int body = nt_ref(g->nt, id, "statements");
+  cr_indent(b, indent); buf_puts(b, "until ");
+  cr_emit_cond(g, pred, b); buf_puts(b, "\n");
+  cr_emit_stmts(g, body, b, indent + 1);
+  cr_indent(b, indent); buf_puts(b, "end\n");
 }
 
 /* ---- case / when / else ----
@@ -3537,6 +3653,19 @@ static int cr_emit_kernel_call(CrGen *g, const CrCall *c, Buf *b) {
     buf_puts(b, "nil");
     return 1;
   }
+  /* Ruby's `loop` runs until the block raises StopIteration, which it catches and
+     turns into loop's own value: `loop { e.next }` ends when the Enumerator runs
+     out. Crystal has no StopIteration -- Iterator#next answers a Stop value, so
+     the same source never terminates. Refuse the shape instead of emitting a
+     hang. `e.next` outside a loop is left alone: there nothing observes the
+     raise, and a bounded walk translates exactly. */
+  if (recv < 0 && sp_streq(name, "loop") && block >= 0 && cr_subtree_calls_next(g, block)) {
+    cr_mark_unsupportedf(g, id, "`loop` around an `Enumerator#next` (Ruby's loop catches the "
+                           "StopIteration and answers its result; Crystal's iterator never "
+                           "raises, so the emitted loop never ends)");
+    buf_puts(b, "nil");
+    return 1;
+  }
   return 0;
 }
 
@@ -3551,6 +3680,29 @@ static int cr_subtree_has_kind(CrGen *g, int id, NodeKind k) {
     int n = 0; const int *a = nt_arr_at(g->nt, id, i, &n);
     for (int j = 0; j < n; j++)
       if (cr_subtree_has_kind(g, a[j], k)) return 1;
+  }
+  return 0;
+}
+
+/* True when the subtree contains a zero-argument `next` call. Ruby's
+   `Enumerator#next` raises StopIteration at the end of the sequence; Crystal's
+   iterator answers a Stop value instead, so any shape that relies on the raise
+   (the one above all: `loop { e.next }`) cannot be translated. Same walk. */
+static int cr_subtree_calls_next(CrGen *g, int id) {
+  if (id < 0) return 0;
+  if (nt_kind(g->nt, id) == NK_CallNode) {
+    const char *nm = nt_str(g->nt, id, "name");
+    int args = nt_ref(g->nt, id, "arguments");
+    int n = 0;
+    if (nm && sp_streq(nm, "next") && (args < 0 || !nt_arr(g->nt, args, "arguments", &n) || n == 0))
+      return 1;
+  }
+  for (int i = 0; i < nt_num_refs(g->nt, id); i++)
+    if (cr_subtree_calls_next(g, nt_ref_at(g->nt, id, i))) return 1;
+  for (int i = 0; i < nt_num_arrs(g->nt, id); i++) {
+    int n = 0; const int *a = nt_arr_at(g->nt, id, i, &n);
+    for (int j = 0; j < n; j++)
+      if (cr_subtree_calls_next(g, a[j])) return 1;
   }
   return 0;
 }
@@ -4397,6 +4549,34 @@ static void cr_emit_stmts(CrGen *g, int body_id, Buf *b, int indent) {
   for (int i = 0; i < n; i++) cr_emit_stmt(g, arr[i], b, indent);
 }
 
+/* Emit the value tail of a `return`/`next`/`break` node. Prism stores even a
+   single operand inside an ArgumentsNode, and the expression walker has no case
+   for ArgumentsNode -- so handing it the wrapper refused EVERY valued
+   return/next/break as the bare node kind "ArgumentsNode", the wrong construct.
+   Unwrap it here: no operand is a bare keyword, one operand emits directly, and
+   two or more (Ruby answers an Array, Crystal a Tuple) is refused by name. */
+static void cr_emit_ctl_value(CrGen *g, int id, Buf *b) {
+  int args = nt_ref(g->nt, id, "arguments");
+  if (args < 0) return;
+  const char *aty = nt_type(g->nt, args);
+  if (!aty || !sp_streq(aty, "ArgumentsNode")) return;
+  int n = 0;
+  const int *av = nt_arr(g->nt, args, "arguments", &n);
+  if (!av || n == 0) return;
+  if (n > 1) {
+    cr_mark_unsupported(g, id, "a return/next/break with multiple values "
+                       "(Ruby answers an Array, Crystal a Tuple)");
+    return;
+  }
+  buf_puts(b, " ");
+  if (nt_kind(g->nt, av[0]) == NK_SplatNode) {
+    cr_mark_unsupported(g, av[0], "a splat in a return/next/break value");
+    buf_puts(b, "nil");
+    return;
+  }
+  cr_emit_expr(g, av[0], b);
+}
+
 static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
   NodeKind k = nt_kind(g->nt, id);
   switch (k) {
@@ -4650,59 +4830,30 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
     case NK_CaseNode:
       cr_emit_case(g, id, b, indent);
       return;
-    case NK_UnlessNode: {
-      int pred = nt_ref(g->nt, id, "predicate");
-      int then = nt_ref(g->nt, id, "statements");
-      int cons = nt_ref(g->nt, id, "consequent");
-      cr_indent(b, indent);
-      buf_puts(b, "unless ");
-      cr_emit_cond(g, pred, b);
-      buf_puts(b, "\n");
-      cr_emit_stmts(g, then, b, indent + 1);
-      if (cons >= 0 && nt_kind(g->nt, cons) == NK_ElseNode) {
-        int cs = nt_ref(g->nt, cons, "statements");
-        cr_indent(b, indent); buf_puts(b, "else\n");
-        cr_emit_stmts(g, cs, b, indent + 1);
-      }
-      cr_indent(b, indent); buf_puts(b, "end\n");
+    case NK_UnlessNode:
+      cr_emit_unless(g, id, b, indent);
       return;
-    }
-    case NK_WhileNode: {
-      int pred = nt_ref(g->nt, id, "predicate");
-      int body = nt_ref(g->nt, id, "statements");
-      cr_indent(b, indent); buf_puts(b, "while ");
-      cr_emit_cond(g, pred, b); buf_puts(b, "\n");
-      cr_emit_stmts(g, body, b, indent + 1);
-      cr_indent(b, indent); buf_puts(b, "end\n");
+    case NK_WhileNode:
+      cr_emit_while(g, id, b, indent);
       return;
-    }
-    case NK_UntilNode: {
-      int pred = nt_ref(g->nt, id, "predicate");
-      int body = nt_ref(g->nt, id, "statements");
-      cr_indent(b, indent); buf_puts(b, "until ");
-      cr_emit_cond(g, pred, b); buf_puts(b, "\n");
-      cr_emit_stmts(g, body, b, indent + 1);
-      cr_indent(b, indent); buf_puts(b, "end\n");
+    case NK_UntilNode:
+      cr_emit_until(g, id, b, indent);
       return;
-    }
     case NK_ReturnNode: {
-      int args = nt_ref(g->nt, id, "arguments");
       cr_indent(b, indent); buf_puts(b, "return");
-      if (args >= 0) { buf_puts(b, " "); cr_emit_expr(g, args, b); }
+      cr_emit_ctl_value(g, id, b);
       buf_puts(b, "\n");
       return;
     }
     case NK_NextNode: {
-      int args = nt_ref(g->nt, id, "arguments");
       cr_indent(b, indent); buf_puts(b, "next");
-      if (args >= 0) { buf_puts(b, " "); cr_emit_expr(g, args, b); }
+      cr_emit_ctl_value(g, id, b);
       buf_puts(b, "\n");
       return;
     }
     case NK_BreakNode: {
-      int args = nt_ref(g->nt, id, "arguments");
       cr_indent(b, indent); buf_puts(b, "break");
-      if (args >= 0) { buf_puts(b, " "); cr_emit_expr(g, args, b); }
+      cr_emit_ctl_value(g, id, b);
       buf_puts(b, "\n");
       return;
     }
