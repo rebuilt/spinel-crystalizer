@@ -64,6 +64,22 @@ typedef struct {
                          even one whose analyzer kind is TY_POLY_ARRAY before the
                          object-array narrowing -- must not. Keyed by name so the
                          decision matches the container actually emitted. */
+  NameSet poly_hashes;/* locals declared Hash(SpValue, SpValue) (a widened empty
+                         `{}` or `Hash.new`): a store to one boxes the key AND
+                         the value, and an index read boxes the key. Keyed by
+                         name for the same reason as poly_arrays. */
+  NameSet poly_elems; /* block parameters bound to an ELEMENT of a pinned wide
+                         container: the yielded value is the SpValue itself (a
+                         `map` over `banks` yields `b : SpValue`), so reads of
+                         one dispatch through the seam. Kept apart from
+                         poly_arrays: a container holder is a NAKED crystal
+                         container whose own methods answer natively, while an
+                         element holder IS an SpValue and needs `sp_send`. */
+  NameSet returns_boxed;/* user methods whose every return path answers a
+                         pinned-container ELEMENT (an SpValue), keyed by the
+                         resolved callee scope. A call whose callee is here is
+                         itself an SpValue, so a call on IT dispatches through
+                         the seam (`p c.bank(2).n`). */
   NameSet boxed_locals;/* locals declared `x : SpValue` by the P22b boxing path.
                          A read of one is unboxed where the analyzer narrowed it
                          to a concrete type. A poly PARAMETER is not here: it is
@@ -188,6 +204,15 @@ static void nameset_add(NameSet *s, const char *name) {
   }
   s->names[s->n++] = (char *)name;
 }
+/* Same, but owning the string: composed keys would otherwise dangle. */
+static void nameset_add_copy(NameSet *s, const char *name) {
+  char *dup;
+  if (!name || nameset_has(s, name)) return;
+  dup = malloc(strlen(name) + 1);
+  if (!dup) return;
+  strcpy(dup, name);
+  nameset_add(s, dup);
+}
 /* Save the current depth so a nested scope (method/block) can be popped back.
    Both the declared-local and the boxed-local sets are stacked together. */
 typedef struct { int locals_n, boxed_n; } ScopeMark;
@@ -246,6 +271,15 @@ static void cr_pop_scope(CrGen *g, ScopeMark m) {
 static void cr_emit_expr(CrGen *g, int id, Buf *b);
 static TyKind cr_ivar_type(CrGen *g, const char *name);
 static int cr_user_method_ok(CrGen *g, const char *name, TyKind rt, int bare);
+static int cr_empty_literal_kind(CrGen *g, int id);
+static int cr_pin_has(CrGen *g, NameSet *s, int node, const char *name);
+static void cr_pin_add_scope(CrGen *g, NameSet *s, Scope *sc, const char *name);
+static int cr_pin_has_ivar(CrGen *g, NameSet *s, int node);
+static void cr_pin_add_ivar(CrGen *g, NameSet *s, const char *name);
+static int cr_ivar_empty_pin(CrGen *g, ClassInfo *ci, const char *name);
+static Scope *cr_callee_scope(CrGen *g, const char *name, TyKind rt, int bare);
+static void cr_pin_scope_key(char *out, size_t n, Scope *sc, const char *name);
+static int cr_map_type(CrGen *g, TyKind t, Buf *b);
 /* True when some visible call site of a scope omits positional param `pi`
    (defined below, near the class-body scans). */
 static int cr_param_omitted_anywhere(CrGen *g, Scope *s, int pi);
@@ -636,17 +670,86 @@ static TyKind cr_local_type(CrGen *g, int id, const char *name) {
   return lv ? lv->type : TY_UNKNOWN;
 }
 
-/* True when a receiver node emits an SpValue: a read of a poly local, which the
-   local-slot half of P22 boxes. A poly COMPOUND (`if`/`case`) emits a raw union,
-   not an SpValue, so `cr_is_poly(comp_ntype)` alone cannot decide whether
-   boxed dispatch applies -- using it there called `sp_send`/`sp_nil?` on a
-   union (`undefined method 'sp_send' for Array(String)`). */
-static int cr_recv_boxed(CrGen *g, int recv) {
-  if (recv < 0 || !CR_POLY_LOCALS) return 0;
-  if (nt_kind(g->nt, recv) != NK_LocalVariableReadNode) return 0;
-  const char *rn = nt_str(g->nt, recv, "name");
-  return rn && cr_is_poly(cr_local_type(g, recv, rn));
+/* True when `id` is a plain single-index read (`a[i]` / `h[k]`) -- the index
+   read that hands back an element/key value rather than a slice (`a[1..2]`,
+   `a[i, j]`, `s[re, 1]`). */
+static int argc_1_index_read(CrGen *g, int id) {
+  const char *nm = nt_str(g->nt, id, "name");
+  if (!nm || !sp_streq(nm, "[]")) return 0;
+  int argc = 0;
+  call_args(g->nt, id, &argc);
+  if (argc != 1) return 0;
+  int argv = -1;
+  const int *args = call_args(g->nt, id, &argc);
+  if (!args) return 0;
+  argv = args[0];
+  return nt_kind(g->nt, argv) != NK_RangeNode;
 }
+
+/* True when a receiver node emits an SpValue: a read of a poly local -- which
+   the local-slot half of P22 boxes by TYPE, either a nameset-pinned wide
+   container holder or a plain poly local -- dispatches through the seam; a
+   poly COMPOUND (`if`/`case`) emits a raw union, not an SpValue, so
+   `cr_is_poly(comp_ntype)` alone cannot decide whether boxed dispatch applies
+   -- using it there called `sp_send`/`sp_nil?` on a union (`undefined method
+   'sp_send' for Array(String)`).
+   From the container rung: an INDEX READ out of a registered wide container
+   (Array(SpValue) / Hash(SpValue, SpValue)) also hands back an SpValue, so a
+   receiver like `banks[0].n` must dispatch through the runtime seam exactly
+   like a poly local does. */
+static int cr_recv_boxed(CrGen *g, int recv) {
+  if (recv < 0) return 0;
+  /* A pinned ivar container is a boxed carrier: its own is the declared
+     Array(SpValue)/Hash(...), agreed between the decl annotation and the init
+     literal by the empty-pin scans on both sides. */
+  if (nt_kind(g->nt, recv) == NK_InstanceVariableReadNode) {
+    return cr_pin_has_ivar(g, &g->poly_arrays, recv) ||
+           cr_pin_has_ivar(g, &g->poly_hashes, recv);
+  }
+  if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
+    const char *rn = nt_str(g->nt, recv, "name");
+    if (rn && cr_pin_has(g, &g->poly_elems, recv, rn))
+      return 1;
+    if (rn && (cr_pin_has(g, &g->poly_arrays, recv, rn) ||
+               cr_pin_has(g, &g->poly_hashes, recv, rn)))
+      return 1;
+    return CR_POLY_LOCALS && rn && cr_is_poly(cr_local_type(g, recv, rn));
+  }
+  /* A call whose callee answers a pinned-container ELEMENT is itself an
+     SpValue: a call on IT dispatches (`c.bank(2).n`). The scoped key guards
+     against a same-named method elsewhere with a different return nature.
+     Misses fall through to the aref/empty-literal checks below. */
+  if (CR_POLY_CONTAINERS && nt_kind(g->nt, recv) == NK_CallNode) {
+    const char *cn = nt_str(g->nt, recv, "name");
+    if (cn) {
+      int cr0 = nt_ref(g->nt, recv, "receiver");
+      Scope *cs = cr_callee_scope(g, cn,
+                                  cr0 >= 0 ? comp_ntype(g->c, cr0) : TY_UNKNOWN,
+                                  cr0 < 0);
+      if (cs) {
+        char k[160];
+        cr_pin_scope_key(k, sizeof k, cs, cn);
+        if (nameset_has(&g->returns_boxed, k)) return 1;
+      }
+    }
+  }
+  if (CR_POLY_CONTAINERS && nt_kind(g->nt, recv) == NK_CallNode &&
+      sp_streq(nt_str(g->nt, recv, "name"), "[]") && argc_1_index_read(g, recv)) {
+    int arecv = nt_ref(g->nt, recv, "receiver");
+    if (nt_kind(g->nt, arecv) == NK_LocalVariableReadNode) {
+      const char *rn = nt_str(g->nt, arecv, "name");
+      return rn && (cr_pin_has(g, &g->poly_arrays, arecv, rn) ||
+                    cr_pin_has(g, &g->poly_hashes, arecv, rn));
+    }
+    if (nt_kind(g->nt, arecv) == NK_InstanceVariableReadNode) {
+      return cr_pin_has_ivar(g, &g->poly_arrays, arecv) ||
+             cr_pin_has_ivar(g, &g->poly_hashes, arecv);
+    }
+    return cr_empty_literal_kind(g, arecv) != 0;
+  }
+  return 0;
+}
+
 
 /* True when `id` emits an SpValue already, so a boundary box must NOT wrap it
    again. That is a boxed local read (CR_POLY_LOCALS) or a boxed ivar read whose
@@ -742,6 +845,312 @@ static int cr_param_poly(Scope *callee, int idx) {
   const char *pn = callee->pnames ? callee->pnames[idx] : NULL;
   LocalVar *lv = pn ? scope_local(callee, pn) : NULL;
   return lv && cr_is_poly(lv->type);
+}
+
+/* The scope-composed key for the pin-flow pre-pass's registrations. The decl
+   wedges register the BARE name (P21's own shipped policy, which a nested
+   block's push must still see), so the pre-pass must NOT -- two callees'
+   `memo` parameters are different slots: `def fill(memo)` gets Int pushes and
+   `def spread(xs, memo)` a pinned container. The pre-pass therefore registers
+   under "<scope>@<name>", where the scope pointer text is stable for one
+   compile; every gate checks both forms, so a wedge-backed pin and a
+   flow-backed pin can coexist without one widening the other's pushes. */
+static void cr_pin_scope_key(char *out, size_t n, Scope *sc, const char *name) {
+  snprintf(out, n, "%lu@%s", (unsigned long)(size_t)sc, name ? name : "");
+}
+static void cr_pin_add_scope(CrGen *g, NameSet *s, Scope *sc, const char *name) {
+  if (!sc || !name) return;
+  /* NameSet stores the pointer verbatim: the key must outlive the set. */
+  char k[160];
+  cr_pin_scope_key(k, sizeof k, sc, name);
+  nameset_add_copy(s, k);
+}
+/* The empty-literal pin for a class's ivar: the first `@x = []` write inside a
+   method of THIS class whose value is a bare empty container pins the ivar to
+   the boxed spelling. The decl emitter must answer the SAME question the init
+   writer answers, or Crystal rejects the class with
+   "instance variable '@x' of C must be Array(Rom), not Array(SpValue)" -- the
+   decl's own narrowing (an object-array kind from the index stores) and the
+   boxed init disagreed exactly there. Writes are attributed by the scope's
+   owning class (Scope.class_id), matching every other ivar consult. Returns
+   0/1/2 like cr_empty_literal_kind. */
+static int cr_ivar_empty_pin(CrGen *g, ClassInfo *ci, const char *name) {
+  if (!ci || !name) return 0;
+  int cidx = (int)(ci - g->c->classes);
+  if (cidx < 0 || cidx >= g->c->nclasses) return 0;
+  for (int id = 0; id < g->nt->count; id++) {
+    if (nt_kind(g->nt, id) != NK_InstanceVariableWriteNode) continue;
+    const char *wn = nt_str(g->nt, id, "name");
+    if (!wn || !sp_streq(wn, name)) continue;
+    Scope *sc = comp_scope_of(g->c, id);
+    if (!sc || sc->class_id != cidx) continue;
+    int k = cr_empty_literal_kind(g, nt_ref(g->nt, id, "value"));
+    if (k) return k;
+  }
+  return 0;
+}
+
+/* The class-scoped key for pinned IVARS: an ivar name repeats across classes,
+   so a bare name cannot key one. `cur_class` is the same context every ivar
+   write and read resolves through (cr_ivar_type), so the key is stable for one
+   compile and does not collide with the "%lu@%s" scope keys above. */
+static void cr_pin_ivar_key(char *out, size_t n, CrGen *g, const char *name) {
+  snprintf(out, n, "c%d@%s", g->cur_class, name ? name : "");
+}
+static void cr_pin_add_ivar(CrGen *g, NameSet *s, const char *name) {
+  if (g->cur_class < 0 || !name) return;
+  char k[160];
+  cr_pin_ivar_key(k, sizeof k, g, name);
+  nameset_add_copy(s, k);
+}
+static int cr_pin_has_ivar(CrGen *g, NameSet *s, int node) {
+  const char *rn = nt_str(g->nt, node, "name");
+  if (!rn) return 0;
+  if (g->cur_class >= 0) {
+    char k[160];
+    cr_pin_ivar_key(k, sizeof k, g, rn);
+    if (nameset_has(s, k)) return 1;
+  }
+  /* A consult before body emission (the pin-flow pre-pass) has no registration
+     to read: fall back to the same write-scan the decl emitter uses, and keep
+     the set question honest -- an array pin does not answer a hash consult. */
+  Scope *sc = comp_scope_of(g->c, node);
+  int cid = sc ? sc->class_id : -1;
+  if (cid < 0 || cid >= g->c->nclasses) return 0;
+  int want = (s == &g->poly_hashes) ? 2 : 1;
+  return cr_ivar_empty_pin(g, &g->c->classes[cid], rn) == want;
+}
+/* Gate-side check: the decl wedges' bare name, or a flow-pre-pass's scoped
+   key for the node's own scope. */
+static int cr_pin_has(CrGen *g, NameSet *s, int node, const char *name) {
+  if (!name) return 0;
+  if (nameset_has(s, name)) return 1;
+  Scope *sc = comp_scope_of(g->c, node);
+  if (!sc) return 0;
+  char k[160];
+  cr_pin_scope_key(k, sizeof k, sc, name);
+  return nameset_has(s, k);
+}
+
+/* True when the receiver node is pinned to the boxed container spelling: a
+   registered wide container (the wedge or a flow pre-pass pin) or a bare empty
+   literal (which emits Array(SpValue)/Hash(SpValue, SpValue) directly). */
+static int cr_receiver_is_pinned(CrGen *g, int recv) {
+  if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
+    const char *rn = nt_str(g->nt, recv, "name");
+    return rn && (cr_pin_has(g, &g->poly_arrays, recv, rn) ||
+                  cr_pin_has(g, &g->poly_hashes, recv, rn));
+  }
+  return cr_empty_literal_kind(g, recv) != 0;
+}
+
+/* What a bare container literal creates, and therefore what a slot receiving it
+   must carry: 0 = not a pinned empty literal, 1 = empty array (emitted as
+   Array(SpValue)), 2 = empty hash (emitted as Hash(SpValue, SpValue)). The kind
+   consults the analyzer the same way the empty-literal emit site does: an empty
+   `[]` whose element kind resolved to a concrete Crystal type emits
+   `Array(T).new`, not the boxed form, so it never pins a flow to SpValues.
+   Checking the same predicate keeps registration and emission consistent. */
+static int cr_empty_literal_kind(CrGen *g, int id) {
+  if (id < 0) return 0;
+  NodeKind k = nt_kind(g->nt, id);
+  if (k == NK_ParenthesesNode)
+    return cr_empty_literal_kind(g, nt_ref(g->nt, id, "body"));
+  int n = 0;
+  if (k == NK_ArrayNode) {
+    nt_arr(g->nt, id, "elements", &n);
+    if (n != 0) return 0;
+    Buf el; memset(&el, 0, sizeof el);
+    int c = cr_array_elem_type(g, comp_ntype(g->c, id), &el);
+    free(el.p);
+    return c ? 0 : 1;
+  }
+  if (k == NK_HashNode) {
+    nt_arr(g->nt, id, "elements", &n);
+    if (n != 0) return 0;
+    Buf ht; memset(&ht, 0, sizeof ht);
+    int c = cr_map_type(g, comp_ntype(g->c, id), &ht);
+    free(ht.p);
+    return c ? 0 : 2;
+  }
+  return 0;
+}
+
+/* What a pinned-container flow binds its target slot to: a bare empty literal
+   by kind (the concrete-pinned kinds excluded -- see the emit-site consult), or
+   a read of a method PARAMETER whose analyzer slot the pinning already left a
+   poly container (TY_POLY_ARRAY / TY_POLY_POLY_HASH). The parameter rule is
+   scope-free by instinct but safe: the slot type itself is per-callee scope
+   state, so `def fill(memo)` with an Int slot and `def spread(xs, memo)` with a
+   poly slot disagree correctly -- a bare-name nameset alone would pin both.
+   A poly LOCAL's slot is deliberately skipped: a heterogeneous literal local
+   keeps its Crystal union and its pushes must stay unboxed (the P22b pin). */
+static int cr_pin_flow_kind(CrGen *g, int id) {
+  int k = cr_empty_literal_kind(g, id);
+  if (k) return k;
+  if (nt_kind(g->nt, id) == NK_LocalVariableReadNode) {
+    const char *n = nt_str(g->nt, id, "name");
+    if (n) {
+      Scope *sc = comp_scope_of(g->c, id);
+      LocalVar *lv = scope_local(sc, n);
+      if (lv && lv->is_param) {
+        if (lv->type == TY_POLY_ARRAY) return 1;
+        if (lv->type == TY_POLY_POLY_HASH) return 2;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Pre-pass before emission: a value-position empty container literal is emitted
+   in the boxed spelling, so every flow CARRYING it into a callee must hold the
+   boxed type there too. The decl wedges register the visible `a = []` binding,
+   but a literal passed INTO a call pins the callee's parameter -- `f([])` under
+   `def fill(memo); memo << 1; end` must make the pushes onto `memo` box, since
+   otherwise Crystal's inference restricts `memo` to concrete element unions and
+   the call fails. For each call whose positional argument is a bare empty
+   literal, register that parameter's name in the matching nameset; the push and
+   index-write gates then box at the boundary.
+   Name-only registration (the poly_arrays pattern): a collision between scopes
+   boxes a concrete push and fails to build -- an honest BUILDFAIL whose sites
+   the corpus fallout identifies, never a silent wrong answer. Calls into the
+   "__"-prefixed synthesized methods are skipped with their bodies. */
+/* True when `e' (a method-value expression) is a pinned-container ELEMENT:
+   the value the caller receives is the SpValue itself, so a call on it must
+   dispatch through the seam. cr_recv_boxed answers 1 for both sides of this
+   question -- an SpValue element (an aref of a pinned container) AND the naked
+   container itself (a read of a pinned local) -- so this asks it only for the
+   expression SHAPES whose boxed value is an element: the index read of a
+   pinned container, and a call whose callee is already registered (chained
+   boundaries). */
+static int cr_returns_spvalue(CrGen *g, int e) {
+  if (e < 0) return 0;
+  if (nt_kind(g->nt, e) == NK_CallNode) {
+    if (cr_recv_boxed(g, e) && sp_streq(nt_str(g->nt, e, "name"), "[]")) return 1;
+    const char *cn = nt_str(g->nt, e, "name");
+    if (cn) {
+      Scope *cs = cr_callee_scope(g, cn,
+                                  nt_ref(g->nt, e, "receiver") >= 0
+                                      ? comp_ntype(g->c, nt_ref(g->nt, e, "receiver"))
+                                      : TY_UNKNOWN,
+                                  nt_ref(g->nt, e, "receiver") < 0);
+      if (cs) {
+        char k[160];
+        cr_pin_scope_key(k, sizeof k, cs, cn);
+        if (nameset_has(&g->returns_boxed, k)) return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Whole-method pre-pass: a user method whose EVERY return path answers a
+   pinned-container element (explicit `return e` plus the implicit tail) hands
+   its caller an SpValue, and the caller's read of the call must dispatch that
+   way too (`p c.bank(2).n` -- without the seam the `.n` emits raw on a boxed
+   value). Registered under the resolved callee's scope, so a same-named
+   method on two classes with different return natures cannot cross-box.
+   Rounds run to a fixpoint so a method may return through another. */
+static void cr_scan_returns_boxed(CrGen *g) {
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (int si = 1; si < g->c->nscopes; si++) {
+      Scope *s = &g->c->scopes[si];
+      if (s->def_node < 0 || !s->name || s->name[0] == '_') continue;
+      if (s->is_proc_form) continue;
+      char k[160];
+      cr_pin_scope_key(k, sizeof k, s, s->name);
+      if (nameset_has(&g->returns_boxed, k)) continue;
+      int all_spv = 1, any_path = 0;
+      for (int id = 0; id < g->nt->count; id++) {
+        if (nt_kind(g->nt, id) != NK_ReturnNode) continue;
+        Scope *rs = comp_scope_of(g->c, id);
+        if (rs != s) continue;
+        any_path = 1;
+        int args = nt_ref(g->nt, id, "arguments");
+        int aval = -1;
+        if (args >= 0 && sp_streq(nt_type(g->nt, args), "ArgumentsNode")) {
+          int an = 0;
+          const int *av = nt_arr(g->nt, args, "arguments", &an);
+          if (an == 1) aval = av[0];
+        }
+        if (aval < 0 || !cr_returns_spvalue(g, aval)) { all_spv = 0; break; }
+      }
+      /* the implicit tail: the method body's last statement */
+      if (all_spv && s->body >= 0) {
+        int bn = 0;
+        const int *ba = nt_arr(g->nt, s->body, "body", &bn);
+        if (bn > 0) {
+          any_path = 1;
+          if (!cr_returns_spvalue(g, ba[bn - 1])) all_spv = 0;
+        }
+      }
+      if (all_spv && any_path) {
+        nameset_add_copy(&g->returns_boxed, k);
+        changed = 1;
+      }
+    }
+  }
+}
+
+static void cr_scan_pin_flow(CrGen *g) {
+  for (int id = 0; id < g->nt->count; id++) {
+    if (nt_kind(g->nt, id) != NK_CallNode) continue;
+    const char *nm = nt_str(g->nt, id, "name");
+    if (!nm) continue;
+    int recv = nt_ref(g->nt, id, "receiver");
+    int argc = 0; const int *argv = call_args(g->nt, id, &argc);
+    Scope *callee = cr_callee_scope(g, nm,
+                                    recv < 0 ? TY_UNKNOWN : comp_ntype(g->c, recv),
+                                    recv < 0);
+    if (!callee || !callee->pnames) continue;
+    if (callee->name && callee->name[0] == '_' && callee->name[1] == '_') continue;
+    for (int a = 0; a < argc && a < callee->nparams; a++) {
+      int kind = cr_pin_flow_kind(g, argv[a]);
+      if (!kind) continue;
+      const char *pn = callee->pnames[a];
+      if (!pn) continue;
+      cr_pin_add_scope(g, kind == 1 ? &g->poly_arrays : &g->poly_hashes, callee, pn);
+    }
+    /* Yield flow: a `yield e` in the callee hands its value to the block
+       parameter, at the same position, of every call site that passes a block,
+       so a pinned container flowing out binds the block parameter to the boxed
+       form and pushes onto it box too (`f([]) { |m| m << 3 }`). Non-block call
+       sites need nothing: only a block binds parameter names. */
+    int blk = nt_ref(g->nt, id, "block");
+    if (blk < 0) continue;
+    int params = nt_ref(g->nt, blk, "parameters");
+    int bpn = 0; const int *bpreqs = NULL;
+    if (params >= 0 && sp_streq(nt_type(g->nt, params), "BlockParametersNode")) {
+      int inner = nt_ref(g->nt, params, "parameters");
+      if (inner >= 0) bpreqs = nt_arr(g->nt, inner, "requireds", &bpn);
+    } else if (params >= 0 && sp_streq(nt_type(g->nt, params), "ParametersNode")) {
+      bpreqs = nt_arr(g->nt, params, "requireds", &bpn);
+    }
+    if (!bpreqs) continue;
+    for (int y = 0; y < g->nt->count; y++) {
+      if (nt_kind(g->nt, y) != NK_YieldNode) continue;
+      if (comp_scope_of(g->c, y) != callee) continue;
+      int yargc = 0; const int *yargs = call_args(g->nt, y, &yargc);
+      for (int j = 0; j < yargc && j < bpn; j++) {
+        int kind = cr_pin_flow_kind(g, yargs[j]);
+        if (!kind) continue;
+        const char *bn = nt_str(g->nt, bpreqs[j], "name");
+        if (bn) {
+          /* Comp_scope_of on the parameters node answers a different scope
+             than the body's reads answer; the body is the one the gate sees. */
+          Scope *bs = comp_scope_of(g->c, bpreqs[j]);
+          Scope *bs2 = comp_scope_of(g->c, nt_ref(g->nt, blk, "body"));
+          if (bs != bs2) bs = bs2;
+          cr_pin_add_scope(g, kind == 1 ? &g->poly_arrays : &g->poly_hashes, bs, bn);
+        }
+      }
+    }
+  }
+  /* After the container flows so chained `return f()` boundaries resolve in the
+     fixpoint rounds (cr_scan_returns_boxed). */
+  cr_scan_returns_boxed(g);
 }
 
 /* True when `id` emits as a value that a Crystal operator will try to resolve
@@ -2622,17 +3031,22 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
            annotation form and only parses as a whole expression, so it is a
            syntax error the moment the array is a method receiver
            (`[] of T.zip()`); `Array(T).new` is the same value in expression
-           position. A poly element type has no Crystal spelling at all. */
+           position. When the analyzer pinned the element kind (a local whose
+           pushes resolved it) the concrete spelling is used; otherwise the
+           literal answers in the boxed container Array(SpValue), which every
+           Ruby value boxes into and renders Ruby-exactly (probed: push with
+           sp_box, index store, size/empty?, aref, `p`). A read of it yields an
+           SpValue, so an operator use (a[0] + 1) or a concrete-boundary feed is
+           an honest BUILDFAIL, not a silent wrong answer -- the corpus fallout
+           names those sites for the next rung. */
         Buf el; memset(&el, 0, sizeof el);
-        if (!cr_array_elem_type(g, comp_ntype(g->c, id), &el)) {
-          cr_mark_unsupported(g, id, "empty array with a poly/unknown element type "
-                                    "(Crystal 1.21 has no untyped type)");
+        if (cr_array_elem_type(g, comp_ntype(g->c, id), &el)) {
+          buf_printf(b, "Array(%s).new", el.p);
           free(el.p);
-          buf_puts(b, "[] of Int64");
           return;
         }
-        buf_printf(b, "Array(%s).new", el.p);
         free(el.p);
+        buf_puts(b, "Array(SpValue).new");
         return;
       }
       /* A non-empty literal keeps its own element types (Crystal types a
@@ -2649,17 +3063,21 @@ static void cr_emit_expr(CrGen *g, int id, Buf *b) {
       if (n == 0) {
         /* As with an empty array literal, Crystal has no element type to infer
            and its `{} of K => V` spelling is annotation-only, so use the
-           expression-position constructor. A poly hash has no Crystal type. */
+           expression-position constructor. A first-binding local pins K/V from
+           its first store (the Hash.new wedge below); when neither is a
+           concrete Crystal type the hash answers in the boxed
+           Hash(SpValue, SpValue), whose stores and reads carry SpValues -- a
+           raw store or an operator on a boxed read stays an honest BUILDFAIL
+           (the corpus fallout names those sites). The Hash#inspect rewrite
+           below unboxes keys so rendering stays Ruby-exact for symbol labels. */
         Buf ht; memset(&ht, 0, sizeof ht);
-        if (!cr_map_type(g, comp_ntype(g->c, id), &ht)) {
-          cr_mark_unsupported(g, id, "empty hash with a poly/unknown key or value type "
-                                    "(Crystal 1.21 has no untyped type)");
+        if (cr_map_type(g, comp_ntype(g->c, id), &ht)) {
+          buf_printf(b, "%s.new", ht.p);
           free(ht.p);
-          buf_puts(b, "{ }");
           return;
         }
-        buf_printf(b, "%s.new", ht.p);
         free(ht.p);
+        buf_puts(b, "Hash(SpValue, SpValue).new");
         return;
       }
       /* A non-empty hash literal also keeps its own key/value types (Crystal
@@ -3031,12 +3449,20 @@ static void cr_emit_case(CrGen *g, int id, Buf *b, int indent) {
    (already `SpValue` when the container is widened). A concrete `pt` unboxes
    through the runtime; a widened `pt` (or an unresolved one) is the identity.
    The types match Crystal's `sp_unbox_*` helpers. */
-static void cr_emit_block_unbox(Buf *b, const char *dst, const char *src, TyKind pt) {
+static void cr_emit_block_unbox(CrGen *g, Buf *b, const char *dst, const char *src, TyKind pt) {
   if (pt == TY_INT)         buf_printf(b, "%s = sp_unbox_i(%s)\n", dst, src);
   else if (pt == TY_FLOAT)  buf_printf(b, "%s = sp_unbox_f(%s)\n", dst, src);
   else if (pt == TY_STRING || pt == TY_STRBUF) buf_printf(b, "%s = sp_unbox_s(%s)\n", dst, src);
   else if (pt == TY_SYMBOL) buf_printf(b, "%s = sp_unbox_sym(%s)\n", dst, src);
   else if (pt == TY_BOOL)   buf_printf(b, "%s = sp_unbox_b(%s)\n", dst, src);
+  else if (ty_is_object(pt)) {
+    /* A user-class block parameter over a pinned container binds its stored
+       object directly, so the call sites keep their concrete methods. */
+    int ci = ty_object_class(pt);
+    const char *cn = (ci >= 0 && ci < g->c->nclasses) ? g->c->classes[ci].name : NULL;
+    if (cn) buf_printf(b, "%s = sp_unbox_as(%s, %s)\n", dst, src, cn);
+    else    buf_printf(b, "%s = %s\n", dst, src);
+  }
   else                      buf_printf(b, "%s = %s\n", dst, src);
 }
 
@@ -3079,10 +3505,18 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
      is on the receiver being the widened array kind itself, so a future
      Hash(..., SpValue) mapping cannot accidentally enable it. ty_block_yield is
      the source of truth for the yield arity. */
+  /* A PINNED wide container yields SpValues even when the analyzer's kind for
+     the slot is a narrowed object-array kind (a `banks` local registered by the
+     empty-literal rung while its slot narrowed to TY_OBJ_ARRAY): the query runs
+     on TY_POLY_ARRAY for those so the yield protocol is found, and the block
+     binding follows what will RUN, not the analyzer's kind. */
+  int recv_pinned = recv >= 0 && CR_POLY_CONTAINERS && cr_receiver_is_pinned(g, recv);
   TyKind yt[4]; memset(yt, 0, sizeof yt);
-  int nyield = (recv >= 0 && meth) ? ty_block_yield(recv_ty, meth, yt, 4) : 0;
+  int nyield = (recv >= 0 && meth)
+                   ? ty_block_yield(recv_pinned ? TY_POLY_ARRAY : recv_ty, meth, yt, 4)
+                   : 0;
   int widen_block = CR_POLY_CONTAINERS && pn == 1 && nyield == 1 &&
-                    recv_ty == TY_POLY_ARRAY && yt[0] == TY_POLY;
+                    ((recv_ty == TY_POLY_ARRAY && yt[0] == TY_POLY) || recv_pinned);
 
   /* Ruby auto-splats only when the block asks for more values than the iterator
      yields. A parenthesized `|(a, b)|` was already desugared upstream into a
@@ -3137,7 +3571,14 @@ static void cr_emit_block(Buf *b, CrGen *g, int block, int indent, int recv,
     LocalVar *lv = rn ? scope_local(comp_scope_of(g->c, block), rn) : NULL;
     TyKind pt = lv ? lv->type : TY_UNKNOWN;
     cr_indent(b, indent + 1);
-    if (yt[0] == TY_POLY) cr_emit_block_unbox(b, cr_local(rn), elem, pt);
+    if (yt[0] == TY_POLY || recv_pinned) {
+      /* An unresolved (TY_POLY) block param over a pinned container holds the
+         SpValue itself: bind its reads to the dispatch seam. It registers in
+         poly_elems, not poly_arrays -- it is an element holder, not a container. */
+      if (recv_pinned && pt == TY_POLY)
+        cr_pin_add_scope(g, &g->poly_elems, comp_scope_of(g->c, body), rn);
+      cr_emit_block_unbox(g, b, cr_local(rn), elem, pt);
+    }
     else                  buf_printf(b, "%s = %s\n", cr_local(rn), elem);
   }
   /* The last statement of a block body is the block's return value, not a
@@ -3510,9 +3951,26 @@ static int cr_emit_binop_call(CrGen *g, const CrCall *c, Buf *b) {
 static int cr_emit_poly_call(CrGen *g, const CrCall *c, Buf *b) {
   int id = c->id; const char *name = c->name; int recv = c->recv;
   int argc = c->argc; const int *argv = c->argv; int block = c->block;
+  /* A pinned-container holder is a NAKED Array(SpValue) / Hash(...) local, not
+     an SpValue: its own methods (size, empty?, min, max, nil?, ...) answer
+     through Crystal's real forms, and its pushes/[]=/[] go through the box arms
+     below. The SpValue dispatch seam must not claim calls on it -- emitting
+     `m.sp_send("<<", ...)` on a raw container is a build error, not a dispatch. */
+  int container_holder = 0;
+  if (CR_POLY_CONTAINERS && recv >= 0 &&
+      (nt_kind(g->nt, recv) == NK_LocalVariableReadNode ||
+       nt_kind(g->nt, recv) == NK_InstanceVariableReadNode)) {
+    const char *rn = nt_str(g->nt, recv, "name");
+    container_holder = rn && ((nt_kind(g->nt, recv) == NK_LocalVariableReadNode &&
+                               (cr_pin_has(g, &g->poly_arrays, recv, rn) ||
+                                cr_pin_has(g, &g->poly_hashes, recv, rn))) ||
+                              (nt_kind(g->nt, recv) == NK_InstanceVariableReadNode &&
+                               (cr_pin_has_ivar(g, &g->poly_arrays, recv) ||
+                                cr_pin_has_ivar(g, &g->poly_hashes, recv))));
+  }
   /* Crystal's `nil?` is a pseudo-method that cannot be redefined, so a widened
      value answers through the runtime's sp_nil? instead. */
-  if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 && argc == 0 &&
+  if ((CR_POLY_DISPATCH || (cr_recv_boxed(g, recv) && !container_holder)) && recv >= 0 && argc == 0 &&
       sp_streq(name, "nil?") && cr_is_poly(comp_ntype(g->c, recv))) {
     cr_emit_recv(g, recv, b);
     buf_puts(b, ".sp_nil?");
@@ -3525,8 +3983,8 @@ static int cr_emit_poly_call(CrGen *g, const CrCall *c, Buf *b) {
      object -- which before was refused. `!` and the operators have their own
      SpValue forms and are handled above. `call` is the block/proc protocol,
      answered by SpValue#call. */
-  if ((CR_POLY_DISPATCH || cr_recv_boxed(g, recv)) && recv >= 0 &&
-      cr_is_poly(comp_ntype(g->c, recv)) && !cr_user_method_ok(g, name, TY_POLY, 0) &&
+  if ((CR_POLY_DISPATCH || (cr_recv_boxed(g, recv) && !container_holder)) && recv >= 0 &&
+      !container_holder && !cr_user_method_ok(g, name, TY_POLY, 0) &&
       !sp_streq(name, "!") && !sp_streq(name, "[]") && !sp_streq(name, "[]=") &&
       !cr_is_binop(name) && !sp_streq(name, "-@") && !sp_streq(name, "+@")) {
     if (block >= 0) {
@@ -3577,7 +4035,7 @@ static int cr_emit_poly_call(CrGen *g, const CrCall *c, Buf *b) {
     int box_push = 0;
     if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
       const char *rn = nt_str(g->nt, recv, "name");
-      box_push = rn && nameset_has(&g->poly_arrays, rn);
+      box_push = rn && cr_pin_has(g, &g->poly_arrays, recv, rn);
     }
     if (box_push) {
       cr_emit_recv(g, recv, b);
@@ -3586,6 +4044,28 @@ static int cr_emit_poly_call(CrGen *g, const CrCall *c, Buf *b) {
       buf_puts(b, ")");
       return 1;
     }
+  }
+
+  /* Ruby's pop/shift/first/last answer nil on an empty container; Crystal's
+     raise instead (Array#pop, Array#first). The helper takes the receiver as an
+     argument, so it is evaluated exactly once, and returns the boxed SpValue --
+     whose rendering and Ruby-shape arithmetic the runtime guarantees. first/last
+     take the nil-answering `?` forms directly (evaluated once, no mutation).
+     max/min need no rewrite: Crystal's Enumerable answers nil on empty, same as
+     Ruby. */
+  if (CR_POLY_CONTAINERS && recv >= 0 && argc == 0 && ty_is_array(comp_ntype(g->c, recv)) &&
+      (sp_streq(name, "pop") || sp_streq(name, "shift") ||
+       sp_streq(name, "first") || sp_streq(name, "last") ||
+       sp_streq(name, "min") || sp_streq(name, "max"))) {
+    if (sp_streq(name, "first") || sp_streq(name, "last")) {
+      cr_emit_recv(g, recv, b);
+      buf_printf(b, ".%s?", name);
+      return 1;
+    }
+    buf_printf(b, "sp_arr_%s(", name);
+    cr_emit_recv(g, recv, b);
+    buf_puts(b, ")");
+    return 1;
   }
   return 0;
 }
@@ -3828,9 +4308,25 @@ static int cr_emit_index_call(CrGen *g, const CrCall *c, Buf *b) {
        so a nested read is not silently made nilable: in `t[k][j]`, making the
        inner `t[k]` nilable would change the type of the outer receiver. */
     int savr = g->nil_ok; g->nil_ok = 0;
+    /* A widened hash's keys are SpValue, so a read on it boxes the key. The
+       array case reads with a concrete index and needs none. A pinned ivar
+       hash consults its class-scoped key the same way. */
+    int box_key = 0;
+    if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
+      const char *rn = nt_str(g->nt, recv, "name");
+      box_key = rn && cr_pin_has(g, &g->poly_hashes, recv, rn);
+    } else if (nt_kind(g->nt, recv) == NK_InstanceVariableReadNode) {
+      box_key = cr_pin_has_ivar(g, &g->poly_hashes, recv);
+    }
     cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
-    cr_emit_args(g, argv, argc, b);
+    if (box_key) {
+      buf_puts(b, "sp_box(");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+    } else {
+      cr_emit_args(g, argv, argc, b);
+    }
     g->nil_ok = savr;
     buf_puts(b, nilable ? "]?" : "]");
     return 1;
@@ -3847,11 +4343,54 @@ static int cr_emit_index_call(CrGen *g, const CrCall *c, Buf *b) {
       buf_puts(b, "nil");
       return 1;
     }
+    /* A widened container holds SpValues: a store onto one boxes what it stores,
+       and a hash additionally boxes its key. Keyed off the pinned namesets, so a
+       concrete container keeps its own element type (an unboxed store stays
+       valid there). */
+    int box_val = 0, box_key = 0;
+    if (nt_kind(g->nt, recv) == NK_LocalVariableReadNode) {
+      const char *rn = nt_str(g->nt, recv, "name");
+      if (rn && cr_pin_has(g, &g->poly_arrays, recv, rn)) box_val = 1;
+      else if (rn && cr_pin_has(g, &g->poly_hashes, recv, rn)) { box_val = 1; box_key = 1; }
+    } else if (nt_kind(g->nt, recv) == NK_InstanceVariableReadNode) {
+      if (cr_pin_has_ivar(g, &g->poly_arrays, recv)) box_val = 1;
+      else if (cr_pin_has_ivar(g, &g->poly_hashes, recv)) { box_val = 1; box_key = 1; }
+    }
+    /* A Ruby index store on a pinned array grows the array with nils and
+       counts a negative index from the end, and raises IndexError below -len;
+       Crystal's own []= raises on every out-of-bounds index and can hold no nil
+       filler (see sp_arr_idx_store). The helper carries those semantics; a
+       store that replaces an element in range answers the same value either
+       way, so every pinned-array store takes the one honest path. A pinned
+       HASH keeps the bracket form: its Crystal []= accepts any key and Ruby
+       grows nothing. */
+    if (box_val && !box_key) {
+      buf_puts(b, "sp_arr_idx_store(");
+      cr_emit_recv(g, recv, b);
+      buf_puts(b, ", ");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ", sp_box(");
+      cr_emit_expr(g, argv[1], b);
+      buf_puts(b, "))");
+      return 1;
+    }
     cr_emit_recv(g, recv, b);
     buf_puts(b, "[");
-    cr_emit_expr(g, argv[0], b);
+    if (box_key) {
+      buf_puts(b, "sp_box(");
+      cr_emit_expr(g, argv[0], b);
+      buf_puts(b, ")");
+    } else {
+      cr_emit_expr(g, argv[0], b);
+    }
     buf_puts(b, "] = ");
-    cr_emit_expr(g, argv[1], b);
+    if (box_val) {
+      buf_puts(b, "sp_box(");
+      cr_emit_expr(g, argv[1], b);
+      buf_puts(b, ")");
+    } else {
+      cr_emit_expr(g, argv[1], b);
+    }
     return 1;
   }
   return 0;
@@ -3932,6 +4471,24 @@ static int cr_emit_call_special(CrGen *g, const CrCall *c, Buf *b) {
       buf_puts(b, "nil");
       return 1;
     }
+  }
+
+  /* Ruby's Hash.new(default): a default-valued hash taking ANY key type.
+     Crystal's Hash.new(d) infers only V from the default -- K has no source --
+     but a first-binding local is pinned concretely by the decl wedge (it reads
+     K from the first store), so the raw spelling only ever reaches here for
+     value-position defaults the analyzer could not back-propagate. Leave those
+     with their pre-existing (Crystal-checker) failure rather than widen the
+     hash silently: a defaulted `Hash.new("")` that flows into an unboxed store
+     would need store plumbing the rung does not ship. */
+  if (recv >= 0 && nt_kind(g->nt, recv) == NK_ConstantReadNode &&
+      sp_streq(nt_str(g->nt, recv, "name"), "Hash") &&
+      sp_streq(name, "new") && argc == 1) {
+    cr_mark_unsupported(g, id,
+      "Hash.new(default) in value position (Crystal cannot infer the key type; "
+      "only a first-binding local is pinned concretely)");
+    buf_puts(b, "{} of String => String");
+    return 1;
   }
 
   if (cr_emit_poly_call(g, c, b)) return 1;
@@ -4646,33 +5203,69 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
     case NK_LocalVariableWriteNode: {
       const char *name = nt_str(g->nt, id, "name");
       int val = nt_ref(g->nt, id, "value");
-      /* A bare `Hash.new` bound to a new local: Crystal cannot infer K/V for an
-         argument-less Hash constructor, so pin them from the first `h[k] = v`
-         store and emit an explicitly parameterized local. */
-      if (!nameset_has(&g->locals, name) && name &&
-          nt_kind(g->nt, val) == NK_CallNode) {
+      /* A bare `Hash.new` -- or, identically, a bare `{}` literal -- bound to a
+         new local: Crystal cannot infer K/V for either empty hash spelling, so
+         pin them from the first `h[k] = v` store and emit an explicitly
+         parameterized local. A `{}` literal the analyzer left untyped rides the
+         same pin; when no first store resolves both K/V the generic assignment
+         keeps the boxed spelling the literal itself emitted. */
+      int hempty = nt_kind(g->nt, val) == NK_HashNode;
+      int hnew = 0;
+      int hdefarg = -1;
+      if (nt_kind(g->nt, val) == NK_CallNode) {
         const char *cn = nt_str(g->nt, val, "name");
         int recv = nt_ref(g->nt, val, "receiver");
-        int argc0 = 0; call_args(g->nt, val, &argc0);
-        if (cn && sp_streq(cn, "new") && argc0 == 0 && recv >= 0 &&
+        int argc0 = 0; const int *cargs0 = call_args(g->nt, val, &argc0);
+        if (cn && sp_streq(cn, "new") && recv >= 0 &&
             nt_kind(g->nt, recv) == NK_ConstantReadNode) {
           const char *cn2 = nt_str(g->nt, recv, "name");
           if (cn2 && sp_streq(cn2, "Hash")) {
-            TyKind kt, vt;
-            Buf kb, vb; memset(&kb, 0, sizeof kb); memset(&vb, 0, sizeof vb);
-            if (cr_find_stored_kv(g, name, &kt, &vt) &&
-                cr_map_type(g, kt, &kb) && cr_map_type(g, vt, &vb)) {
-              cr_indent(b, indent);
-              buf_printf(b, "%s : Hash(%s, %s) = Hash(%s, %s).new",
-                         cr_local(name), kb.p, vb.p, kb.p, vb.p);
-              free(kb.p); free(vb.p);
-              nameset_add(&g->locals, name);
-              buf_puts(b, "\n");
-              return;
-            }
-            free(kb.p); free(vb.p);
+            /* `Hash.new` with no args: K/V from the first store. `Hash.new(d)`:
+               Ruby's default-value hash -- Crystal also infers V from the
+               default, but K has no source, so K still comes from the first
+               store and V is the default's type (the stored values may differ
+               from the default in Ruby, unlike `Hash(K, V).new(d)`'s constraint
+               where they agree). */
+            hnew = 1;
+            if (argc0 == 1) hdefarg = cargs0[0];
           }
         }
+      }
+      if (hempty) {
+        int en = 0;
+        nt_arr(g->nt, val, "elements", &en);
+        if (en != 0) hempty = 0;   /* a non-empty `{...}` keeps its own types */
+      }
+      if (!nameset_has(&g->locals, name) && name && (hempty || hnew)) {
+        /* The wedge answers only what the ANALYZER left unresolved: a local
+           the passes pinned (str_str_hash for THIS h) must keep its own
+           annotation. Without this gate the first-store scan below keyed by
+           bare name lifted the first `h[...]=v` in the whole program onto every
+           same-named local, and the analyzer's precise per-method types were
+           thrown away (test_empty_hash_int_int_no_widen regressed exactly
+           there). */
+        TyKind lt = cr_local_type(g, id, name);
+        int wedge_ok = lt == TY_UNKNOWN;
+        TyKind kt, vt;
+        Buf kb, vb; memset(&kb, 0, sizeof kb); memset(&vb, 0, sizeof vb);
+        if (wedge_ok &&
+            cr_find_stored_kv(g, name, &kt, &vt) &&
+            cr_map_type(g, kt, &kb) &&
+            (hdefarg < 0 ? cr_map_type(g, vt, &vb) : cr_map_type(g, comp_ntype(g->c, hdefarg), &vb))) {
+          cr_indent(b, indent);
+          buf_printf(b, "%s : Hash(%s, %s) = Hash(%s, %s).new",
+                     cr_local(name), kb.p, vb.p, kb.p, vb.p);
+          if (hdefarg >= 0) {
+            buf_puts(b, "(");
+            cr_emit_expr(g, hdefarg, b);
+            buf_puts(b, ")");
+          }
+          free(kb.p); free(vb.p);
+          nameset_add(&g->locals, name);
+          buf_puts(b, "\n");
+          return;
+        }
+        free(kb.p); free(vb.p);
       }
       /* Empty array literal whose element type the inference left poly: pin it
          from the first push so Crystal can form `[] of T`. */
@@ -4724,6 +5317,16 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
         }
       }
       cr_indent(b, indent);
+      /* A first binding whose value is a bare empty literal falls through here
+         only when no wedge pinned it, so the literal emits the boxed spelling
+         and the variable carries the boxed container: register it so its later
+         pushes and index writes box. A wedge-backed concrete/widened pin already
+         returned above, never reaching this. */
+      if (name && !nameset_has(&g->locals, name)) {
+        int klit = cr_empty_literal_kind(g, val);
+        if (klit == 1) nameset_add(&g->poly_arrays, name);
+        else if (klit == 2) nameset_add(&g->poly_hashes, name);
+      }
       /* A local the inference widened to poly is the boxed runtime type when
          the poly runtime is active. Every write is boxed and the binding is
          declared, so the local is an SpValue at every read (P22 flips this on
@@ -4782,6 +5385,13 @@ static void cr_emit_stmt(CrGen *g, int id, Buf *b, int indent) {
     case NK_InstanceVariableWriteNode: {
       const char *name = nt_str(g->nt, id, "name");   /* includes the leading @ */
       int val = nt_ref(g->nt, id, "value");
+      /* A bare empty literal pins the ivar to the boxed container, the same
+         first-binding policy the local wedges follow: register the class-keyed
+         ivar name so reads, stores and index writes box. The decl emitter asks
+         the same question (cr_ivar_empty_pin) so the two spellings agree. */
+      int klit = cr_empty_literal_kind(g, val);
+      if (klit == 1) cr_pin_add_ivar(g, &g->poly_arrays, name);
+      else if (klit == 2) cr_pin_add_ivar(g, &g->poly_hashes, name);
       cr_indent(b, indent);
       buf_printf(b, "%s = ", name ? name : "");
       if ((CR_POLY_BOXED || CR_POLY_IVARS) && cr_is_poly(cr_ivar_type(g, name)))
@@ -5574,8 +6184,20 @@ static void cr_emit_class(CrGen *g, ClassInfo *ci, Buf *b, int is_module) {
       int nilable = synth_init ||
                     (!ci->is_struct && !inherited &&
                      !cr_ivar_assigned_in_init(g, ci, ci->ivars[i]));
+      /* The empty-literal pin overrides the narrowing-based annotation: the
+         init writer emits the boxed spelling, so the decl must say Array(SpValue)
+         / Hash(SpValue, SpValue) too. Before the pin, this exact shape mapped
+         the decl to Array(Rom) while `@roml = []` emitted Array(SpValue).new,
+         and Crystal rejected the class on the mismatch. */
+      int epin = cr_ivar_empty_pin(g, ci, ci->ivars[i]);
       Buf tmp; memset(&tmp, 0, sizeof tmp);
-      if (cr_map_type(g, ci->ivar_types[i], &tmp)) {
+      if (epin == 1 || epin == 2) {
+        if (inherited) continue;   /* the superclass already declares it */
+        Buf depin; memset(&depin, 0, sizeof depin);
+        buf_puts(&depin, epin == 1 ? "Array(SpValue)" : "Hash(SpValue, SpValue)");
+        buf_printf(b, "  %s : %s%s\n", ci->ivars[i], depin.p, nilable ? "?" : "");
+        free(depin.p);
+      } else if (cr_map_type(g, ci->ivar_types[i], &tmp)) {
         if (inherited) continue;   /* the superclass already declares it */
         buf_printf(b, "  %s : %s%s\n", ci->ivars[i], tmp.p, nilable ? "?" : "");
         free(tmp.p);
@@ -6072,7 +6694,16 @@ char *codegen_program_crystal(const NodeTable *nt) {
     "    each do |k, v|\n"
     "      io << \", \" unless first\n"
     "      first = false\n"
-    "      if k.is_a?(Symbol) && sp_hash_label?(k.to_s)\n"
+    "      if k.is_a?(SpValue)\n"
+    "        r = k.raw\n"
+    "        if r.is_a?(Symbol) && sp_hash_label?(r.to_s)\n"
+    "          io << r.to_s << \": \"\n"
+    "        elsif r.is_a?(Symbol)\n"
+    "          r.to_s.inspect(io); io << \": \"\n"
+    "        else\n"
+    "          r.inspect(io); io << \" => \"\n"
+    "        end\n"
+    "      elsif k.is_a?(Symbol) && sp_hash_label?(k.to_s)\n"
     "        io << k.to_s << \": \"\n"
     "      elsif k.is_a?(Symbol)\n"
     "        k.to_s.inspect(io); io << \": \"\n"
@@ -6324,6 +6955,11 @@ char *codegen_program_crystal(const NodeTable *nt) {
   if (top_body >= 0 && nt_kind(nt, top_body) == NK_StatementsNode)
     tstmts = nt_arr(nt, top_body, "body", &tn);
 
+  /* The pin-flow pre-pass must run before ANY declaration body is emitted: a
+     call site whose argument is a bare empty literal pins that callee's
+     parameter, and the def's pushes onto the parameter box in response. */
+  cr_scan_pin_flow(&g);
+
   /* Pass 1: declarations (classes, modules and top-level defs), so they are
      available to the executable statements that follow -- matching Ruby, where a
      def/class/module is visible throughout regardless of its position. */
@@ -6381,6 +7017,7 @@ char *codegen_program_crystal(const NodeTable *nt) {
 
   free(g.locals.names);
   free(g.poly_arrays.names);
+  free(g.poly_hashes.names);
   free(g.boxed_locals.names);
   comp_free(c);
   return b.p;

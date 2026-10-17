@@ -385,6 +385,83 @@ p f'
 expect_refuse "Enumerator#next" 'e = [1, 2].each
 p loop { e.next }'
 
+# R2: the container rung. A value-position EMPTY literal emits the boxed
+# spelling (Array(SpValue) / Hash(SpValue, SpValue)), and what flows through it
+# -- pushes, index stores, method boundaries -- boxes the same way, so wide
+# container flows survive the method boundary the C backend pinned by
+# back-propagation instead. The hash wedge pins its key/value types from the
+# first store (K) and the Hash.new default (V), so a later store of another
+# element type is refused rather than silently retyped; heterogeneous VALUES
+# widen in a later step.
+expect_agree "r2_boxed_literal_flows" 'a = []
+a << 1
+a << "x"
+a << :k
+p a
+b = {}
+b["s"] = 1
+b["t"] = 2
+p b'
+
+# R2: Ruby answers nil for pop/shift/first/last/max/min on an empty array;
+# Crystal raises (EmptyEnumerableError for max/min, EmptyError for pop/first).
+# Every one is rewritten onto a runtime helper that restores Ruby's nil answer.
+expect_agree "r2_empty_true_nil_answers" 'a = [3, 1, 2]
+a.pop
+p a
+p [].pop
+p [].shift
+p [5].min
+p [7].max
+p [].first
+p [].last'
+
+# R2: a Ruby index store grows a short boxed array with nils, counts a negative
+# index from the end, and raises IndexError with Ruby's exact message below
+# -len (and `minimum: 0` -- never `-0` -- on an empty one).
+expect_agree "r2_index_store_grows" 'a = []
+a[2] = 9
+p a
+a[-1] = 7
+p a
+begin
+  a[-9] = 0
+rescue IndexError => e
+  p e.message
+end
+d = []
+begin
+  d[-1] = 1
+rescue IndexError => e
+  p e.message
+end'
+
+# R2: a pinned ivar container agrees between the decl annotation and the empty
+# literal init (the analyzer narrows @l to an object array from the stores, but
+# the init emits the boxed spelling), stores grow like the local form, and a
+# method whose every return path answers a container ELEMENT hands the caller
+# an SpValue, so a call on the result dispatches through the boxed seam.
+expect_agree "r2_ivar_element_boundary" 'class C
+  def initialize = @l = []
+  def add(x) = @l[0] = x
+  def get = @l[0]
+end
+c = C.new
+c.add(5)
+p c.get'
+
+# R2: a zip pair is a two-element ARRAY in Ruby and a Tuple in Crystal; a boxed
+# container must store the Ruby shape, so the Tuple wrapper converts to an array
+# (class Tuple cannot be reopened).
+expect_agree "r2_tuple_pairs_boxed" 'a = [[1, 2]].zip(["x"])
+p a'
+
+# Ruby's Hash.new(default) is refused in VALUE position (Crystal cannot infer
+# the key type there; only a first-binding local is pinned concretely): the
+# refusal names the construct and the rung does not fake a default-hash shape.
+expect_refuse "Hash.new(default) in value position" 'def mk; Hash.new(0); end
+p mk'
+
 # ---- DIVERGE: emitted, but differs from CRuby on a known edge ----------------
 # Each of these was REFUSED before P25.0 (a valued return/next/break or a
 # value-position case/unless/while was the first obstacle) and now emits. Three

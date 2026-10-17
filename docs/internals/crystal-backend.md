@@ -1116,6 +1116,84 @@ its `expect_diverge` note:
 | `issue_2966` | Ruby has `TrueClass` and `FalseClass`; Crystal has one `Bool`. `TrueClass === false` is false in Ruby, true in Crystal. |
 | `poly_index_range_forms` | Ruby's `String#[]` with an Integer index answers a one-character String; Crystal answers a **Char**. |
 
+## R2: the boxed empty-container rung
+
+The biggest *sole-obstacle* bucket after the method ladder was
+`untyped empty container`: **116 programs** — 72 `a = []`, 44 `h = {}` — whose
+emission refused on an empty literal that Crystal cannot type. The optimizer's
+answer (P21's per-`T` arrays) only carries scalar pushes; the bucket above it is
+everything else, which is what this rung carries.
+
+**Mechanism.** One idea, spelled out at every site a container value passes
+through: a *value-position* empty literal emits the boxed spelling —
+`Array(SpValue)` / `Hash(SpValue, SpValue)` — and every flow through it boxes the
+same way, so the boxed container is honest at every boundary:
+
+- **Literal sites.** An empty literal whose element type the analyzer pinned
+  to a concrete Crystal type still emits `Array(T).new`; only the unresolved
+  ones emit the boxed form, and the *same* scan (`cr_empty_literal_kind`)
+  answers what a slot receiving it must carry, so registration and
+  emission cannot disagree.
+- **Registration is keyed, not global.** Decl wedges keep the shipped bare-name
+  policy; a pre-pass before Pass 1 (`cr_scan_pin_flow`) registers the flows the
+  wedges cannot see — a literal *argument* pinning a callee's parameter
+  (`f([])` under `def fill(memo); memo << 1; end`), a `yield(e)` pinning a block
+  parameter, and after this rung's fallout, a *chain* of the same through
+  explicit `return`s — under `"<scope>@<name>"` keys, so `def fill(memo)`'s Int
+  slot and `def spread(xs, memo)`'s poly slot do not cross-contaminate. Gates
+  check both keys.
+- **Boxed-element block parameters are not containers.** A `map` over a boxed
+  array *yields* the SpValue; binding it needs the dispatch seam, while the
+  container-holder local never does (its own methods answer natively). Mixing
+  the two in one set silently mis-gated both; they are separate sets now.
+- **Ruby's nil-answer arithmetic, at every boundary the rung opens:** `pop` /
+  `shift` / `first` / `last` / `min` / `max` on an empty or missing-element
+  container answer nil through runtime helpers (Crystal raises);
+  `a[i] = v` on a boxed array grows with nils, applies negative indices from
+  the end, and raises `IndexError` with Ruby's own message below −len — an
+  empty array prints `minimum: 0`, never `−0`. Index *reads* keep the
+  nil-tolerant `]?` form the existing machinery carries.
+- **Ivar containers agree between decl and init.** The decl's own narrowing
+  (`@l` of `Cart` → an object array from its index stores) and the boxed init
+  literal disagreed; the empty-literal-pin was answered by the *same*Scan on
+  both sides (`cr_ivar_empty_pin` — writes attributed by the scope's owning
+  class), and ivar reads/stores consult the class-scoped pin like locals do.
+- **Hash wedges only answer what the analyzer left unresolved.** The wedge's
+  first-store scan keyed by bare name lifted the first `h[..]=v` in the whole
+  program onto every same-named local and threw the analyzer's per-method
+  types away (`test_empty_hash_int_int_no_widen` regressed exactly there and
+  pinned the rule): an `h` the passes typed keeps its own annotation.
+- **A chorus of small agreements the fallout named:** a `Tuple` element of a
+  boxed array stores its Ruby shape (`v.to_a` — `class Tuple` cannot be
+  reopened); `Int32`-returning native answers (`Array#size`) need an exact
+  `sp_box(v : Int32)` overload or every `size` boundary is a build error;
+  SpValue gained `<=>` overloads so `min`/`max`/`sort` still compare; a user
+  method whose every return path answers a container element registers, and
+  the caller's `.method` on the answer dispatches (`p c.bank(2).n`).
+
+**Measured effect (R2).** **+45 PASS, +9 DIFF, +86 BUILDFAIL, −140 REFUSED**,
+zero PASS regressions (gate PASS, 528 baselined; reject test and the difference
+ledger both pass, the ledger now carrying 6 new `expect_agree` pins and 2 new
+refusals), on the 7,347-program corpus:
+
+```
+PASS 528 → 573    DIFF 89 → 98    BUILDFAIL 374 → 460    REFUSED 6356 → 6216
+```
+
+Most of the 140 unstopped programs still stop behind a later obstacle —
+concentrated now in method-boundary unboxing (`x = f([])` then arithmetic on
+`x`), mixed-type stores onto a first-store-pinned container, and the
+`Hash.new(default)` family. One shape is refused by name rather than emitted:
+`Hash.new(default)` in **value position** (Crystal cannot infer the key type
+there; only a first-binding local is pinned concretely) — that refusal keeps
+`empty_hash_method_return` REFUSED until the default-hash shape is modelled.
+
+**Materialized fallout given a name rather than a wrong answer:** a concrete
+(non-empty-literal) array keeps Crystal's own index-store error instead of
+Ruby's grow (`Index out of bounds` vs `index -9 too small for array; minimum:
+-3`); the rung owns the boxed path only, and the difference ledger pins the
+boxed side.
+
 ## The ladder the obstacle survey implies
 
 A program is refused at its **first** unsupported construct, so the
@@ -1148,7 +1226,8 @@ refused 6,356   sole-obstacle 1,925  (30%)
 
 The order is the ladder: **the exception-class shim is the single cheapest
 large gain** (one ~15-line hierarchy, ~140 PASS), then the per-name method
-allowlist, then the boxed empty-container spelling.
+allowlist — and the last rung of that opening, the boxed empty-container
+spelling, has landed below as R2.
 
 One caveat on the two "method" rows: the per-name counts come from the
 name-preserving view (a program naming two different globals is *not* sole
@@ -1196,6 +1275,14 @@ classes with ivars + `attr_accessor` + `initialize`, Array/Hash/String
 operations, string interpolation, ranges (inclusive/exclusive), boolean logic,
 and blocks (`each`/`map`/`select`/`sum`/`times`, `next`, nested blocks).
 ## Results
+
+Measured 2026-10-16 on Crystal 1.21.1 / LLVM 20.1.8, CRuby as the oracle, after
+the R2 container rung landed (below):
+
+```
+programs: 7347   PASS 573   DIFF 98   BUILDFAIL 460   REFUSED 6216
+gate: PASS (528 PASS baselined, 0 regressions)
+```
 
 Measured 2026-10-15 on Crystal 1.21.1 / LLVM 20.1.8, CRuby as the oracle, after
 P25.0 landed:
