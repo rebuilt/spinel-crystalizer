@@ -279,10 +279,14 @@ static void scrape_ffi_markers(const char *csrc, const char *prefix, Str *out) {
    unit under its name, and nothing downstream can undo that: the compile then
    fails on a wall of duplicate symbols naming no file, and the source is gone.
    Re-emitting over spinel's OWN output is the ordinary case and stays silent.
-   `--force` is the way through for anyone who means it. */
+   `--force` is the way through for anyone who means it. Only a regular file
+   is looked into, as refuse_log_overwrite does: `-o /dev/stdout` into a pipe
+   opened the pipe to read it and waited for a writer that is this process. */
 static int g_force_overwrite = 0;
 static int refuse_overwrite(const char *path) {
   if (g_force_overwrite) return 0;
+  struct stat st;
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
   FILE *f = fopen(path, "rb");
   if (!f) return 0;                      /* new file: nothing to lose */
   char head[sizeof SP_EMIT_BANNER];
@@ -345,7 +349,11 @@ static int refuse_log_overwrite(const char *path) {
 static int cc_split_build(const char *cmd, size_t src_at, size_t src_end,
                           const char *c_path, int jobs) {
   if (jobs > 64) jobs = 64;
-  char dir[] = "/tmp/spinel_split_XXXXXX";
+  /* the scratch goes where TMPDIR says, /tmp by default: a large program's
+     preprocessed unit and parts take several GB (#9267) */
+  const char *tmpd = getenv("TMPDIR");
+  char dir[4096];
+  snprintf(dir, sizeof dir, "%s/spinel_split_XXXXXX", tmpd && *tmpd ? tmpd : "/tmp");
   if (!mkdtemp(dir)) return -1;
   char flags[16384];
   if (src_at >= sizeof flags) return -1;

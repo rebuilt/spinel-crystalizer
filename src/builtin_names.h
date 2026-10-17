@@ -48,7 +48,10 @@ int is_range_member_walk(const char *n); /* each each_entry step: a Range's bloc
 int is_stop_walk(const char *n); /* find detect take_while find_index each_with_index: walks that stop at the block's answer */
 int is_each_walk(const char *n);      /* each each_entry reverse_each */
 int is_index_query(const char *n);    /* find_index index rindex */
+int is_itself_name(const char *n);    /* itself */
+int is_each_char_name(const char *n);  /* each_char */
 int is_self_copy(const char *n);      /* freeze dup clone itself: the receiver, or a copy of it */
+int is_step_call(const char *n);       /* step: Numeric#step and Range#step */
 int is_int_step(const char *n);       /* times upto downto: Integer's counting iterators */
 int is_equality_name(const char *n);  /* equal? eql? == */
 int is_bits_query(const char *n);     /* allbits? anybits? nobits? */
@@ -58,6 +61,9 @@ int is_eval_exec_family(const char *n);   /* class/module/instance eval and exec
 int is_key_query(const char *n);      /* key? has_key? include? member?: Hash/ENV membership aliases */
 int is_hash_key_lookup(const char *n); /* [] fetch delete and is_key_query: a Hash call that only compares its key */
 int is_receiver_conversion(const char *n); /* to_s to_str itself: conversions a String answers with itself */
+int is_string_conversion(const char *n);   /* to_s to_str +@: conversions that turn a nil receiver into a String */
+int is_string_self_answer(const char *n);   /* to_s to_str itself +@: names a String answers itself to */
+int is_rebinding_reach_call(const char *n); /* call () send instance_variable_set instance_eval yield...: code the walk cannot see */
 int is_to_s_name(const char *n);
 int is_message_name(const char *n);
 int is_range_membership(const char *n); /* cover? include? member? ===: Range membership predicates */
@@ -86,6 +92,9 @@ int is_minmax_pair(const char *n); /* minmax: both extrema in one answer */
 int is_endpoint_query(const char *n); /* first last: collection or Range endpoints */
 int is_map_alias(const char *n); /* map collect: Enumerable transformation aliases */
 int is_instance_eval_family(const char *n); /* instance_eval instance_exec */
+int is_reflective_access(const char *n); /* instance_variable_get/set, class_variable_get/set, const_get/set, remove_* */
+int is_reflective_listing(const char *n); /* instance_variables class_variables constants */
+int is_local_reflection(const char *n); /* eval binding local_variable_get/set local_variables */
 int is_find_alias(const char *n); /* find detect: Enumerable search aliases */
 
 int is_text_conversion(const char *n); /* inspect to_s */
@@ -213,6 +222,7 @@ int is_initialize_name(const char *n); /* initialize */
 int is_initialize_family(const char *n); /* initialize initialize_copy */
 
 int is_iso8601_alias(const char *n); /* iso8601 xmlschema */
+int sock_const_always(const char *n); /* Socket constants every platform defines */
 int is_exception_message(const char *n); /* message to_s */
 int is_socket_pair_alias(const char *n); /* pair socketpair */
 int is_partition_family(const char *n); /* partition rpartition */
@@ -261,6 +271,7 @@ int is_file_class_name(const char *n); /* File */
 int is_filetest_module_name(const char *n); /* FileTest */
 int is_immediate_class_name(const char *n); /* FalseClass NilClass TrueClass */
 int is_object_base_name(const char *n); /* BasicObject Object */
+int is_builtin_method_host_name(const char *n); /* Object BasicObject Kernel Comparable Enumerable Module */
 int is_boolean_class_name(const char *n); /* FalseClass TrueClass */
 int is_numeric_literal_tag(const char *n); /* Float Int */
 int is_standard_output_global(const char *n); /* $stderr $stdout */

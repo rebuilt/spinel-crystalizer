@@ -28,6 +28,11 @@ const char *poly_recv_class_values(Compiler *c, int call);
    the receiver's Class values is k or under it; 1 when the walk cannot
    bound them. Shared by the dispatch's arms and the call's type. */
 int poly_cls_value_reaches(Compiler *c, int call, int k);
+/* Is the class-value arm for class method kmi of class k left out of boxed
+   call `call`: a module's own `def self.x` when no box can hold the module
+   or none reaches the method. The dispatch (poly_cls_value_cands) and the
+   call's type (an_class_concrete) both ask it, so they take the same arms. */
+int poly_cls_arm_left_out(Compiler *c, int call, int k, int kmi);
 /* A class method of `name` on one of the Class values the boxed receiver of
    `call` holds, as far as the walk bounds them (poly_cls_value_reaches): a
    String face then answers only part of the call, and the call's type meets
@@ -148,6 +153,7 @@ void analyze_program(Compiler *c);
 /* The program as written gives no class a method named `nm`, beyond `defs`
    (0 or 1) defs of that name: read ahead of the desugars, by absence. */
 int an_prog_never_gives(const char *nm, int defs);
+int an_prog_names_method(const char *nm);
 /* True if a regex source contains a capturing group: an unescaped '(' that
    isn't the start of a non-capturing/extension group '(?...'. scan returns
    nested arrays for capturing patterns, which the str_array path can't model. */
@@ -242,6 +248,13 @@ int strbuf_ivar_alias_value(const NodeTable *nt, int v);
 /* Infer (and cache) the type of node `id`. Used during analysis; codegen
    reads the cached results via comp_ntype. */
 TyKind infer_type(Compiler *c, int id);
+/* Does a receiver of type `rt` have a real method named `name`, among the
+   per-call-site-cloned generic Enumerable names (analyze_desugar.c's
+   builtin_enum_name_index list) or transform_keys!/transform_values!?
+   Used by rt_probe_answer (codegen_call.c) for a respond_to? probe on
+   one of these names, which the one-shot rewrites that actually type
+   them never reach (K-026 cause A). */
+int enum_builtin_responds(Compiler *c, const char *name, TyKind rt);
 /* empty infer_type's memo of earlier queries' answers: the start or end of
    a pass whose writes are not all counted (#8852) */
 void infer_memo_boundary(void);
@@ -592,5 +605,7 @@ int strh_call_op(Compiler *c, int call, TyKind rt);
    not settled yet counts as the type asked (the gate runs again, and
    refuses for good, once it is) */
 int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok);
+int strh_literal_held(Compiler *c, int n);   /* an Array literal a variable of any kind is written */
+int strh_var_read(const NodeTable *nt, int n);   /* a variable's read, whatever its kind of variable */
 
 #endif

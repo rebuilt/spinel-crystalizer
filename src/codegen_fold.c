@@ -30,6 +30,32 @@ static int bv_value_may_be_nil(Compiler *c, int block, TyKind t) {
   if (body >= 0 && block_next_may_be_nil(c, body, 0)) return 1;
   return bn > 0 && node_is_oint(c, bb[bn - 1]);
 }
+/* Does a `next v` of the block (not one of a block nested in it) answer a
+   boxed value, while its tail is a typed t? The block's value slot is then
+   the box (#9300). */
+static int bv_next_boxed_walk(Compiler *c, int n, int depth) {
+  const NodeTable *nt = c->nt;
+  if (n < 0 || depth > 64) return 0;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_BlockNode || k == NK_LambdaNode || k == NK_DefNode) return 0;
+  if (k == NK_NextNode) {
+    int args = nt_ref(nt, n, "arguments"), an = 0;
+    const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+    if (an == 1 && (repr_of(c, av[0]).kind == RK_BOXED || repr_of(c, av[0]).as_ty == TY_POLY)) return 1;
+  }
+  int nr = nt_num_refs(nt, n);
+  for (int i = 0; i < nr; i++) if (bv_next_boxed_walk(c, nt_ref_at(nt, n, i), depth + 1)) return 1;
+  int na = nt_num_arrs(nt, n);
+  for (int i = 0; i < na; i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int j = 0; j < an; j++) if (bv_next_boxed_walk(c, av[j], depth + 1)) return 1;
+  }
+  return 0;
+}
+static int bv_next_boxed(Compiler *c, int block, TyKind t) {
+  if (block < 0 || t == TY_POLY) return 0;
+  return bv_next_boxed_walk(c, nt_ref(c->nt, block, "body"), 0);
+}
 /* the step slots emit_iter_step_open declared as an oint (a ring: a slot
    is read back by its tail right after the step opened) */
 static int g_oint_slots[32], g_oint_slot_n = 0;
@@ -1006,6 +1032,8 @@ int emit_transform_hash_expr(Compiler *c, int id, Buf *b) {
     }
   }
   TyKind bret = repr_of(c, bb[bn - 1]).as_ty;
+  TyKind nx = block_next_value_ty(c, body);
+  if (nx != TY_UNKNOWN) bret = bret == TY_UNKNOWN ? nx : ty_unify(bret, nx);
   Buf vb; memset(&vb, 0, sizeof vb);
   /* the block's value carries its nil into a result whose values may be nil:
      an oint-formed value is emitted as its oint, a boxed one unboxed with it */
@@ -2929,10 +2957,17 @@ static int emit_chunk_family_runs(Compiler *c, int ck) {
 
   int ta = ++g_tmp, tout = ++g_tmp, tcur = ++g_tmp, ti = ++g_tmp;
   Buf rb; memset(&rb, 0, sizeof rb);
-  if (!pr_empty_lit) emit_expr(c, pr, &rb);
+  /* (--share-strings: a new String Array whose Strings the rule shares is
+     walked as the Array of their handles, so a run holds the Strings
+     themselves: iter_src_as_handles) */
+  int src_handles = !pr_empty_lit && prr.elem == TY_STRING && prr.kind != RK_BOXED && iter_src_as_handles(c, pr);
+  if (src_handles) emit_str_array_handles(c, pr, &rb);
+  else if (!pr_empty_lit) emit_expr(c, pr, &rb);
   emit_indent(g_pre, g_indent);
   if (pr_empty_lit)
     buf_printf(g_pre, "sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);\n", ta, ta);
+  else if (src_handles)
+    buf_printf(g_pre, "sp_PolyArray *_t%d = %s; SP_GC_ROOT(_t%d);\n", ta, rb.p ? rb.p : "", ta);
   else if (prr.elem == TY_POLY)
     buf_printf(g_pre, "sp_PolyArray *_t%d = %s; SP_GC_ROOT(_t%d);\n", ta, rb.p ? rb.p : "", ta);
   /* A boxed receiver (a container-read row, a boxed Hash) walks the elements
@@ -4562,7 +4597,8 @@ int emit_each_with_index_terminal(Compiler *c, int id, Buf *b) {
     if (bt == TY_UNKNOWN) bt = TY_INT;
     /* a number that can be nil is carried boxed, so its nil reads falsy */
     int vpoly = (bt == TY_POLY || bt == TY_NIL || (oint_kind(bt) && bn > 0 && node_has_oint_form(c, bb[bn - 1])) ||
-                 bv_value_may_be_nil(c, block, bt));   /* a `next nil` too */
+                 bv_value_may_be_nil(c, block, bt) ||   /* a `next nil` too */
+                 bv_next_boxed(c, block, bt));          /* and a boxed `next v` */
     int tv = ++g_tmp; char tvb[24]; snprintf(tvb, sizeof tvb, "_t%d", tv);
     emit_indent(g_pre, din);
     if (vpoly) buf_printf(g_pre, "sp_RbVal _t%d = sp_box_nil();\n", tv);
@@ -7081,6 +7117,8 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
 enum { OPEN_DEFAULTS_MAX = 256 };
 static struct { Scope *m; int idx; } g_open_default[OPEN_DEFAULTS_MAX];
 int g_open_defaults = 0;
+/* the method whose parameter default is being spelled innermost, or NULL */
+Scope *open_default_method(void) { return g_open_defaults > 0 ? g_open_default[g_open_defaults - 1].m : NULL; }
 
 static void emit_arg_or_default_at(Compiler *c, Scope *m, int idx, int provided, Buf *out) {
   if (provided >= 0 || !m->pdefault || m->pdefault[idx] < 0) {
@@ -7301,15 +7339,14 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
   /* An empty `[]` argument carries no element type of its own and otherwise
      falls back to an IntArray, which mismatches a parameter typed from another
      call site (`P.new(deps: ["d1"])` then `P.new(deps: [])`). Build it at the
-     parameter's type instead, the way the ternary arms already do (#3359). */
-  if (provided >= 0 && ty_is_array(pt) && !ty_is_obj_array(pt) &&
-      nt_kind(c->nt, provided) == NK_ArrayNode) {
-    int en = 0; nt_arr(c->nt, provided, "elements", &en);
-    if (en == 0) {
-      const char *k = (pt == TY_POLY_ARRAY) ? "Poly" : array_kind(pt);
-      if (k) { buf_printf(out, "sp_%sArray_new()", k); return; }
-    }
-  }
+     parameter's type instead, the way the ternary arms already do (#3359). A
+     bare `Array.new` is as empty, an empty `{}` or `Hash.new` is the same for
+     a Hash parameter, and parentheses around any of them do not change it
+     (emit_empty_literal_as sees through them). One the call ran ahead of the
+     binding is its temp, below. */
+  if (provided >= 0 && (ty_is_array(pt) || pt == TY_STRH_ARRAY || ty_is_hash(pt)) &&
+      !arg_ran_first(provided, 0) && emit_empty_literal_as(c, provided, pt, out))
+    return;
   /* Byref string out-param: pass the caller's slot (const char**) so the
      callee's mutation lands in the caller's variable. A plain string local
      passes its address; an already-celled local (captured, or itself a byref
@@ -8896,6 +8933,10 @@ int ran_first_read_handle(int node) {
 static int arg_temp_conversion(Compiler *c, int v, TyKind at) {
   if (at != TY_STRING) return 0;
   if (strbuf_poly_to_s(c, v) || strbuf_srange_tail(c, v) >= 0) return 1;
+  /* --share-strings: so does a boxed receiver's call whose arms answer a
+     String (or a sequence ending in one): the handle its box holds is
+     taken where the call runs */
+  if (repr_share_rule(c) && strbuf_poly_user_base(c, v) >= 0) return 1;
   /* So does a call result lifted into the handle for a boxed parameter: the
      handle its method publishes is taken where the call runs. */
   if (repr_share_rule(c) && c->poly_strbuf_lift[v] && strbuf_value_carries(c, v)) return 1;
@@ -8907,6 +8948,13 @@ static int arg_temp_conversion(Compiler *c, int v, TyKind at) {
 
 /* The value `v` evaluated into a rooted temp in g_pre, pushed onto the
    g_argov overrides so its uses read the temp. */
+/* --share-strings: is v a bang (`s.upcase!`) on a handle, which answers that
+   handle or nil? */
+static int arg_bang_on_handle(Compiler *c, int v) {
+  int u = unwrap_parens(c, v);
+  const char *nm = u >= 0 && nt_kind(c->nt, u) == NK_CallNode ? nt_str(c->nt, u, "name") : NULL;
+  return nm && nm[0] && nm[strlen(nm) - 1] == '!' && strbuf_bang_self_local(c, u);
+}
 static void emit_arg_temp(Compiler *c, int v) {
   Repr r = repr_of(c, v);
   int fresh = repr_handle_apart(c, v, r);
@@ -8951,7 +8999,8 @@ static void emit_arg_temp(Compiler *c, int v) {
     view_bind(recv, "_t%d", tr);
   }
   Buf hw; memset(&hw, 0, sizeof hw);
-  if (conversion) emit_strbuf_handle_of(c, srange ? stail : v, &hw);
+  if (conversion && arg_bang_on_handle(c, v)) emit_bang_self_handle(c, unwrap_parens(c, v), &hw);
+  else if (conversion) emit_strbuf_handle_of(c, srange ? stail : v, &hw);
   else if (wshare) emit_strbuf_write_handle(c, v, &hw);
   wshare |= conversion;
   if (wshare || ((vk == NK_LocalVariableReadNode || vk == NK_InstanceVariableReadNode ||
@@ -8977,6 +9026,14 @@ static void emit_arg_temp(Compiler *c, int v) {
     size_t arm_at = hb.len;
     emit_expr(c, stail, &hb);
     if (g_share_check) share_check_declare_reads(&hb, arm_at, stail);
+  }
+  /* a bang (or a conditional with one on an arm) ran for its handle, which is
+     the String's or nil: its bytes are the handle's read, where the node's
+     Repr says handle */
+  else if (conversion && at == TY_STRING &&
+           (arg_bang_on_handle(c, v) || face_str_bang_call(c, unwrap_parens(c, v)) ||
+            (strbuf_arg_bang_value(c, v) && !strbuf_arg_bang(c, v)))) {
+    buf_printf(&hb, "sp_strbuf_read_pub(_t%d)", th);
   }
   else if (wshare) {
     char thr[24]; snprintf(thr, sizeof thr, "_t%d", th);
@@ -10226,8 +10283,8 @@ void emit_pd_param_bind(Compiler *c, Scope *m, int i, int uid, const char *val, 
   snprintf(name, cap, byref ? "_cell_%s" : "lv_%s", uniq);
 }
 
-/* True if some parameter's default expression references an EARLIER parameter.
-   Ruby evaluates defaults left-to-right in the callee where earlier params are
+/* True if some parameter's default expression references an EARLIER parameter
+   (reads or assigns it: `b = (a = 4)`). Ruby evaluates defaults left-to-right in the callee where earlier params are
    already bound; spinel fills defaults at the call site, where those bindings
    are absent, so such a default needs the sibling-binding path below. */
 int default_refs_earlier_param(Compiler *c, Scope *m) {
@@ -10236,7 +10293,8 @@ int default_refs_earlier_param(Compiler *c, Scope *m) {
   for (int i = 1; i < m->nparams; i++) {
     if (!m->pdefault || m->pdefault[i] < 0) continue;
     for (int j = 0; j < i; j++)
-      if (m->pnames[j] && subtree_reads_local(nt, m->pdefault[i], m->pnames[j]))
+      if (m->pnames[j] && (subtree_reads_local(nt, m->pdefault[i], m->pnames[j]) ||
+                           subtree_writes_local(c, m->pdefault[i], m->pnames[j])))
         return 1;
   }
   return 0;
@@ -11796,6 +11854,20 @@ void emit_args_filled_argv(Compiler *c, int callee_idx, const int *argv, int arg
       emit_pd_param_bind(c, m, i, uid, vb.p, tmpnames[i], sizeof tmpnames[0]);
       free(vb.p);
     }
+    /* a parameter a closure captures lives in its cell once a default has
+       run, which a later default may have written (`b = (-> { a = 7 }.call)`):
+       the call passes the alias, which takes the cell's value */
+    for (int i = 0; i < m->nparams; i++) {
+      LocalVar *cp = m->pnames[i] ? scope_local(m, m->pnames[i]) : NULL;
+      if (!cp || !cp->is_cell || cp->byref_out) continue;
+      for (int j = i + 1; j < m->nparams; j++)
+        if (m->pdefault && m->pdefault[j] >= 0 && subtree_writes_local(c, m->pdefault[j], m->pnames[i])) {
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "%s = %s*_cell__pd%d_%d;\n", tmpnames[i],
+                     cp->type == TY_PROC ? "(sp_Proc *)(uintptr_t)" : "", uid, i);
+          break;
+        }
+    }
     g_nren = ren_base;  /* pop the renames before emitting the call args */
     for (int i = 0; i < m->nparams; i++) {
       buf_puts(out, i == 0 ? lead : ", ");
@@ -11892,12 +11964,13 @@ void emit_args_filled_argv(Compiler *c, int callee_idx, const int *argv, int arg
         ran_first_bind(argv[k], ht, ht);
         continue;
       }
-      /* --share-strings: a bang on a boxed receiver, or a conditional with
-         one on an arm, collected by the rest parameter runs as the handle it
-         hands on, which the rest's box takes (ran_first_handle): bound as
-         its bytes, the box rendered the arms again, a second bang */
+      /* --share-strings: a conditional with a bang on an arm, collected by
+         the rest parameter, runs as the handle it hands on, which the rest's
+         box takes (ran_first_handle): bound as its bytes, the box rendered
+         the arms again, a second bang. A bang alone stays bound as its
+         bytes, which the rest's box takes as its receiver's own box */
       if (repr_share_rule(c) && at == TY_STRING && m->rest_idx >= 0 && k >= m->rest_idx &&
-          strbuf_arg_bang_value(c, argv[k])) {
+          strbuf_arg_bang_value(c, argv[k]) && !strbuf_bang_self_local(c, argv[k])) {
         emit_strbuf_handle_of(c, argv[k], &hb);
         emit_indent(g_pre, g_indent);
         buf_printf(g_pre, "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n", ht, hb.p, ht);
@@ -12089,6 +12162,8 @@ static void emit_arm_arg(Compiler *c, Scope *arm, int a, int atmp_id, TyKind fro
   else if (from_o && pt == from && !pto) buf_printf(b, "%s(%s)", oint_arg(pt), tn);
   else if (!from_o && pt == from && pto) buf_printf(b, "%s(%s)", oint_of(pt), tn);
   else if (pt == TY_POLY && from != TY_POLY && from != TY_UNKNOWN) emit_boxed_text(c, from, tn, b);
+  /* (a parameter that holds its nil takes the box's oint, nil kept: #9398) */
+  else if (from == TY_POLY && pt != TY_POLY && pt != TY_UNKNOWN && pto) emit_unbox_nilable_text(c, pt, tn, b);
   else if (from == TY_POLY && pt != TY_POLY && pt != TY_UNKNOWN) emit_unbox_text(c, pt, tn, b);
   else buf_puts(b, tn);
 }
@@ -12874,6 +12949,8 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
   int pd_ren_base = g_nren, pd_uid = 0;
   int pd_active = pm && (splat_tmp_d < 0 || L.gather) && default_refs_earlier_param(c, pm);
   if (pd_active) pd_uid = ++g_tmp;
+  char *pd_alias = np ? calloc((size_t)np, 1) : NULL;   /* the parameters that have an alias */
+  if (np && !pd_alias) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   /* a strict parameter's argument that can be nil (param_strict): held as
      its oint here, checked once every argument has run (below) */
   int pmi = pm ? (int)(pm - c->scopes) : -1;
@@ -13092,10 +13169,28 @@ else {
         char pdn[48]; snprintf(pdn, sizeof pdn, "_pd%d_%d", pd_uid, k);
         emit_pd_cell_alias(c, p, pdn);
         ren_push(pm->pnames[k], "_pd%d_%d", pd_uid, k);
+        pd_alias[k] = 1;
       }
     }
     free(ab.p);
   }
+  /* a default that assigns an earlier parameter (`b = (a = 4)`) wrote its
+     alias, or its cell when a closure captures the parameter; the call
+     passes the temp, which takes the value */
+  for (int k = 0; pd_active && k < np; k++)
+    if (pd_alias[k]) {
+      LocalVar *cp = scope_local(pm, pm->pnames[k]);
+      int cell = cp && cp->is_cell && !cp->byref_out;
+      for (int j = k + 1; j < pm->nparams; j++)
+        if (pm->pdefault && pm->pdefault[j] >= 0 && subtree_writes_local(c, pm->pdefault[j], pm->pnames[k])) {
+          emit_indent(g_pre, g_indent);
+          if (!cell) buf_printf(g_pre, "_t%d = lv__pd%d_%d;\n", atmp[k], pd_uid, k);
+          else if (cp->type == TY_PROC) buf_printf(g_pre, "_t%d = (sp_Proc *)(uintptr_t)*_cell__pd%d_%d;\n", atmp[k], pd_uid, k);
+          else buf_printf(g_pre, "_t%d = *_cell__pd%d_%d;\n", atmp[k], pd_uid, k);
+          break;
+        }
+    }
+  free(pd_alias);
   g_nren = pd_ren_base;   /* the renames served the defaults only */
   view_unbind(argov_saved_d);
   /* the strict parameters' checks, in the callee's order: each nil raises

@@ -129,6 +129,14 @@ int is_tap_name(const char *n) {
   return sp_streq(n, "tap");
 }
 
+int is_itself_name(const char *n) {
+  return sp_streq(n, "itself");
+}
+
+int is_each_char_name(const char *n) {
+  return sp_streq(n, "each_char");
+}
+
 int is_tap_alias(const char *n) {
   return sp_streq(n, "tap") || sp_streq(n, "then") || sp_streq(n, "yield_self");
 }
@@ -202,6 +210,8 @@ int is_self_copy(const char *n) {
          sp_streq(n, "itself");
 }
 
+int is_step_call(const char *n) { return sp_streq(n, "step"); }
+
 int is_int_step(const char *n) {
   return sp_streq(n, "times") || sp_streq(n, "upto") || sp_streq(n, "downto");
 }
@@ -240,6 +250,26 @@ int is_receiver_conversion(const char *n) {
   return sp_streq(n, "to_s") || sp_streq(n, "to_str") || sp_streq(n, "itself");
 }
 int is_to_s_name(const char *n) { return n && sp_streq(n, "to_s"); }
+
+/* The conversions that turn a nil receiver into a String ("" for to_s) and
+   answer a String receiver itself: to_s to_str +@. */
+int is_string_conversion(const char *n) {
+  return sp_streq(n, "to_s") || sp_streq(n, "to_str") || sp_streq(n, "+@");
+}
+
+/* The names a String answers itself to: to_s to_str itself +@. */
+int is_string_self_answer(const char *n) {
+  return is_receiver_conversion(n) || sp_streq(n, "+@");
+}
+
+/* A call that can run code of the program's own the walk does not see, and
+   so rebind a variable through it: a proc's call, a send, a reflective
+   write or eval, a yield. */
+int is_rebinding_reach_call(const char *n) {
+  return sp_streq(n, "call") || sp_streq(n, "()") || is_send_family(n) ||
+         sp_streq(n, "instance_variable_set") || is_instance_eval_family(n) || sp_streq(n, "yield");
+}
+
 int is_message_name(const char *n) { return n && sp_streq(n, "message"); }
 
 int is_range_membership(const char *n) {
@@ -346,6 +376,23 @@ int is_map_alias(const char *n) {
 
 int is_instance_eval_family(const char *n) {
   return sp_streq(n, "instance_eval") || sp_streq(n, "instance_exec");
+}
+/* The reflective reads and writes of a variable by the name it is given: the
+   ivar, class variable and constant accessors and removers */
+int is_reflective_access(const char *n) {
+  return sp_streq(n, "instance_variable_get") || sp_streq(n, "instance_variable_set") ||
+         sp_streq(n, "class_variable_get") || sp_streq(n, "class_variable_set") ||
+         sp_streq(n, "const_get") || sp_streq(n, "const_set") || sp_streq(n, "remove_instance_variable") ||
+         sp_streq(n, "remove_class_variable") || sp_streq(n, "remove_const");
+}
+/* The reflective listings of a kind of variable */
+int is_reflective_listing(const char *n) {
+  return sp_streq(n, "instance_variables") || sp_streq(n, "class_variables") || sp_streq(n, "constants");
+}
+/* The calls that reach a local by a name or a string of code */
+int is_local_reflection(const char *n) {
+  return sp_streq(n, "eval") || sp_streq(n, "binding") || sp_streq(n, "local_variable_get") ||
+         sp_streq(n, "local_variable_set") || sp_streq(n, "local_variables");
 }
 
 int is_find_alias(const char *n) {
@@ -892,6 +939,17 @@ int is_local_time(const char *n) {
   return sp_streq(n, "localtime") || sp_streq(n, "getlocal");
 }
 
+/* The Socket constants sp_sock_const (lib/sp_io.c) answers on every
+   platform -- the entries of its table outside any #ifdef. The others are
+   the system's to define, so only the run time knows them. */
+int sock_const_always(const char *n) {
+  static const char *const names[] = {
+    "AF_INET", "AF_INET6", "AF_UNIX", "PF_INET", "PF_INET6", "PF_UNIX",
+    "SOCK_STREAM", "SOCK_DGRAM", "SHUT_RD", "SHUT_WR", "SHUT_RDWR", NULL
+  };
+  for (int i = 0; n && names[i]; i++) if (sp_streq(names[i], n)) return 1;
+  return 0;
+}
 int is_iso8601_alias(const char *n) {
   return sp_streq(n, "iso8601") || sp_streq(n, "xmlschema");
 }
@@ -986,6 +1044,13 @@ int is_range_or_time_class(const char *n) {
 
 int is_object_base_name(const char *n) {
   return sp_streq(n, "Object") || sp_streq(n, "BasicObject");
+}
+
+/* A class or module besides the builtin classes (is_builtin_reopen) whose
+   methods every builtin value may run: Object, BasicObject, Kernel,
+   Comparable, Enumerable, Module. */
+int is_builtin_method_host_name(const char *n) {
+  return is_object_root(n) || sp_streq(n, "Comparable") || sp_streq(n, "Enumerable") || sp_streq(n, "Module");
 }
 
 int is_queue_class_name(const char *n) {

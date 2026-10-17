@@ -718,7 +718,9 @@ int subtree_has_side_effect(Compiler *c, int id) {
   if (sp_streq(ty, "SuperNode") || sp_streq(ty, "ForwardingSuperNode") ||
       sp_streq(ty, "YieldNode") || strstr(ty, "WriteNode"))
     return 1;
-  if (sp_streq(ty, "CallNode") && !call_is_scalar_op(c, id)) return 1;
+  /* a bare Array.new / Hash.new is as empty and as unobservable as the
+     literal `[]` / `{}`, which is no effect */
+  if (sp_streq(ty, "CallNode") && !call_is_scalar_op(c, id) && !node_is_empty_container(nt, id)) return 1;
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
     if (subtree_has_side_effect(c, nt_ref_at(nt, id, i))) return 1;
@@ -1737,7 +1739,12 @@ void emit_scope_local_ref(Compiler *c, Scope *s, const char *name, Buf *b) {
     buf_printf(b, "lv_%s", rn);
     return;
   }
-  if (g_cap_struct && g_cap_names && nameset_has(g_cap_names, name)) {
+  /* A name renamed inside the proc body is the renaming's local, not the
+     capture: a proc body starts with no renames (ren_park), so a rename
+     here is one the body pushed, such as a default argument's binding of
+     the callee's parameter (`text v.to_s` in a block that captured an
+     outer `obj`, where text's default is `obj.length`, #9263) */
+  if (g_cap_struct && g_cap_names && rn == name && nameset_has(g_cap_names, name)) {
     /* A TY_PROC capture is stored as (sp_int)(uintptr_t)sp_Proc* in the cell.
        Cast it back to sp_Proc* so call sites work. A heap-object cell is a real
        typed pointer, so its deref is already the right lvalue (no cast). */
@@ -3677,12 +3684,12 @@ void strh_elem_handle_text(Compiler *c, int v, Buf *b) {
   if (strh_call_op(c, v, comp_recv_type(c, recv)) == STRH_TAKE) {
     int pop = is_pop_name(nm);
     buf_puts(b, pop ? "((sp_String *)sp_PtrArray_pop(" : "((sp_String *)sp_PtrArray_delete_at(");
-    emit_expr(c, recv, b);
+    strh_emit_recv(c, v, recv, b);
     buf_puts(b, pop ? "))" : ", 0))");
   }
   else {
     buf_puts(b, "((sp_String *)sp_PtrArray_get(");
-    emit_expr(c, recv, b);
+    strh_emit_recv(c, v, recv, b);
     buf_puts(b, ", ");
     if (argc == 1) emit_int_expr(c, argv[0], b);
     else buf_puts(b, is_first_name(nm) ? "0" : "-1");
@@ -3704,7 +3711,7 @@ int strh_handle_call(Compiler *c, int v) {
   return op == STRH_ELEM || op == STRH_TAKE;
 }
 /* Is v an element read of a String Array of handles that reads like a
-   variable's slot: a local's Array at an index that is an Integer literal
+   variable's slot: a variable's Array at an index that is an Integer literal
    or a local's read (share_strh_gate admits no other), so its handle text
    can be read again where it is used? */
 int strh_elem_slot(Compiler *c, int v) {
@@ -3712,7 +3719,7 @@ int strh_elem_slot(Compiler *c, int v) {
   if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return 0;
   int recv = nt_ref(nt, v, "receiver"), argc = 0;
   const int *argv = call_args(nt, v, &argc);
-  if (recv < 0 || nt_kind(nt, recv) != NK_LocalVariableReadNode ||
+  if (recv < 0 || !strh_var_read(nt, recv) ||
       strh_call_op(c, v, comp_recv_type(c, recv)) != STRH_ELEM) return 0;
   return argc == 0 || nt_kind(nt, argv[0]) == NK_IntegerNode || nt_kind(nt, argv[0]) == NK_LocalVariableReadNode;
 }
@@ -3748,7 +3755,7 @@ static int strbuf_slot_into(Compiler *c, int recv, Buf *b) {
   /* (--share-strings: a value route over a handle, `(+s)`, whose handle
      already ran into a temp (emit_bang_self_handle): that temp holds it,
      as a variable's slot does) */
-  if (repr_share_rule(c) && recv >= 0 && nt_kind(c->nt, recv) == NK_CallNode && ran_first_read_handle(recv) >= 0) {
+  if (repr_share_rule(c) && recv >= 0 && ran_first_read_handle(recv) >= 0) {
     if (b) buf_printf(b, "_t%d", ran_first_read_handle(recv));
     return 1;
   }
@@ -4621,11 +4628,13 @@ void emit_coerce(Compiler *c, int node, TyKind slot, int how, const char *what, 
   case CF_CHECKED_UNBOX: {
     /* a container, an object or a Bignum through the checked unbox, which
        converts or raises for a value of another class rather than reading
-       its memory, and a Class from its boxed form. A struct-valued or other
-       handle slot has no checked unbox, and is refused below. */
+       its memory, a Class from its boxed form, and a Time through its own
+       (sp_poly_as_time_chk, #9381). Another struct-valued or handle slot
+       has no checked unbox, and is refused below. */
     Buf vb; memset(&vb, 0, sizeof vb);
     emit_expr(c, node, &vb);
-    emit_unbox_nilable_text(c, slot, vb.p ? vb.p : "sp_box_nil()", b);
+    if (slot == TY_TIME) buf_printf(b, "sp_poly_as_time_chk(%s)", vb.p ? vb.p : "sp_box_nil()");
+    else emit_unbox_nilable_text(c, slot, vb.p ? vb.p : "sp_box_nil()", b);
     free(vb.p);
     RCC(CF_CHECKED_UNBOX);
     return;
@@ -7779,7 +7788,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       }
       if (sgc >= 0 && an2 == 0 && comp_method_in_chain(c, sgc, nm, NULL) < 0) {
         ClassInfo *sgi = &c->classes[sgc];
-        const char *rn = comp_resolve_alias(c, sgc, nm);
+        const char *rn = comp_resolve_cm_alias_at(c, sgc, nm, NULL);
         if (!rn) rn = nm;
         if (comp_is_sg_reader(sgi, rn) && comp_is_sg_civ(sgi, rn)) {
           char ivb[300]; snprintf(ivb, sizeof ivb, "@%s", rn);

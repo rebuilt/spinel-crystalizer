@@ -28,6 +28,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
 int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
+void emit_class_value_constants(Compiler *c, const char *cv, int inherit, Buf *b);
 int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, TyKind rt);
 int emit_call_regexp_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt, TyKind a0);
@@ -58,7 +59,7 @@ int emit_call_range_literal_arms(Compiler *c, Buf *b, const NodeTable *nt, const
 int emit_call_iter_expr_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_display_ivar_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_symbol_misc_arms(Compiler *c, Buf *b, const char *name, int recv, int argc, const int *argv, TyKind rt);
-int emit_call_untyped_array_arms(Buf *b, const NodeTable *nt, const char *name, int recv, int argc, TyKind rt);
+int emit_call_untyped_array_arms(Compiler *c, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, TyKind rt);
 int emit_call_handle_op_arms(Compiler *c, int id, Buf *b, const char *name, int recv);
 int emit_call_implicit_self_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv);
 int emit_call_proc_literal_arms(Compiler *c, int id, Buf *b, const NodeTable *nt);
@@ -114,7 +115,7 @@ int emit_io_pick(Compiler *c, int tv, const char *name, int public_only, Buf *b)
 void emit_io_pick_public(Compiler *c, const char *qm, const char *pick, Buf *b);
 void emit_io_reopen_responds(Compiler *c, int tv, const char *qm, int include_all, Buf *b);
 void emit_poly_dispatch_key(Compiler *c, int tv, int cls0_cand, int prim_cand, int exc_cand, Buf *b);
-void emit_responds_name(Compiler *c, int k, const char *nm, int tv, Buf *b);
+void emit_responds_name(Compiler *c, int k, const char *nm, Buf *pub, Buf *priv);
 extern const char *const enumerable_names[];
 extern int g_rto_nil_obj;
 extern int g_rto_by_cls;
@@ -219,6 +220,7 @@ void emit_voided_operands(Compiler *c, int recv, int arg, int v, Buf *b);
 int parse_named_format(const char *fmt, Buf *rew, const char **names, int *name_len, int maxn);
 int re_lit_enc_opts(Compiler *c, int recv, int rre);
 void emit_re_opts_flags(Compiler *c, int argc, const int *argv, Buf *out);
+void emit_regexp_new(Compiler *c, int argc, const int *argv, Buf *b);
 int emit_try_convert_boxed(Compiler *c, const char *cname, int arg, Buf *b);
 int re_src_has_backref(const char *s);
 int emit_time_civil_ctor(Compiler *c, int id, int is_utc, int is_new, Buf *b);

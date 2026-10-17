@@ -999,8 +999,8 @@ int an_int_step_range_chain(Compiler *c, int id) {
    block that does not answer its receiver, a reader (`size` and `take(n)`
    too, which an Array answers alike), and `each { }` or
    `each_with_index { }` whose value is dropped. A blockless map or select
-   (which the Enumerator has no blockless form of), `each(&blk)`, and an
-   `each { |x, y| }` whose value is read keep the Array as before. */
+   (which the Enumerator has no blockless form of) and `each(&blk)` keep the
+   Array as before. */
 int an_blockless_tuples_kept(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   int p = comp_recv_parent(c, id);
@@ -1017,16 +1017,7 @@ int an_blockless_tuples_kept(Compiler *c, int id) {
   if (pblk >= 0 && nt_kind(nt, pblk) == NK_BlockNode) {
     if (each || ewi) {
       if (comp_value_dropped(c, p)) return 1;
-      /* `each { |x, y| }` over the Enumerator is rewritten to the call's
-         block form after its parameters are shaped for the Array's walk:
-         only a block taking one value, or none, is kept off the Array */
-      int bp = nt_ref(nt, pblk, "parameters");
-      const char *bpt = bp >= 0 ? nt_type(nt, bp) : NULL;
-      int plain = bp < 0 || (bpt && sp_streq(bpt, "BlockParametersNode") &&
-                             block_param_name(c, pblk, 0) && !block_param_name(c, pblk, 1) &&
-                             !block_opt_name(c, pblk, 0) && !block_post_name(c, pblk, 0) &&
-                             !block_rest_marker(c, pblk));
-      return each && !plain;
+      return 0;
     }
     for (int i = 0; KEPT_WALK[i]; i++) if (sp_streq(pn, KEPT_WALK[i])) return 1;
     return 0;
@@ -1297,6 +1288,7 @@ static int an_elems_int_rows(Compiler *c, int arr, int *saw) {
   return 1;
 }
 
+static TyKind infer_empty_array_kind(Compiler *c, int id);
 static int an_settled_int(Compiler *c, int n, int depth);
 
 /* Whether every write of constant `name` is a plain `NAME = v` whose value
@@ -2353,9 +2345,10 @@ TyKind an_class_concrete(Compiler *c, int id, const char *name, TyKind t) {
     /* a class method no Class value the receiver holds reaches has no arm
        (poly_cls_value_cands): Shellwords.split beside `{b: Integer}` */
     if (!poly_cls_value_reaches(c, id, s->class_id)) continue;
-    /* nor one whose class no box can hold, a module the program only
-       calls (share_target_reachable): `Params.sub` beside a String's sub, */
-    if (!share_target_reachable(c, id, targets[i])) continue;
+    /* nor one the dispatch leaves out, a module's own class method no box
+       can hold or reach (poly_cls_arm_left_out): `Params.sub` beside a
+       String's sub */
+    if (poly_cls_arm_left_out(c, id, s->class_id, targets[i])) continue;
     /* nor one that cannot take the call's arguments: it only raises
        (cplan_target_binds), `def self.split(s, keys, values, present)` */
     if (!cplan_target_binds(c, id, targets[i])) continue;
@@ -2366,6 +2359,23 @@ TyKind an_class_concrete(Compiler *c, int id, const char *name, TyKind t) {
        split beside a module's `def self.split = [1, s]` (under
        --share-strings a String Array moves in as its handles,
        sp_StrArray_to_poly_handles) */
+    if (ty_is_array(r) && ty_is_array(j)) { j = TY_POLY_ARRAY; continue; }
+    return TY_POLY;
+  }
+  /* the plan lists the call's target, but the dispatch arms every class
+     method of the name the receiver may hold (poly_cls_value_cands): one the
+     plan does not name (Splitter.split beside Shellwords.split, with a Class
+     value the walk cannot name in the receiver) shares the slot as well */
+  int ncc = 0;
+  const PolyCand *cc = comp_cmethod_candidates(c, name, &ncc);
+  for (int i = 0; i < ncc; i++) {
+    int k = cc[i].cls, mi = cc[i].mi;
+    if (mi < 0 || mi >= c->nscopes || is_builtin_reopen(c->classes[k].name)) continue;
+    if (!poly_cls_value_reaches(c, id, k) || poly_cls_arm_left_out(c, id, k, mi) ||
+        !cplan_target_binds(c, id, mi)) continue;
+    TyKind r = (TyKind)c->scopes[mi].ret;
+    if (r == j || r == TY_UNKNOWN || r == TY_VOID) continue;
+    if (r == TY_NIL && an_ty_holds_nil(j)) continue;
     if (ty_is_array(r) && ty_is_array(j)) { j = TY_POLY_ARRAY; continue; }
     return TY_POLY;
   }
@@ -2396,8 +2406,12 @@ static TyKind infer_call_inner(Compiler *c, int id);
 /* The type of an implicit-self call to `name` bound to `mi` in scope `self`:
    the method's return unified with every descendant's direct override,
    since codegen's dispatch switches over them all. */
+static TyKind cmethod_setter_assign_ty(Compiler *c, int id, int mi);
 static TyKind an_self_call_ret(Compiler *c, Scope *self, const char *name, int mi, int id) {
   TyKind r = an_user_call(c, id, mi, c->scopes[mi].is_cmethod ? UC_CMETH : UC_INST, self->class_id);
+  /* an assignment through a writer is its argument whichever class's
+     writer the dispatch runs, so no override's return widens it */
+  if (c->scopes[mi].is_cmethod && cmethod_setter_assign_ty(c, id, mi) != TY_UNKNOWN) return r;
   return dispatch_ret_over(c, self->class_id, name, self->is_cmethod, mi, r, id);
 }
 /* `k[]` or `k[1, 2, 3]` on a boxed receiver: no builtin `[]` takes that
@@ -2488,6 +2502,9 @@ static int yield_recv_builtin_every_site(Compiler *c, int call) {
 }
 
 TyKind infer_call(Compiler *c, int id) {
+  /* a receiver that folded to a constant after the early rewrite of a
+     singleton alias of a builtin's class method (`k = Integer; k.root(25)`) */
+  if (c->has_cm_builtin_alias && !an_pure_reads && nt_ref(c->nt, id, "receiver") >= 0) rewrite_builtin_cm_alias_call(c, id);
   /* a builtin call a desugar built (desugar_builtin, beside builtin_only)
      answers what the builtin alone answers, as it is emitted: a reopened
      class's own method of the name is no candidate */
@@ -2619,7 +2636,7 @@ static int sg_accessor_type(Compiler *c, int ci, const char *name, TyKind *out) 
   else {
     /* an accessor backed by the class-level ivar reads that slot's type;
        the alias table maps a renamed accessor onto it (#3776) */
-    rn = comp_resolve_alias(c, ci, name);
+    rn = comp_resolve_cm_alias_at(c, ci, name, NULL);
     if (!rn) rn = name;
     if (!comp_is_sg_reader(cls, rn)) return 0;
   }
@@ -2682,21 +2699,27 @@ void an_user_call_record(Compiler *c, int id, int mi, int via, int owner_ci) {
   c->ucall_inf[id].via = (unsigned char)via;
 }
 
+/* `Klass.x = v` through the class's writer is an assignment: its value
+   is v as written, whatever the body returns (emit_cmethod_setter_assign),
+   as an instance writer's is. TY_UNKNOWN for any other call, and for an
+   argument not yet typed, which leaves the call to the method's return
+   until the next round revisits it. */
+static TyKind cmethod_setter_assign_ty(Compiler *c, int id, int mi) {
+  if (!c->scopes[mi].is_cmethod || nt_ref(c->nt, id, "block") >= 0 ||
+      !call_is_setter_assign(c->nt, id)) return TY_UNKNOWN;
+  int an = nt_ref(c->nt, id, "arguments"), ac = 0;
+  const int *av = an >= 0 ? nt_arr(c->nt, an, "arguments", &ac) : NULL;
+  if (ac != 1 || nt_kind(c->nt, av[0]) == NK_SplatNode) return TY_UNKNOWN;
+  TyKind rk = infer_type(c, av[0]);
+  if (rk == TY_STRBUF && c->share_strings) rk = TY_STRING;
+  return rk;
+}
+
 TyKind an_user_call(Compiler *c, int id, int mi, int via, int owner_ci) {
   an_user_call_record(c, id, mi, via, owner_ci);
-  /* `Klass.x = v` through the class's writer is an assignment: its value
-     is v as written, whatever the body returns (emit_cmethod_setter_assign),
-     as an instance writer's is. An argument not yet typed leaves the call
-     to the method's return, which the next round revisits. */
-  if (via == UC_CMETH && c->scopes[mi].is_cmethod && nt_ref(c->nt, id, "block") < 0 &&
-      call_is_setter_assign(c->nt, id)) {
-    int an = nt_ref(c->nt, id, "arguments"), ac = 0;
-    const int *av = an >= 0 ? nt_arr(c->nt, an, "arguments", &ac) : NULL;
-    if (ac == 1 && nt_kind(c->nt, av[0]) != NK_SplatNode) {
-      TyKind rk = infer_type(c, av[0]);
-      if (rk == TY_STRBUF && c->share_strings) rk = TY_STRING;
-      if (rk != TY_UNKNOWN) return rk;
-    }
+  if (via == UC_CMETH) {
+    TyKind rk = cmethod_setter_assign_ty(c, id, mi);
+    if (rk != TY_UNKNOWN) return rk;
   }
   /* A yielding reopening is called through its proc form. Its return
      includes the block's boxed answer, also through rescue or ensure. */
@@ -2704,13 +2727,83 @@ TyKind an_user_call(Compiler *c, int id, int mi, int via, int owner_ci) {
   return method_call_ret(c, pf >= 0 ? pf : mi, id);
 }
 
+/* Does the row this pass finds for call `id` count as the call's own? Not
+   under the builtin-only re-derivation, whose answer is not the call's (a
+   user method owns the name there). Except for the call that re-derivation
+   was asked about when a desugar built it (infer_call): the builtin answer
+   is the answer it has, as it is emitted. */
+static int an_bop_records(Compiler *c, int id) {
+  if (!g_plan_check || an_pure_reads || id < 0 || id >= c->node_cap) return 0;
+  if (!an_builtin_only) return 1;
+  int recv = nt_ref(c->nt, id, "receiver");
+  return recv >= 0 && recv == an_bo_recv && nt_int(c->nt, id, "desugar_builtin", 0);
+}
+
 const BuiltinOp *an_bop_find(Compiler *c, int id, TyKind rt, const char *name,
                              int argc, int has_block) {
   const BuiltinOp *op = bop_find(rt, name, argc, has_block);
-  if (g_plan_check && !an_builtin_only && !an_pure_reads && op && op->result != TY_UNKNOWN &&
-      id >= 0 && id < c->node_cap)
+  if (op && op->result != TY_UNKNOWN && an_bop_records(c, id))
     c->bop_inf[id] = op;
   return op;
+}
+
+/* Does the program give a builtin class or module (String, Comparable,
+   Kernel, Object ...) an instance method of its own, by a def in it or a
+   module it includes or prepends? Shape alone, so asked once per scope
+   count. */
+static int an_prog_extends_builtin(Compiler *c) {
+  static const Compiler *seen_c;
+  static int seen_n = -1, ans;
+  if (seen_c == c && seen_n == c->nscopes) return ans;
+  seen_c = c; seen_n = c->nscopes; ans = 0;
+  for (int k = 0; k < c->nclasses && !ans; k++)
+    if (c->classes[k].is_builtin_const && (c->classes[k].nincluded_mods > 0 || c->classes[k].nprep_chain > 0)) ans = 1;
+  for (int s = 0; s < c->nscopes && !ans; s++) {
+    int k = c->scopes[s].class_id;
+    if (k >= 0 && k < c->nclasses && c->classes[k].is_builtin_const && !c->scopes[s].is_cmethod && c->scopes[s].name) ans = 1;
+  }
+  return ans;
+}
+
+/* A call on a boxed receiver whose only argument is a splat, of a name a
+   builtin answers when called with a receiver: where a user class also
+   owns the name, the class-id dispatch's builtin default cannot read the
+   list (its emitters take typed arguments of a fixed count), so it calls
+   the builtin's generic entry instead (bi_generic_fn), which takes the list
+   as (argc, argv) and answers boxed. Object's own methods, and the names
+   whose builtin default reads a splat itself (poly_splat_keyed), keep the
+   arms they have. */
+int an_bi_generic_splat(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  if (id < 0 || nt_kind(nt, id) != NK_CallNode || nt_ref(nt, id, "block") >= 0) return 0;
+  if (nt_ref(nt, id, "receiver") < 0 || call_is_safe_nav(nt, id)) return 0;
+  const char *name = nt_str(nt, id, "name");
+  if (!name) return 0;
+  int an = nt_ref(nt, id, "arguments"), n = 0;
+  const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &n) : NULL;
+  if (n != 1 || nt_kind(nt, av[0]) != NK_SplatNode) return 0;
+  if (object_public_method_name(name) || poly_splat_keyed(name) || !bop_generic_entry(name, NULL)) return 0;
+  /* a name that may change a String in place (String's mutators and any
+     name ending in `!`, on any receiver, which the call site does not know):
+     the default build hands a boxed String to it as a copy, which the
+     written-out call loses the change of too, so only a build that shares
+     Strings by reference takes the entry */
+  if (!repr_share_rule(c) && an_str_mutator_name(name)) return 0;
+  /* a name every value answers (an Object row), or one the program defines
+     in a subclass of Array, Hash or String, which the dispatch reads as its
+     builtin: the entry would run the builtin's own method instead */
+  const char *own[64];
+  if (builtin_recv_owner_classes(name, own, 64) < 0) return 0;
+  for (int k = 0; k < c->nclasses; k++)
+    if (c->classes[k].ary_root > 0 && comp_method_in_chain(c, k, name, NULL) >= 0) return 0;
+  /* a name the program aliases, undefines, hides or defines by a Symbol
+     (`alias center ljust`, `private :center`), and any name in a program
+     that gives a builtin class or module a method of its own (String,
+     Comparable, Kernel ...): CRuby's builtin then answers through that
+     method (an Integer's own `<=>`), which the entry's arms do not call */
+  if (an_prog_names_method(name) || an_prog_extends_builtin(c)) return 0;
+  int lo, hi;
+  return builtin_recv_arity_span(name, &lo, &hi);
 }
 
 /* A boxed receiver or a boxed first operand (infer_call_inner's rules, in their order) */
@@ -3174,6 +3267,10 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
          The builtin answer's own shape is recorded for codegen, which emits
          the builtin arm by re-entering the ordinary emission and has to know
          whether that produces an array pointer or a boxed value. */
+      /* a splat the dispatch hands to a builtin's generic entry: its answer
+         is boxed, whatever the count the list has at run time */
+      if (found && !an_builtin_only && rt == TY_POLY && an_bi_generic_splat(c, id))
+        { *out = TY_POLY; return 1; }
       if (found && !an_builtin_only && poly_container_read_p(name) &&
           nt_ref(nt, id, "block") < 0 && poly_expr_flows_container(c, recv)) {
         { *out = an_poly_concrete(c, name, TY_POLY); return 1; }
@@ -3719,8 +3816,9 @@ static int infer_new_call(Compiler *c, int id, const NodeTable *nt, const char *
           }
         }
         /* a bare `Array.new` carries no element type; leave it UNKNOWN (like an
-           empty `[]`) so the push-promotion pass can narrow it from `<<`/push. */
-        if (argc == 0 && blk < 0) { *out = TY_UNKNOWN; return 1; }
+           empty `[]`) so the push-promotion pass can narrow it from `<<`/push,
+           and give it the kind its use fixes, as `[]` has. */
+        if (argc == 0 && blk < 0) { *out = infer_empty_array_kind(c, id); return 1; }
         /* Array.new(array) is a copy of the array, of its own kind (#7449).
            An argument not typed yet may still turn out to be one. */
         if (argc == 1 && blk < 0) {
@@ -5085,7 +5183,7 @@ static int cls_value_sg_accessor_any(Compiler *c, const char *name, int argc) {
   snprintf(base, sizeof base, "%.*s", setter ? nlen - 1 : nlen, name);
   for (int k = 0; k < c->nclasses; k++) {
     if (is_builtin_reopen(c->classes[k].name)) continue;
-    const char *rn = setter ? base : comp_resolve_alias(c, k, name);
+    const char *rn = setter ? base : comp_resolve_cm_alias_at(c, k, name, NULL);
     if (setter ? comp_is_sg_writer(&c->classes[k], base) : comp_is_sg_reader(&c->classes[k], rn ? rn : name))
       return 1;
   }
@@ -5162,7 +5260,10 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
     if (argc == 0 && sp_streq(name, "ancestors")) { *out = TY_POLY_ARRAY; return 1; }
     if (argc == 0 && sp_streq(name, "subclasses")) { *out = TY_POLY_ARRAY; return 1; }
     if (argc == 1 && is_kind_query(name)) { *out = TY_BOOL; return 1; }
-    if (argc == 1 && sp_streq(name, "include?")) { *out = TY_BOOL; return 1; }
+    if (argc == 1 && sp_streq(name, "include?")) {
+      int oci = class_recv_static_ci(c, recv);
+      if (oci < 0 || comp_cmethod_in_chain(c, oci, name, NULL) < 0) { *out = TY_BOOL; return 1; }
+    }
     if (argc == 1 && sp_streq(name, "class_variable_defined?")) { *out = TY_BOOL; return 1; }
     if (sp_streq(name, "class_variable_get") || sp_streq(name, "class_variable_set")) { *out = TY_POLY; return 1; }
     if (argc <= 1 && (sp_streq(name, "instance_methods") ||
@@ -5265,8 +5366,13 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
          body answers -- `def dup = self.class.new(...)` answers boxed (#5461) */
       !(ty_is_object(rt) &&
         comp_resolve_member(c, ty_object_class(rt), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
-      !(rt == TY_POLY && an_user_defines_method(c, name)))
-    { *out = rt; return 1; }
+      !(rt == TY_POLY && an_user_defines_method(c, name))) {
+    /* the receiver kind's row answers (the receiver itself, as the rule says
+       where no row does) */
+    const BuiltinOp *op = an_bop_find(c, id, bop_family_of(rt), name, argc, nt_ref(nt, id, "block") >= 0);
+    *out = op && op->result != TY_UNKNOWN ? bop_result(op, rt) : rt;
+    return 1;
+  }
 
   /* bareword freeze (implicit self) returns self, so `def seal = freeze` and
      other freeze-as-value uses stay typed as the instance. (Matches the
@@ -5344,6 +5450,13 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
       nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "CallNode") &&
       nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "encoding"))
     { *out = TY_STRING; return 1; }
+
+  /* Module#constants on a boxed value that is a class answers its names
+     (codegen's emit_class_value_constants), as on a typed class value */
+  if (recv >= 0 && rt == TY_POLY && sp_streq(name, "constants") && nt_ref(nt, id, "block") < 0 &&
+      (argc == 0 || (argc == 1 && (nt_kind(nt, argv[0]) == NK_TrueNode || nt_kind(nt, argv[0]) == NK_FalseNode))) &&
+      !an_user_defines_method(c, name))
+    { *out = TY_POLY_ARRAY; return 1; }
 
   /* Module.singleton_writer= / Module.singleton_reader */
   if (recv >= 0 && nt_type(nt, recv) &&
@@ -5497,7 +5610,10 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
       /* bare `new` inside a class method returns an instance of self's class */
       if (self->is_cmethod && sp_streq(name, "new"))
         { *out = ty_object(self->class_id); return 1; }
-      int mi = comp_method_in_chain(c, self->class_id, name, NULL);
+      /* a class method's self is the class: of the instance methods on its
+         chain only Object's and Module's are its own (comp_self_call_mi) */
+      int mi = self->is_cmethod ? comp_class_self_inst_mi(c, self->class_id, name)
+                                : comp_method_in_chain(c, self->class_id, name, NULL);
       if (mi < 0 && self->is_cmethod)
         mi = comp_cmethod_in_chain(c, self->class_id, name, NULL);
       if (mi >= 0) { *out = an_self_call_ret(c, self, name, mi, id); return 1; }
@@ -5994,8 +6110,11 @@ static int infer_user_method_call(Compiler *c, int id, const NodeTable *nt, cons
   if (recv >= 0 && argc == 0 && sp_streq(name, "frozen?") &&
       (rt == TY_INT || rt == TY_FLOAT || rt == TY_SYMBOL || rt == TY_BOOL ||
        rt == TY_NIL || rt == TY_RANGE || rt == TY_COMPLEX || rt == TY_RATIONAL ||
-       rt == TY_BIGINT))
-    { *out = TY_BOOL; return 1; }
+       rt == TY_BIGINT)) {
+    const BuiltinOp *op = an_bop_find(c, id, rt, name, argc, nt_ref(nt, id, "block") >= 0);
+    *out = op && op->result != TY_UNKNOWN ? op->result : TY_BOOL;
+    return 1;
+  }
   return 0;
 }
 
@@ -7707,11 +7826,11 @@ static TyKind infer_call_prelude(Compiler *c, int id) {
   /* the call is inferred afresh: only the row this pass answers with counts */
   /* the builtin-only re-derivation (an_builtin_answer) asks what the call
      would be with no user method: not the call's answer, so it neither
-     clears nor makes the call's records */
-  if (g_plan_check && !an_builtin_only && !an_pure_reads && id >= 0 && id < c->node_cap) {
-    c->bop_inf[id] = NULL;
+     clears nor makes the call's records (the builtin-op one is the call's
+     for a desugar-built call, an_bop_records) */
+  if (an_bop_records(c, id)) c->bop_inf[id] = NULL;
+  if (g_plan_check && !an_builtin_only && !an_pure_reads && id >= 0 && id < c->node_cap)
     c->ucall_inf[id].via = UC_NONE;
-  }
 
   return TY_UNKNOWN;
 }
@@ -8978,6 +9097,8 @@ static TyKind an_empty_container_tail(Compiler *c, int stmts) {
   int n = 0;
   const int *bb = nt_arr(nt, stmts, "body", &n);
   int tail = (bb && n > 0) ? bb[n - 1] : stmts;
+  tail = an_unparen(nt, tail);   /* `([])` is `[]` */
+  if (tail < 0) return TY_UNKNOWN;
   const char *ty = nt_type(nt, tail);
   int len = 0;
   if (ty && sp_streq(ty, "ArrayNode")) {
@@ -9049,7 +9170,7 @@ static TyKind an_paren_ty(Compiler *c, int id) {
 int an_or_empty_hash_fallback(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
   if (node < 0 || nt_kind(nt, node) != NK_OrNode) return -1;
-  int r = nt_ref(nt, node, "right");
+  int r = an_unparen(nt, nt_ref(nt, node, "right"));   /* `x || ({})` is `x || {}` */
   if (r < 0 || nt_kind(nt, r) == NK_ArrayNode || !node_is_empty_container(nt, r)) return -1;
   if (nt_kind(nt, r) == NK_CallNode && an_empty_container_new(c, r) != 2) return -1;
   TyKind lt = infer_type(c, nt_ref(nt, node, "left"));
@@ -9751,6 +9872,25 @@ static int range_indexes_seq(Compiler *c, int id) {
   return ty_is_array(rt) || rt == TY_STRING || rt == TY_STRBUF;
 }
 
+/* The kind of an empty `[]`, or of a bare `Array.new`, which carries no
+   element type either, from the use that fixes it (mark_empty_array_operands),
+   else UNKNOWN. */
+static TyKind infer_empty_array_kind(Compiler *c, int id) {
+  /* A SPECIFIC kind fixed by the use context outranks the generic poly
+     layout: the row of an `Array.new(n) { [] }` table is a block tail
+     (marked as a receiver-style empty) and is built as an sp_FloatArray
+     once narrow_object_arrays has decided the table's kind (#4484). */
+  if (c->arr_want && id < c->node_cap && ty_is_array(c->arr_want[id]) &&
+      c->arr_want[id] != TY_POLY_ARRAY)
+    return c->arr_want[id];
+  if (c->empty_arr_recv && id < c->node_cap && c->empty_arr_recv[id])
+    return TY_POLY_ARRAY;
+  /* kind fixed by the use context (mark_empty_array_operands) */
+  if (c->arr_want && id < c->node_cap && ty_is_array(c->arr_want[id]))
+    return c->arr_want[id];
+  return infer_empty_array_reopen(c, id);  /* empty: element type comes from usage */
+}
+
 static TyKind infer_array_literal(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
     if (nt_int(nt, id, "cext_args", 0)) return TY_POLY_ARRAY;
@@ -9761,19 +9901,7 @@ static TyKind infer_array_literal(Compiler *c, int id) {
          writes to infer from, so mark_empty_array_operands types it as a poly
          array. An argument may instead take a specific layout through arr_want.
          Elsewhere it stays UNKNOWN so `x = []; x << 1` can back-fill its kind. */
-      /* A SPECIFIC kind fixed by the use context outranks the generic poly
-         layout: the row of an `Array.new(n) { [] }` table is a block tail
-         (marked as a receiver-style empty) and is built as an sp_FloatArray
-         once narrow_object_arrays has decided the table's kind (#4484). */
-      if (c->arr_want && id < c->node_cap && ty_is_array(c->arr_want[id]) &&
-          c->arr_want[id] != TY_POLY_ARRAY)
-        return c->arr_want[id];
-      if (c->empty_arr_recv && id < c->node_cap && c->empty_arr_recv[id])
-        return TY_POLY_ARRAY;
-      /* kind fixed by the use context (mark_empty_array_operands) */
-      if (c->arr_want && id < c->node_cap && ty_is_array(c->arr_want[id]))
-        return c->arr_want[id];
-      return infer_empty_array_reopen(c, id);  /* empty: element type comes from usage */
+      return infer_empty_array_kind(c, id);
     }
     /* A callee stores elements of another kind into the literal it is
        passed (widen_arg_array). */
@@ -9817,7 +9945,8 @@ static TyKind infer_array_literal(Compiler *c, int id) {
        String Array of handles (#8328 step 5) when a local holds it, where its
        container class can take that form (share_strh_gate refuses it
        otherwise, for good) */
-    if (strh_all && strh_has && !share_strh_node_no(c, id) && comp_lwrite_of_value(c, id) >= 0) return TY_STRH_ARRAY;
+    if (strh_all && (strh_has || share_strh_literal_slot(c, id)) && !share_strh_node_no(c, id) && strh_literal_held(c, id))
+      return TY_STRH_ARRAY;
     /* ty_array_of holds an all-unknown element type at bottom while the
        fixpoint runs; see its TY_UNKNOWN case. */
     return ty_array_of(e);
@@ -10388,6 +10517,7 @@ TyKind infer_uncached(Compiler *c, int id) {
        other arm makes the answer boxed; `if u then Rel.new else [] end` built
        an sp_IntArray into an sp_Rel slot (#4938). */
     { int tk = an_empty_container_kind(c, then_b), ek = an_empty_container_kind(c, else_b);
+      if (tk && ek && tk != ek) return TY_POLY;
       if (tt == TY_UNKNOWN && tk && ek == 0 && an_empty_container_disagrees(tk, et)) return TY_POLY;
       if (et == TY_UNKNOWN && ek && tk == 0 && an_empty_container_disagrees(ek, tt)) return TY_POLY;
       /* ...and against an arm that settles on no type at all (a call nothing
@@ -10595,6 +10725,19 @@ TyKind infer_uncached(Compiler *c, int id) {
        chain (the instance chain would miss `def self.x` entirely). */
     int mi = s->is_cmethod ? comp_cmethod_in_chain(c, p, uname, NULL)
                            : comp_method_in_chain(c, p, uname, NULL);
+    /* a subclass of a native class (#9269): super reaches the native
+       class's constructor (initialize) or binding */
+    if (mi < 0 && !s->is_cmethod && uname && c->classes[s->class_id].nsub_root > 0) {
+      int root = c->classes[s->class_id].nsub_root - 1;
+      if (sp_streq(uname, "initialize")) return TY_NIL;
+      int sa = nk == NK_SuperNode ? nt_ref(nt, id, "arguments") : -1, sac = 0;
+      if (sa >= 0) (void)nt_arr(nt, sa, "arguments", &sac);
+      if (nk == NK_ForwardingSuperNode) sac = s->nparams;
+      int nm = comp_native_method_find(c, root, uname, sac, 0);
+      if (nm >= 0)
+        return sp_streq(c->native_methods[nm].ret, "self") ? ty_object(s->class_id)
+                                                           : native_spec_to_ty(c->native_methods[nm].ret);
+    }
     if (mi < 0) return none;
     an_user_call_record(c, id, mi, UC_SUPER, p);
     return super_target_ret(c, s, mi, id);

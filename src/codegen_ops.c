@@ -182,7 +182,7 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
     }
     else if (p[0] == '$' && (p[1] == '<' || p[1] == '>')) {
       TyKind rk = bop_result(x->op, x->rt);
-      if (!oint_kind(rk)) rk = comp_ntype(c, x->id);
+      if (!oint_kind(rk)) rk = repr_of(c, x->id).as_ty;
       if (oint_kind(rk) && !node_is_oint(c, x->id)) buf_printf(b, p[1] == '<' ? "%s(" : ")", oint_arg(rk));
       p++;
     }
@@ -190,7 +190,7 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
        where the consumer takes the oint (node_is_oint) */
     else if (p[0] == '$' && (p[1] == '[' || p[1] == ']')) {
       TyKind rk = bop_result(x->op, x->rt);
-      if (!oint_kind(rk)) rk = comp_ntype(c, x->id);
+      if (!oint_kind(rk)) rk = repr_of(c, x->id).as_ty;
       if (oint_kind(rk) && node_is_oint(c, x->id)) buf_printf(b, p[1] == '[' ? "%s(" : ")", oint_of(rk));
       p++;
     }
@@ -313,7 +313,8 @@ static int emit_op_pstatus_eq(Compiler *c, const BopCtx *x, Buf *b) {
      conflict    inference answered from a different row: the two halves
                  decided the call differently
      unrecorded  inference answered without a row (a rule ahead of the
-                 lookup, or a codegen-only row whose result is TY_UNKNOWN)
+                 lookup, or a codegen-only row whose result is TY_UNKNOWN
+                 and not BOPF_INFERRED)
      respecialized  inference's row is for another receiver kind: the node
                  is emitted more than once with its receiver typed per copy
                  (a yield's value, read per call site), and inference keeps
@@ -321,6 +322,11 @@ static int emit_op_pstatus_eq(Compiler *c, const BopCtx *x, Buf *b) {
 static void plan_check_observe(Compiler *c, int id, TyKind rt, const BuiltinOp *op) {
   if (view_depth() > 0 || id < 0 || id >= c->node_cap) return;
   const BuiltinOp *inf = c->bop_inf[id];
+  /* A row flagged BOPF_INFERRED says inference types the call in a rule of
+     its own; inference records no row for it (an_bop_find), so answering
+     without one is what the row says. The call still has to have been
+     typed: an untyped one stays unrecorded. */
+  if (!inf && (op->flags & BOPF_INFERRED) && comp_ntype(c, id) != TY_UNKNOWN) return;
   /* A different name is a different call: codegen renamed the node to emit
      it (a String bang's value form runs the plain method), so the row
      inference chose for the original name says nothing about this one. */
@@ -427,6 +433,18 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_ARRAY_SLICE_GROUPS] = emit_op_array_slice_groups,
   [BOPE_ARRAY_JOIN_STR] = emit_op_array_join_str,
   [BOPE_IVAR_REFLECTION] = emit_op_ivar_reflection,
+  [BOPE_METHOD_UNBIND] = emit_op_method_unbind,
+  [BOPE_METHOD_SUPER_METHOD] = emit_op_method_super_method,
+  [BOPE_METHOD_BIND] = emit_op_method_bind,
+  [BOPE_METHOD_TO_PROC] = emit_op_method_to_proc,
+  [BOPE_METHOD_ORIGINAL_NAME] = emit_op_method_original_name,
+  [BOPE_METHOD_SOURCE_LOCATION] = emit_op_method_source_location,
+  [BOPE_METHOD_PARAMETERS] = emit_op_method_parameters,
+  [BOPE_METHOD_OWNER] = emit_op_method_owner,
+  [BOPE_METHOD_RECEIVER] = emit_op_method_receiver,
+  [BOPE_METHOD_ARITY] = emit_op_method_arity,
+  [BOPE_PROC_PARAMETERS] = emit_op_proc_parameters,
+  [BOPE_PROC_SOURCE_LOCATION] = emit_op_proc_source_location,
   [BOPE_ARRAY_PRED_CLASS] = emit_op_array_pred_class,
 };
 
@@ -441,12 +459,8 @@ static int emit_builtin_op_ex(Compiler *c, int id, int recv, TyKind rt, const ch
                               const char *rtext, int t0, int stage, Buf *b) {
   if (recv < 0) return 0;
   /* a Hash or Array receiver of any variant reads its family's rows */
-  TyKind lk = rt;
-  if (!bop_covers(rt)) {
-    if (ty_is_hash(rt)) lk = BOP_ANY_HASH;
-    else if (ty_is_array(rt)) lk = BOP_ANY_ARRAY;
-    if (lk == rt || !bop_covers(lk)) return 0;
-  }
+  TyKind lk = bop_family_of(rt);
+  if (!bop_covers(lk)) return 0;
   int argc;
   const int *argv = call_args(c->nt, id, &argc);
   BopArgs a = { c, argv };

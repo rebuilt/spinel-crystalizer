@@ -274,7 +274,7 @@ void sp_io_wait_writable(sp_File *f) {SP_GC_ROOT(f);
   sp_io_unuse(f);
   if (wfd < 0) return;
   { struct pollfd wp; wp.fd = wfd; wp.events = POLLOUT; wp.revents = 0;
-    if (poll(&wp, 1, 0) > 0) return; }   /* room already: no park */
+    if (SP_SIG_BLOCKING(poll(&wp, 1, 0)) > 0) return; }   /* room already: no park */
 #ifdef SP_THREADS
   {
     extern int sp_sched_wait_io_unless(int fd, short events, const unsigned char *cancel);
@@ -288,7 +288,7 @@ void sp_io_wait_writable(sp_File *f) {SP_GC_ROOT(f);
     p.fd = wfd; p.events = POLLOUT;
     for (;;) {
       p.revents = 0;
-      int r = poll(&p, 1, 1);
+      int r = SP_SIG_BLOCKING(poll(&p, 1, 1));
       if (r > 0 || (r < 0 && errno != EINTR && errno != EAGAIN)) return;
       sp_Thread_pass();
     }
@@ -309,7 +309,7 @@ static void sp_io_park_fd_readable(int fd, const unsigned char *closed) {
      paying that when the bytes are already there is most of the cost in the
      shape that reads right after an IO.select says the fd is ready. */
   { struct pollfd rp; rp.fd = fd; rp.events = POLLIN; rp.revents = 0;
-    if (poll(&rp, 1, 0) > 0) return; }
+    if (SP_SIG_BLOCKING(poll(&rp, 1, 0)) > 0) return; }
 #ifdef SP_THREADS
   {
     extern int sp_sched_wait_io_unless(int fd, short events, const unsigned char *cancel);
@@ -327,7 +327,7 @@ static void sp_io_park_fd_readable(int fd, const unsigned char *closed) {
     p.events = POLLIN;
     for (;;) {
       p.revents = 0;
-      int r = poll(&p, 1, 1);
+      int r = SP_SIG_BLOCKING(poll(&p, 1, 1));
       if (r > 0 || (r < 0 && errno != EINTR && errno != EAGAIN)) return;
       sp_Thread_pass();
     }
@@ -1223,31 +1223,38 @@ sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, const char *host, 
 }
 static long sp_io_buffered(FILE *fp);
 /* #recv reads one datagram (or up to `len` stream bytes) as a String;
-   #recvfrom pairs it with the sender's address, CRuby's 4-element form. */
+   #recvfrom pairs it with the sender's address, CRuby's 4-element form.
+   The payload is BINARY in every shape, as CRuby answers it. */
 const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
   extern int sp_net_udp_recv_from(int fd, char *buf, int cap, char *ipbuf, int ipcap, int *port_out);
   sp_sock_require(f, "recv");
-  if (len <= 0) return sp_str_from_bytes("", 0);
+  if (len < 0) sp_raise_cls("ArgumentError", "negative string size (or size too big)");
   /* bytes a read on the stream already pulled into stdio's buffer are the
      peer's next ones: served first, as readpartial does, or recv stepped
      over them (#7195) */
   long pend = sp_io_buffered(sp_io_use(f));
   sp_io_unuse(f);
+  /* a zero-length read of a stream with bytes waiting answers nil, as
+     recv(2) of none answers 0 below */
+  if (pend > 0 && len == 0) return NULL;
   if (pend > 0) {
     size_t want = (size_t)len < (size_t)pend ? (size_t)len : (size_t)pend;
     char *r = sp_str_alloc(want);
-    size_t got = fread(r, 1, want, sp_io_use(f));
+    size_t got = SP_SIG_BLOCKING(fread(r, 1, want, sp_io_use(f)));
     sp_io_unuse(f);
     r[got] = 0;
     sp_str_set_len(r, got);
+    sp_str_mark_binary(r);
     return r;
   }
   /* park until the peer writes, as readpartial does: a close from another
      thread then wakes this one with CRuby's IOError, where a recv(2) already
      blocked in the kernel answered EBADF, or read a descriptor that was by
      then someone else's (#7555) */
+  /* (a zero-length read still waits for the peer, as CRuby's does: a
+     datagram it then takes is discarded, and a stream answers nil) */
   sp_io_wait_readable(f);
-  char *buf = (char *)malloc((size_t)len);
+  char *buf = (char *)malloc(len > 0 ? (size_t)len : 1);
   if (!buf) sp_raise_cls("NoMemoryError", "recv");
   FILE *fp = sp_io_try_use(f);
   if (!fp) { free(buf); sp_raise_cls("IOError", "stream closed in another thread"); }
@@ -1262,8 +1269,9 @@ const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
   errno = e;
   if (n < 0) { free(buf); sp_file_raise_errno("recv", ""); }
   if (eof) { free(buf); return NULL; }
-  const char *s = sp_str_from_bytes(buf, (size_t)n);
+  char *s = (char *)sp_str_from_bytes(buf, (size_t)n);
   free(buf);
+  sp_str_mark_binary(s);
   return s;
 }
 /* Fills the caller's address slots; returns the payload. */
@@ -1272,22 +1280,19 @@ const char *sp_sock_recvfrom(sp_File *f, sp_int len, const char **ip_out, sp_int
   sp_sock_require(f, "recvfrom");
   char ipbuf[64];
   int port = 0;
-  if (len <= 0) {
-    const char *s = sp_str_from_bytes("", 0); SP_GC_ROOT_STR(s);   /* across the address's copy */
-    *ip_out = sp_str_from_bytes("", 0);
-    *port_out = 0;
-    return s;
-  }
+  if (len < 0) sp_raise_cls("ArgumentError", "negative string size (or size too big)");
+  /* (a zero-length read waits and takes a datagram too, as sp_sock_recv) */
   sp_io_wait_readable(f);   /* as sp_sock_recv (#7555) */
-  char *buf = (char *)malloc((size_t)len);
+  char *buf = (char *)malloc(len > 0 ? (size_t)len : 1);
   if (!buf) sp_raise_cls("NoMemoryError", "recvfrom");
   FILE *fp = sp_io_try_use(f);
   if (!fp) { free(buf); sp_raise_cls("IOError", "stream closed in another thread"); }
   int n = sp_net_udp_recv_from(fileno(fp), buf, (int)len, ipbuf, (int)sizeof ipbuf, &port);
   { int e = errno; sp_io_unuse(f); errno = e; }
   if (n < 0) { free(buf); sp_file_raise_errno("recvfrom", ""); }
-  const char *s = sp_str_from_bytes(buf, (size_t)n); SP_GC_ROOT_STR(s);   /* across the address's copy */
+  char *s = (char *)sp_str_from_bytes(buf, (size_t)n); SP_GC_ROOT_STR(s);   /* across the address's copy */
   free(buf);
+  sp_str_mark_binary(s);
   *ip_out = sp_str_from_bytes(ipbuf, strlen(ipbuf));
   *port_out = (sp_int)port;
   return s;
@@ -1427,10 +1432,10 @@ const char *sp_File_readpartial_or_nil(sp_File *f, sp_int n) {SP_GC_ROOT(f);
   long pend = sp_io_buffered(fp);
   if (pend > 0) {
     size_t want = (size_t)n < (size_t)pend ? (size_t)n : (size_t)pend;
-    got = (ssize_t)fread(r, 1, want, fp);
+    got = (ssize_t)SP_SIG_BLOCKING(fread(r, 1, want, fp));
   }
   else {
-    do { got = read(fileno(fp), r, (size_t)n); } while (got < 0 && errno == EINTR);
+    do { got = SP_SIG_BLOCKING(read(fileno(fp), r, (size_t)n)); } while (got < 0 && errno == EINTR);
   }
   { int e = errno; sp_io_unuse(f); errno = e; }
   if (got < 0) sp_file_raise_errno("read", "");
@@ -1462,11 +1467,11 @@ const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv
   long pend = sp_io_buffered(fp);
   if (pend > 0) {   /* serve what stdio already holds, as CRuby does */
     size_t want = (size_t)len < (size_t)pend ? (size_t)len : (size_t)pend;
-    n = (ssize_t)fread(buf, 1, want, fp);
+    n = (ssize_t)SP_SIG_BLOCKING(fread(buf, 1, want, fp));
   }
   else {
     int saved = sp_io_nb_begin(f);
-    do { n = read(fileno(fp), buf, (size_t)len); } while (n < 0 && errno == EINTR);
+    do { n = SP_SIG_BLOCKING(read(fileno(fp), buf, (size_t)len)); } while (n < 0 && errno == EINTR);
     int e = errno;
     sp_io_nb_end(f, saved);
     errno = e;
@@ -1565,7 +1570,7 @@ sp_oint sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool 
   struct sockaddr_storage aligned_sa;
   memcpy(&aligned_sa, sa, (size_t)salen);
   int saved = sp_io_nb_begin(f);
-  int rc = connect(fileno(f->fp), (const struct sockaddr *)&aligned_sa, (socklen_t)salen);
+  int rc = SP_SIG_BLOCKING(connect(fileno(f->fp), (const struct sockaddr *)&aligned_sa, (socklen_t)salen));
   int ce = errno;
   sp_io_nb_end(f, saved);
   errno = ce;
@@ -1661,7 +1666,7 @@ sp_int sp_File_flush(sp_File *f) {
 sp_bool sp_File_eof_p(sp_File *f) {
   SP_IO_OPEN(f);
   sp_io_wait_readable(f);
-  int c = fgetc(f->fp);
+  int c = SP_SIG_BLOCKING(fgetc(f->fp));
   if (c == EOF) return TRUE;
   ungetc(c, f->fp);
   return FALSE;
@@ -1831,7 +1836,7 @@ void sp_file_rename(const char *from, const char *to) {SP_GC_ROOT_STR(from);SP_G
 sp_int sp_File_readbyte(sp_File *f) {
   SP_IO_OPEN(f);
   sp_io_wait_readable(f);
-  int ch = fgetc(f->fp);
+  int ch = SP_SIG_BLOCKING(fgetc(f->fp));
   if (ch == EOF) sp_raise_cls("EOFError", "end of file reached");
   return (sp_int)(unsigned char)ch;
 }

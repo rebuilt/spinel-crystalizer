@@ -22,6 +22,9 @@
 #include "spinel_rt.h"
 
 #ifdef SP_CEXT
+sp_RbVal sp_cext_object_class(sp_RbVal object) {
+  return sp_box_class(sp_poly_class_val(object));
+}
 sp_RbVal sp_cext_plain_object_new(void) {
   return sp_box_obj(sp_Object_new(),SP_BUILTIN_OBJECT);
 }
@@ -549,6 +552,15 @@ sp_StrStrHash *sp_StrPolyHash_to_s_values(sp_StrPolyHash *h)
   return r;
 }
 
+/* The text sub/gsub put in for a match a Hash of any keys maps: the value
+   #[] reads for it (a default proc runs, and may store the key), as its
+   to_s, nil's "" included */
+const char *sp_PolyPolyHash_repl(sp_PolyPolyHash *h, const char *key)
+{
+  SP_GC_ROOT(h);
+  return sp_poly_to_s(sp_PolyPolyHash_get(h, sp_box_str(key)));
+}
+
 sp_SymPolyHash*sp_SymPolyHash_merge(sp_SymPolyHash*a,sp_SymPolyHash*b)
 {SP_GC_ROOT(a);SP_GC_ROOT(b);sp_SymPolyHash*r=sp_SymPolyHash_new();r->default_v=a->default_v;r->dproc=a->dproc;r->dproc_self=a->dproc_self;for(sp_int i=0;i<a->len;i++)sp_SymPolyHash_set(r,a->order[i],sp_SymPolyHash_get(a,a->order[i]));for(sp_int i=0;i<b->len;i++)sp_SymPolyHash_set(r,b->order[i],sp_SymPolyHash_get(b,b->order[i]));return r;}
 
@@ -1044,7 +1056,7 @@ void sp_kw_merge_any(sp_PolyPolyHash *dst, sp_RbVal h)
 }
 
 sp_PolyPolyHash*sp_PolyPolyHash_dup(sp_PolyPolyHash*h)
-{SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();SP_GC_ROOT(r);r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,h->keys[h->order[i]],h->vals[h->order[i]]);return r;}
+{SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();SP_GC_ROOT(r);r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;r->ident=h->ident;for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,h->keys[h->order[i]],h->vals[h->order[i]]);return r;}
 
 const char*sp_PolyPolyHash_inspect(sp_PolyPolyHash*h)
 {return h?sp_inspect_container(sp_box_obj(h,SP_BUILTIN_POLY_POLY_HASH)):SPL("nil");}

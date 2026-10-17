@@ -69,6 +69,28 @@ static void emit_re_subject_at(Compiler *c, const char *fn, const char *pat, int
   emit_int_expr(c, pos, b); buf_puts(b, "); })");
 }
 
+/* The body of a match block, inside its hit arm with m bound: each
+   statement's setup (an Array literal's pushes, an argument's temp) lands
+   beside it rather than hoisted before the match, where it read m's nil;
+   the last statement's value goes boxed into _t<tr>. */
+static void emit_match_block_body(Compiler *c, const int *body, int n, int tr, Buf *b) {
+  for (int j = 0; j < n; j++) {
+    Buf spre; memset(&spre, 0, sizeof spre);
+    Buf sval; memset(&sval, 0, sizeof sval);
+    Buf *saved_pre = g_pre; g_pre = &spre;
+    if (j + 1 < n) emit_stmt(c, body[j], &sval, 0);
+    else {
+      buf_printf(&sval, "_t%d = ", tr);
+      emit_boxed(c, body[j], &sval);
+      buf_puts(&sval, "; ");
+    }
+    g_pre = saved_pre;
+    if (spre.p) buf_puts(b, spre.p);
+    if (sval.p) buf_puts(b, sval.p);
+    free(spre.p); free(sval.p);
+  }
+}
+
 int emit_call_regexp_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt, TyKind a0) {
   /* regex literal match predicates (bool-returning, no MatchData/globals):
      /re/.match?(str[, pos])  and  str.match?(/re/[, pos]) */
@@ -320,12 +342,19 @@ no_gsub_enum:
       if (bx) buf_puts(b, ")");
       return 1;
     }
-    if (are >= 0 && sp_streq(name, "match?")) {
+    /* String#match? on a String. Any other receiver declines: the boxed
+       dispatch asks this for a Class value's default arm
+       (emit_poly_cls_value_builtin), where it handed the class to the
+       matcher as its String */
+    if (are >= 0 && sp_streq(name, "match?") && rt == TY_STRING) {
       if (argc == 1) { buf_printf(b, "sp_re_match_p(sp_re_pat_%d, ", are); emit_expr(c, recv, b); buf_puts(b, ")"); return 1; }
       buf_printf(b, "sp_str_re_match_p_at(sp_re_pat_%d, ", are); emit_expr(c, recv, b);
       buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
       return 1;
     }
+    /* a program class answers match itself: the boxed dispatch has its arm,
+       and the String one beside it, as for match? above */
+    if (are >= 0 && sp_streq(name, "match") && rpoly && poly_name_user_claimed(c, name, argc)) return 0;
     if (are >= 0 && sp_streq(name, "match") && nt_ref(nt, id, "block") >= 0) {
       /* match(re) { |m| body }: yield the MatchData on a hit, evaluate to the
          block's value; nil (block not run) on a miss */
@@ -340,12 +369,7 @@ no_gsub_enum:
       buf_printf(b, "); sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d); if (_t%d) { ",
                  tr2, tr2, tm);
       if (mp0r) buf_printf(b, "lv_%s = _t%d; ", mp0r, tm);
-      for (int j = 0; j + 1 < mbn; j++) { emit_stmt(c, mbb[j], b, 0); }
-      if (mbn > 0) {
-        buf_printf(b, "_t%d = ", tr2);
-        emit_boxed(c, mbb[mbn - 1], b);
-        buf_puts(b, "; ");
-      }
+      emit_match_block_body(c, mbb, mbn, tr2, b);
       buf_printf(b, "} _t%d; })", tr2);
       return 1;
     }
@@ -401,12 +425,7 @@ no_gsub_enum:
       buf_printf(b, "); sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d); if (_t%d) { ",
                  tr2, tr2, tm);
       if (mp0r) buf_printf(b, "lv_%s = _t%d; ", mp0r, tm);
-      for (int j = 0; j + 1 < mbn; j++) { emit_stmt(c, mbb[j], b, 0); }
-      if (mbn > 0) {
-        buf_printf(b, "_t%d = ", tr2);
-        emit_boxed(c, mbb[mbn - 1], b);
-        buf_puts(b, "; ");
-      }
+      emit_match_block_body(c, mbb, mbn, tr2, b);
       buf_printf(b, "} _t%d; })", tr2);
       return 1;
     }
@@ -648,8 +667,7 @@ no_gsub_enum:
             buf_printf(b, "); sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d); if (_t%d) { ",
                        tr2, tr2, tm);
             if (mp0r) buf_printf(b, "lv_%s = _t%d; ", mp0r, tm);
-            for (int j = 0; j + 1 < mbn; j++) { emit_stmt(c, mbb[j], b, 0); }
-            if (mbn > 0) { buf_printf(b, "_t%d = ", tr2); emit_boxed(c, mbb[mbn - 1], b); buf_puts(b, "; "); }
+            emit_match_block_body(c, mbb, mbn, tr2, b);
             buf_printf(b, "} _t%d; })", tr2);
             free(rp.p); return 1;
           }
@@ -995,29 +1013,12 @@ int emit_call_regexp_class_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     else { buf_puts(b, "((void)("); emit_expr(c, argv[0], b); buf_puts(b, "), TRUE)"); }
     return 1;
   }
-  /* Regexp.compile is an alias for Regexp.new */
+  /* Regexp.compile is an alias for Regexp.new, and compiles as it does: a
+     String source held boxed is read as a String, a Regexp is copied */
   if (recv >= 0 && argc >= 1 && sp_streq(name, "compile") &&
       nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ConstantReadNode") &&
       nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Regexp")) {
-    /* given a Regexp, the pattern is copied: hand back the pattern itself
-       rather than reading its pointer as a source string (#3686) */
-    if (comp_ntype(c, argv[0]) == TY_REGEX) { emit_expr(c, argv[0], b); return 1; }
-    int tp = ++g_tmp, ts = ++g_tmp;
-    /* See the Regexp.new path: emit the pattern into a local buffer so an
-       interpolated arg's embedded-call arg roots land in g_pre as whole
-       statements before this temp's decl, not inside its initializer. */
-    Buf pv; memset(&pv, 0, sizeof pv);
-    emit_expr(c, argv[0], &pv);
-    emit_indent(g_pre, g_indent);
-    buf_printf(g_pre, "const char *_t%d = %s;\n", ts, pv.p ? pv.p : "\"\"");
-    free(pv.p);
-    Buf flagbuf; memset(&flagbuf, 0, sizeof flagbuf);
-    emit_re_opts_flags(c, argc, argv, &flagbuf);   /* (#3055) */
-    emit_indent(g_pre, g_indent);
-    buf_printf(g_pre, "mrb_regexp_pattern *_t%d = re_compile(_t%d, (int64_t)(_t%d ? sp_str_byte_len(_t%d) : 0), %s);\n",
-               tp, ts, ts, ts, flagbuf.p ? flagbuf.p : "0");
-    free(flagbuf.p);
-    buf_printf(b, "_t%d", tp);
+    emit_regexp_new(c, argc, argv, b);
     return 1;
   }
   return 0;

@@ -31,8 +31,6 @@ typedef struct sp_ev_waiter {
   struct sp_ev_waiter  *next;
 } sp_ev_waiter;
 
-typedef struct sp_sched_timer sp_sched_timer;
-
 /* (#8702) a one-word spin lock guarding one object's waiter list. */
 typedef int sp_wlock;
 
@@ -89,7 +87,19 @@ typedef struct sp_thread {
   struct sp_thread *io_prev;     /* the waiter before it on the I/O waiter list, for an O(1) unlink */
   struct sp_thread *all_next, *all_prev;  /* registry of live threads (GC roots) */
   void             *tls;         /* thread-local storage (Thread#[] / #[]=); lazily allocated */
-  sp_sched_timer   *timer;       /* active scheduler timer for this wait, if any */
+  /* (the two words read and written atomically are aligned to their size: a
+     32-bit target aligns a uint64_t to 4, where clang makes each access a
+     call into libatomic, which the runtime does not link) */
+  _Alignas(8) uint64_t tm_armed; /* (#8702) the generation of the timer armed for this wait,
+                                    0 when none: a cancel exchanges it for 0 and a firing
+                                    compares and swaps it, so exactly one of them gets it */
+  uint64_t          tm_seq;      /* the last generation armed; the thread's own */
+  sp_wlock          sleep_wl;    /* (#8702) a sleep is a list of one, under this lock: no list
+                                    of sleepers is shared, so sleeping threads contend on none */
+  struct sp_thread *sleep_slot;  /* that list's head: the thread itself while it sleeps */
+  _Alignas(8) uint64_t wait_timer; /* the timer the wait it is parked in was published with,
+                                    set under that wait's list lock and cleared when it runs
+                                    again: a timer that fires late ends only its own wait */
   unsigned char     timer_expired; /* set when a generic timed wait reaches its deadline */
   unsigned char     woken;         /* Thread#wakeup ended its sleep early */
   int               io_fd;       /* fd this thread is parked on for I/O (-1 = none, scheduler-aware I/O) */

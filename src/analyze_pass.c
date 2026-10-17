@@ -3,6 +3,7 @@
 #include "builtin_ops.h"
 #include "call_plan.h"
 #include "repr.h"
+#include "share.h"
 int callee_has_kwarg(Compiler *c, Scope *m, const char *name);
 int callee_declares_kwargs(Compiler *c, Scope *m);
 int callee_param_is_declared_kwarg(Compiler *c, Scope *m, const char *name);
@@ -1680,6 +1681,35 @@ static int widen_aliased_array_ivars(Compiler *c, int node, int cls_id) {
   return changed;
 }
 
+/* --share-strings: may the String Array an ivar of class cid names take the
+   handle form: no mark against it (share_strh_gate)? */
+static int strh_ivar_open(Compiler *c, int cid, const char *nm) {
+  int ki = cid >= 0 && cid < c->nclasses ? comp_ivar_index(&c->classes[cid], nm) : -1;
+  return ki >= 0 && !(c->classes[cid].ivar_elems_shared[ki] & ELEMS_STRH_NO);
+}
+/* ...and the global, constant or class variable read node recv names */
+static int strh_named_open(Compiler *c, int recv) {
+  const char *nm = nt_str(c->nt, recv, "name");
+  if (nm && nt_kind(c->nt, recv) == NK_GlobalVariableReadNode) {
+    const char *rn = comp_resolve_gvar(c, nm + 1);
+    LocalVar *lv = rn ? comp_gvar(c, rn) : NULL;
+    return lv && !lv->strh_no;
+  }
+  if (nm && nt_kind(c->nt, recv) == NK_ConstantReadNode) {
+    LocalVar *lv = comp_const(c, nm);
+    return lv && !lv->strh_no;
+  }
+  if (nm && nt_kind(c->nt, recv) == NK_ClassVariableReadNode) {
+    Scope *s = comp_scope_of(c, recv);
+    int cid = s ? s->class_id : -1;
+    if (cid < 0) cid = comp_class_index(c, "Toplevel");
+    if (cid < 0) return 0;
+    cid = comp_cvar_owner(c, cid, nm);
+    int idx = comp_cvar_index(&c->classes[cid], nm);
+    return idx >= 0 && !(c->classes[cid].cvar_elems_shared[idx] & ELEMS_STRH_NO);
+  }
+  return 0;
+}
 /* The type slot a global, class-variable or constant read names, or NULL. */
 static TyRef named_array_slot(Compiler *c, int recv) {
   const NodeTable *nt = c->nt;
@@ -2809,6 +2839,17 @@ static int push_chain_base(Compiler *c, int recv) {
 }
 
 static int value_leaves(Compiler *c, int n, int *out, int nout, int cap);
+enum { VL_NIL = 1, VL_BEGIN = 2 };
+static int value_leaves_ex(Compiler *c, int n, int *out, int nout, int cap, int nil_ok);
+/* Is one of the values `n` can answer, through parentheses, a plain begin
+   body and the arms of a conditional (an arm left out answers nil), an
+   element read out of an Array of shared Strings (share_str_elem_read)? */
+static int share_str_value_leaves(Compiler *c, int n) {
+  int lv[8], cnt = value_leaves_ex(c, n, lv, 0, 8, VL_NIL | VL_BEGIN);
+  for (int i = 0; i < cnt; i++)
+    if (share_str_elem_read(c, lv[i])) return 1;
+  return 0;
+}
 static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb, int *fb, LWIndex lw_ix, LWIndex ivw_ix) {
   int changed = 0;
   /* Fold container usage into the local type so an empty `[]` / `{}` gets
@@ -3183,6 +3224,19 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
     }
     if (elem_splat_index && nt_kind(nt, recv) != NK_LocalVariableReadNode) continue;
     const char *rty = nt_type(nt, recv);
+    /* --share-strings: an element read out of an Array whose Strings are
+       shared is boxed, the Array being the general one that holds their
+       handles, where the default build reads a String out of a String
+       Array. Stored into an Integer or Float array, it is the String it
+       is, and widens the array as the String would: taken as a value of
+       run-time kind, the typed store raised TypeError (#9258). An empty
+       or String array keeps the boxed reading. */
+    if (c->share_strings && vt == TY_POLY && vnode >= 0 && (is_push || is_idx_write) &&
+        share_str_value_leaves(c, vnode)) {
+      TyKind rt0 = infer_type(c, recv);
+      if (ty_is_array(rt0) && rt0 != TY_POLY_ARRAY && rt0 != TY_STR_ARRAY && rt0 != TY_STRH_ARRAY)
+        vt = TY_STRING;
+    }
     if ((is_push || is_idx_write) && !elem_splat_index &&
         arysub_container_evidence(c, id, recv, is_push, is_splice, (TyKind)kt, (TyKind)vt, &changed)) continue;
     /* `(@h ||= {})[k] = v` fills @h exactly as `@h ||= {}; @h[k] = v` does,
@@ -3265,6 +3319,25 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
          binding in bind_call_params, the caller's local too). Widening only:
          an UNKNOWN parameter still takes its type from the call site (#2989). */
       if (lv->is_param) {
+        /* --share-strings: a String Array of handles takes a String at an
+           Integer index and nothing else; any other store widens the
+           parameter (and so the class of its Array, share_strh_gate) to the
+           general Array, the one that holds a box as it is */
+        if (lv->type == TY_STRH_ARRAY && (is_push || is_idx_write || is_splice)) {
+          TyKind f = TY_STRH_ARRAY;
+          fold_container_evidence(&f, is_push, is_splice, kt, vt);
+          for (int ai = elem_argv ? elem_from : 0; elem_argv && ai < elem_an && f == TY_STRH_ARRAY; ai++) {
+            TyKind et = push_elem_ty(c, elem_argv[ai]);
+            if (et != TY_UNKNOWN && et != TY_STRING && et != TY_STRBUF) f = TY_POLY_ARRAY;
+          }
+          if (f != TY_STRH_ARRAY) {
+            lv_set_type(lv, TY_POLY_ARRAY);
+            lv->strh_no = 1;
+            lv->elems_shared = 1;
+            changed = 1;
+          }
+          continue;
+        }
         if ((!is_push && !is_idx_write && !elem_splat_index) || lv->rbs_seeded) continue;
         /* A boxed key or value is exempt below. When it is another parameter
            of the method, boxed because its callers disagree, each call's
@@ -3398,6 +3471,13 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
                                                    elem_splat_index, ty_array_elem(lv->type))) &&
             (vt == TY_UNKNOWN || vt == TY_POLY || vt == TY_POLY_ARRAY ||
              vt == ty_array_elem(lv->type))) continue;
+        /* --share-strings: a String Array parameter a String's handle is
+           pushed into holds its Strings as handles, as a local's does,
+           where its container class can take that form */
+        if (c->share_strings && is_push && !lv->strh_no && lv->type == TY_STR_ARRAY && vt == TY_STRBUF) {
+          lv_set_type(lv, TY_STRH_ARRAY); changed = 1;
+          continue;
+        }
         lv_set_type(lv, TY_POLY_ARRAY); lv->push_widened = 1; changed = 1;
         continue;
       }
@@ -3512,10 +3592,16 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
          taken: seeding or re-keying these slots stays with their write
          passes, which keep a general Array against a typed array write. */
       TyRef nslot = named_array_slot(c, recv);
-      if (!nslot || !ty_is_array(*nslot) || *nslot == TY_POLY_ARRAY) continue;
+      if (!nslot || (!ty_is_array(*nslot) && *nslot != TY_STRH_ARRAY) || *nslot == TY_POLY_ARRAY) continue;
       TyKind nt2 = *nslot;
       fold_container_evidence(&nt2, is_push, is_splice, (TyKind)kt, (TyKind)vt);
-      if (nt2 == TY_POLY_ARRAY) { ty_ref_set(nslot, TY_POLY_ARRAY); changed = 1; }
+      /* --share-strings: a String's handle pushed into a String Array
+         keeps its Strings as handles, where the container class can take
+         that form (share_strh_gate marks it otherwise) */
+      if (nt2 == TY_POLY_ARRAY && c->share_strings && is_push && vt == TY_STRBUF &&
+          (*nslot == TY_STR_ARRAY || *nslot == TY_STRH_ARRAY) && strh_named_open(c, recv))
+        nt2 = TY_STRH_ARRAY;
+      if (nt2 != *nslot) { ty_ref_set(nslot, nt2); changed = 1; }
       continue;
     }
     else if ((is_push || is_idx_write) && rty && sp_streq(rty, "CallNode") &&
@@ -3715,7 +3801,8 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
     /* --share-strings: a local Array of Strings a String's handle is pushed
        into holds its Strings as handles (#8328 step 5), where its container
        class can take that form (share_strh_gate marks it otherwise) */
-    if (c->share_strings && slot_lv && is_push && !slot_lv->strh_no && *slot == TY_POLY_ARRAY &&
+    if (c->share_strings && (slot_lv || watch_nm) && is_push && *slot == TY_POLY_ARRAY &&
+        (slot_lv ? !slot_lv->strh_no : strh_ivar_open(c, watch_cls, watch_nm)) &&
         (vt == TY_STRBUF || vt == TY_STRING) &&
         (before == TY_UNKNOWN || before == TY_STR_ARRAY || before == TY_STRH_ARRAY))
       ty_ref_set(slot, TY_STRH_ARRAY);
@@ -4004,6 +4091,16 @@ static int infer_write_multi_assign(Compiler *c, const NodeTable *nt) {
              answering it took its type from its other answers alone */
           if (rin_p >= 0 && nt_kind(nt, rin_p) == NK_LocalVariableTargetNode)
             changed |= masgn_poly_local(c, ms_poly, rin_p, TY_POLY_ARRAY, value);
+        }
+        /* nothing known of the value (a call on a receiver nothing typed):
+           a local rest target is still an Array, of boxed values. Left
+           untyped, it settled boxed, and each `rest[i]` and `*rest` read of
+           it went through every class's `[]` and constructor */
+        else if (st == TY_UNKNOWN) {
+          int rest_u = nt_ref(nt, id, "rest");
+          int rin_u = rest_u >= 0 && nt_kind(nt, rest_u) == NK_SplatNode ? nt_ref(nt, rest_u, "expression") : -1;
+          if (rin_u >= 0 && nt_kind(nt, rin_u) == NK_LocalVariableTargetNode)
+            changed |= masgn_poly_local(c, comp_scope_of(c, id), rin_u, TY_POLY_ARRAY, value);
         }
         if (ty_is_array(st)) {
           TyKind elem = ty_array_elem(st);
@@ -5546,6 +5643,9 @@ static int container_literals(Compiler *c, int n, int *out, int nout, int cap, i
     if (a >= 0) nt_arr(nt, a, "arguments", &an);
     int elem_read = (sp_streq(nm, "[]") && an == 1) || (sp_streq(nm, "fetch") && an >= 1) ||
                     ((is_endpoint_query(nm)) && an == 0);
+    /* a copy is built as the container it copies: the two widen together */
+    if (r >= 0 && an == 0 && nt_ref(nt, n, "block") < 0 && (sp_streq(nm, "dup") || sp_streq(nm, "clone")))
+      return container_literals(c, r, out, nout, cap, depth + 1);
     if (r < 0 || !elem_read || nt_ref(nt, n, "block") >= 0) return nout;
     int outer[32];
     int no = container_literals(c, r, outer, 0, 32, depth + 1);
@@ -5628,9 +5728,26 @@ static int widen_nested_literals(Compiler *c, int recv, int is_push, int is_spli
     int leaf = -1;
     if (value_leaves(c, r, &leaf, 0, 1) == 1) { r = leaf; seq = 1; }
   }
-  if (r < 0 || !(nt_kind(nt, r) == NK_CallNode || (seq && nt_kind(nt, r) == NK_ArrayNode))) return 0;
-  int lits[32];
-  int nl = container_literals(c, r, lits, 0, 32, 0);
+  int lits[32], nl = 0;
+  if (r >= 0 && nt_kind(nt, r) == NK_LocalVariableReadNode) {
+    /* a local an element read or a copy of one wrote (`r = b[:attrs].dup;
+       r["y"] = v`): the literals those calls reach, the nested one in a
+       caller's argument too. A local a literal wrote is its own slot's. */
+    const char *rn = nt_str(nt, r, "name");
+    Scope *rs = rn ? comp_scope_of(c, r) : NULL;
+    int si = rs ? (int)(rs - c->scopes) : -1;
+    for (int q = si >= 0 ? lw_shared_first(c, rn, si) : -1; q >= 0 && nl < 32; q = lw_shared_next(q)) {
+      int w = lw_shared_node(q);
+      if (nt_kind(nt, w) != NK_LocalVariableWriteNode || comp_scope_of(c, w) != rs ||
+          !sp_streq(nt_str(nt, w, "name"), rn)) continue;
+      int wv = unwrap_parens(c, nt_ref(nt, w, "value"));
+      if (wv >= 0 && nt_kind(nt, wv) == NK_CallNode) nl = container_literals(c, wv, lits, nl, 32, 0);
+    }
+  }
+  else {
+    if (r < 0 || !(nt_kind(nt, r) == NK_CallNode || (seq && nt_kind(nt, r) == NK_ArrayNode))) return 0;
+    nl = container_literals(c, r, lits, 0, 32, 0);
+  }
   int changed = 0;
   for (int q = 0; q < nl; q++) {
     int l = lits[q];
@@ -5647,6 +5764,9 @@ static int widen_nested_literals(Compiler *c, int recv, int is_push, int is_spli
       if (lt == TY_POLY_ARRAY || vt == TY_UNKNOWN || vt == TY_POLY) continue;
       if (!is_push && kt != TY_INT && kt != TY_POLY) continue;
       if (ty_is_array(lt) && vt == ty_array_elem(lt)) continue;
+      /* (a String fits an Array of Strings, which --share-strings holds as
+         their handles: a TY_STRH_ARRAY, a String handle's value a TY_STRBUF) */
+      if ((lt == TY_STR_ARRAY || lt == TY_STRH_ARRAY) && (vt == TY_STRING || vt == TY_STRBUF)) continue;
       if (!c->arr_want || l >= c->node_cap || c->arr_want[l] == TY_POLY_ARRAY) continue;
       comp_set_arr_want(c, l, TY_POLY_ARRAY);
       changed = 1;
@@ -5659,8 +5779,9 @@ static int widen_nested_literals(Compiler *c, int recv, int is_push, int is_spli
    through parentheses, the last statement, and each arm of an `if`,
    `unless` or `case`. Answers the new count, or -1 when a path has no
    such expression (an arm left out answers nil) or out[] is full. */
-/* With `nil_ok`, a path that answers nil (an arm left out, an empty body, a
-   bare `return`) adds no expression instead of answering -1. */
+/* With `nil_ok` (VL_NIL), a path that answers nil (an arm left out, an empty
+   body, a bare `return`) adds no expression instead of answering -1. VL_BEGIN
+   also reads through a plain begin; the flag is for the one caller that asks. */
 static int value_leaves_ex(Compiler *c, int n, int *out, int nout, int cap, int nil_ok) {
   const NodeTable *nt = c->nt;
   if (nout < 0) return -1;
@@ -5673,6 +5794,11 @@ static int value_leaves_ex(Compiler *c, int n, int *out, int nout, int cap, int 
   }
   if (k == NK_ParenthesesNode) return value_leaves_ex(c, nt_ref(nt, n, "body"), out, nout, cap, nil_ok);
   if (k == NK_ElseNode) return value_leaves_ex(c, nt_ref(nt, n, "statements"), out, nout, cap, nil_ok);
+  /* with VL_BEGIN, a begin without rescue, else or ensure answers its
+     body's value */
+  if ((nil_ok & VL_BEGIN) && k == NK_BeginNode && nt_ref(nt, n, "rescue_clause") < 0 &&
+      nt_ref(nt, n, "else_clause") < 0 && nt_ref(nt, n, "ensure_clause") < 0)
+    return value_leaves_ex(c, nt_ref(nt, n, "statements"), out, nout, cap, nil_ok);
   if (k == NK_IfNode || k == NK_UnlessNode) {
     int alt = nt_ref(nt, n, k == NK_IfNode ? "subsequent" : "else_clause");
     nout = value_leaves_ex(c, nt_ref(nt, n, "statements"), out, nout, cap, nil_ok);
@@ -7507,23 +7633,18 @@ static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, i
        parameter that no other call site typed, as an (empty) poly array so
        the callee's array methods dispatch. Never during the fixpoint -- a
        concrete kind from another call site must win the unification. */
-    if (g_final_bind_pass && p->type == TY_UNKNOWN && at == TY_UNKNOWN &&
-        apty && sp_streq(apty, "ArrayNode")) {
-      int en0 = 0; nt_arr(nt, anode, "elements", &en0);
-      if (en0 == 0) { slot_rule(c, p, TY_POLY_ARRAY, anode, "an empty `[]` argument and no other call site typing it: the parameter is the untyped array"); changed = 1; continue; }
+    int empty_kind = at == TY_UNKNOWN && node_is_empty_container(nt, anode) ? an_empty_container_kind(c, anode) : 0;
+    if (g_final_bind_pass && p->type == TY_UNKNOWN && empty_kind == 1) {
+      slot_rule(c, p, TY_POLY_ARRAY, anode, "an empty `[]` argument and no other call site typing it: the parameter is the untyped array"); changed = 1; continue;
     }
     /* An empty `{}` / `[]` literal carries no type of its own, so it is skipped
        by the unification below. When ANOTHER call site typed the parameter as
        the other container, though, the two cannot share one slot: the empty
        literal still emits as its own kind and the C assignment is ill-typed.
        Widen to poly, which holds either. */
-    if (at == TY_UNKNOWN && apty && p->type != TY_UNKNOWN && p->type != TY_POLY) {
-      int cross = (sp_streq(apty, "HashNode") && !ty_is_hash(p->type)) ||
-                  (sp_streq(apty, "ArrayNode") && !ty_is_array(p->type));
-      if (cross) {
-        int en1 = 0; nt_arr(nt, anode, "elements", &en1);
-        if (en1 == 0) { slot_rule(c, p, TY_POLY, anode, "an empty literal argument of one container kind where another call site passed the other: only the boxed slot holds both"); changed = 1; continue; }
-      }
+    if (empty_kind && p->type != TY_UNKNOWN && p->type != TY_POLY &&
+        ((empty_kind == 2 && !ty_is_hash(p->type)) || (empty_kind == 1 && !ty_is_array(p->type)))) {
+      slot_rule(c, p, TY_POLY, anode, "an empty literal argument of one container kind where another call site passed the other: only the boxed slot holds both"); changed = 1; continue;
     }
     /* A void arg (`sink(always_raising_method)`) is nil-ish in value position:
        bind the param poly so it is declarable; the arg is emitted via
@@ -8720,7 +8841,13 @@ static int struct_with_types_members(Compiler *c, int id, int ci) {
   return changed;
 }
 
+/* given_only: only the members the call's arguments supply (a `new` on a
+   class value, whose omitted members the nullable pass makes nil) */
+static int struct_new_types_members_at(Compiler *c, int id, int ci, int given_only);
 static int struct_new_types_members(Compiler *c, int id, int ci) {
+  return struct_new_types_members_at(c, id, ci, 0);
+}
+static int struct_new_types_members_at(Compiler *c, int id, int ci, int given_only) {
   const NodeTable *nt = c->nt;
   int changed = 0;
   ClassInfo *cls = &c->classes[ci];
@@ -8777,6 +8904,7 @@ static int struct_new_types_members(Compiler *c, int id, int ci) {
       }
     }
     else if (a < an) vnode = argv[a];
+    if (given_only && vnode < 0 && !(splat_at >= 0 && a >= splat_at) && !kw_splat) continue;
     if (class_ivar_pin_holds(cls, cls->ivars[a], vnode >= 0 ? infer_type(c, vnode) : TY_NIL)) continue;
     if ((splat_at >= 0 && a >= splat_at) || (kw_splat && (vnode < 0 || splat_after) && (!kwf || a == 0))) {
       TyKind sm = ty_unify(cls->ivar_types[a], TY_POLY);
@@ -9678,6 +9806,26 @@ static int infer_param_types_ex(Compiler *c, int settle) {
         if (ss && ss->is_cmethod && ss->class_id >= 0 && c->classes[ss->class_id].is_struct)
           changed |= struct_new_types_members(c, id, ss->class_id);
       }
+      /* `new` on a class value (`[A, B][i].new(v)`, `Object.const_get(x).new(v)`):
+         the run-time switch builds each Struct the value can be, or any
+         Struct of the program where no analysis names the class, with the
+         arguments given, as a direct `S.new` is built (#9093: a String member
+         was handed an Integer it could not hold, and the program faulted). A
+         class with an initialize binds them as a call (bind_call_params);
+         the members the call leaves out are nil, which the nullable pass
+         marks without widening them. */
+      if (sp_streq(name, "new") && rty && lci < 0 && !sp_streq(rty, "ConstantReadNode") &&
+          !sp_streq(rty, "ConstantPathNode") && !sp_streq(rty, "SelfNode")) {
+        int ks[8], nk = new_recv_classes(c, recv, ks, 8);
+        int every = nk == 0 && new_recv_every_class(c, recv);
+        int nloop = every ? c->nclasses : nk;
+        for (int q = 0; q < nloop; q++) {
+          int k = every ? q : ks[q];
+          if (k < 0 || k >= c->nclasses || !c->classes[k].is_struct ||
+              comp_method_in_chain(c, k, "initialize", NULL) >= 0) continue;
+          changed |= struct_new_types_members_at(c, id, k, 1);
+        }
+      }
       /* `new` on an INSTANCE whose class defines an instance method `new`
          is an ordinary method call, not a constructor: bind its params.
          Skipping it left a `Relation#new(attrs = {}) = @model.new(attrs)`
@@ -9827,12 +9975,16 @@ static int infer_param_types_ex(Compiler *c, int settle) {
            hot method's Integer parameter was boxed by a call that could
            not reach it */
         const PolyCand *pcs = comp_poly_candidates_at(c, id, name, &npc);
+        /* a receiver of no known class: a Range among the arguments makes
+           no candidate's parameter range_held */
+        c->range_unheld = cls_fact_idx(c, recv) < 0;
         for (int pi = 0; pi < npc; pi++)
           if (pcs[pi].mi < 0 || method_takes_call_args(c, &c->scopes[pcs[pi].mi], id))
             changed |= bind_call_params(c, id, pcs[pi].mi);
         pcs = comp_cmethod_candidates(c, name, &npc);
         for (int pi = 0; pi < npc; pi++)
           changed |= bind_call_params(c, id, pcs[pi].mi);
+        c->range_unheld = 0;
       }
     }
     /* A builtin receiver's own reopening takes this call's arguments too,
@@ -10576,16 +10728,14 @@ static TyKind bs_join(TyKind a, TyKind b) {
   return u;
 }
 
-/* What value `v` binds as. An empty `[]` / `{}` literal has no type of its
+/* What value `v` binds as. An empty `[]` / `{}` literal, or a bare
+   `Array.new` / `Hash.new`, has no type of its
    own but is still built as a container, so it is not the Integer an
    unpinned parameter defaults to (#4295): poly holds either. */
 static TyKind bs_value(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   TyKind t = v >= 0 ? infer_type(c, v) : TY_NIL;
-  if (t == TY_UNKNOWN && (nt_kind(nt, v) == NK_ArrayNode || nt_kind(nt, v) == NK_HashNode)) {
-    int en = 0; nt_arr(nt, v, "elements", &en);
-    if (en == 0) t = TY_POLY;
-  }
+  if (t == TY_UNKNOWN && node_is_empty_container(nt, v)) t = TY_POLY;
   return t;
 }
 
@@ -15018,9 +15168,22 @@ static int infer_block_params_enum_arms(Compiler *c, const NodeTable *nt, int id
     }
   }
 
-  /* array.combination(k)/permutation(k) { |c| } binds the k-element sub-array */
+  /* array.combination(k)/permutation(k) { |c| } binds the k-element sub-array;
+     `{ |x, y| }` spreads it, each parameter an element (the block an
+     Enumerator's `each { |x, y| }` hands over before its parameters are
+     shaped) */
   if ((sp_streq(name, "combination") || sp_streq(name, "permutation")) && ty_is_array(rt)) {
-    if (bp_widen(comp_scope_of(c, block), p0, rt)) changed = 1;
+    Scope *cs = comp_scope_of(c, block);
+    int np = 0; while (block_param_name(c, block, np)) np++;
+    if (np >= 2 || block_opt_name(c, block, 0) || block_post_name(c, block, 0) ||
+        block_rest_marker(c, block)) {
+      TyKind et = ty_array_elem(rt);
+      const char *pn;
+      for (int pj = 0; (pn = block_param_name(c, block, pj)); pj++) if (bp_widen(cs, pn, et)) changed = 1;
+      for (int pj = 0; (pn = block_opt_name(c, block, pj)); pj++) if (bp_widen(cs, pn, et)) changed = 1;
+      for (int pj = 0; (pn = block_post_name(c, block, pj)); pj++) if (bp_widen(cs, pn, et)) changed = 1;
+    }
+    else if (bp_widen(cs, p0, rt)) changed = 1;
     return changed | 2;
   }
 
@@ -15694,8 +15857,10 @@ int infer_block_params(Compiler *c) {
          storage and the body still reads the parameter. Poly holds it. The
          `then` / `yield_self` arm further down already says this; without it
          here the two arms typed the same parameter differently on every round
-         and the fixpoint ran to its cap (#4116). */
-      if (rt == TY_NIL) rt = TY_POLY;
+         and the fixpoint ran to its cap (#4116). A receiver with no value
+         (void: a method answering nothing usable, or one that always raises)
+         yields nil the same way. */
+      if (rt == TY_NIL || rt == TY_VOID) rt = TY_POLY;
     }
     else {
       if (!ty_is_object(rt)) continue;
@@ -15898,6 +16063,12 @@ int infer_block_params(Compiler *c) {
        gives it. Left untyped, the block's own uses typed it -- `r[k] = v`
        made it a hash, and an sp_X * element was bound into it (#4879). */
     if (ty_is_obj_array(rt)) rt = TY_POLY_ARRAY;
+    /* --share-strings: the walk of a String Array of handles binds each String
+       as a typed String Array's does. Left untyped until the receiver was
+       known (a call's value, a parameter), the block's own uses typed the
+       parameter first: `x << "."` made it an Array, and a String's handle was
+       bound into it. */
+    if (rt == TY_STRH_ARRAY) rt = TY_STR_ARRAY;
     const char *p0 = block_param_name(c, block, 0);
     if (!p0 && !block_param_is_multi(c, block, 0)) continue;
 
@@ -15906,7 +16077,7 @@ int infer_block_params(Compiler *c) {
       Scope *bs = comp_scope_of(c, block);
       LocalVar *plv = scope_local(bs, p0);
       if (plv && lv_is_handle_of(c, plv, rt)) continue;
-      if (bp_widen(bs, p0, rt == TY_NIL ? TY_POLY : rt)) changed = 1;
+      if (bp_widen(bs, p0, rt == TY_NIL || rt == TY_VOID ? TY_POLY : rt)) changed = 1;
       continue;
     }
 

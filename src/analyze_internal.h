@@ -91,6 +91,10 @@ const int *comp_parent_map(Compiler *c);
 /* --share-strings: is node n an Array literal refused the String handle
    Array form for good (share_strh_gate)? */
 int share_strh_node_no(const Compiler *c, int n);
+/* ...and is it written into a variable already holding the form? */
+int share_strh_literal_slot(Compiler *c, int n);
+int strh_method_open(const Scope *m);   /* analyze_util.c */
+int strh_value_returned(Compiler *c, const int *par, int n);
 /* The definite-assignment walk (analyze.c), shared with the nil facts
    (analyze_nil.c): the program's parent map, each statement's place in its
    list (filled one list at a time, -1 for a node not in its parent's list),
@@ -148,6 +152,10 @@ int builtin_cmethod_known(const char *cls, const char *name);
 int builtin_super_cmethod_known(const char *cls, const char *name);
 int builtin_method_names(const char *cls, const char **out, int cap);
 int builtin_name_arity_span(const char *name, int with_block, int *lo, int *hi);
+int builtin_recv_arity_span(const char *name, int *lo, int *hi);
+int builtin_recv_owner_classes(const char *name, const char **out, int cap);
+int poly_splat_keyed(const char *name);
+int an_bi_generic_splat(Compiler *c, int id);
 int builtin_kernel_fn_span(const char *name, int with_block, int *lo, int *hi);
 int builtin_arity_violation(Compiler *c, int id);
 int is_handler_proc_block(Compiler *c, int id);
@@ -239,6 +247,8 @@ int struct_aset_may_reach(Compiler *c, int id);
 int an_arg_is_shared_handle(Compiler *c, int node);
 /* Last statement of a scope's body, or -1. */
 int scope_body_last(Compiler *c, int mi);
+/* ...or the begin a def's own rescue makes its body (analyze_util.c). */
+int scope_body_value(Compiler *c, int mi);
 /* The expressions whose value method scope mi answers (its body's and each
    `return`'s; see analyze_pass.c). Answers the count, or -1. */
 int method_value_leaves(Compiler *c, int mi, int *out, int cap);
@@ -342,6 +352,8 @@ void register_module_functions(Compiler *c);
 void register_method_visibility(Compiler *c);
 void register_locals(Compiler *c);
 int is_struct_call(Compiler *c, int val);
+int new_recv_classes(Compiler *c, int recv, int *out, int cap);
+int new_recv_every_class(Compiler *c, int recv);
 int class_body_list(Compiler *c, int **out_ci, int **out_body);
 int class_def_body(Compiler *c, int def_node);
 void register_struct_members(Compiler *c, ClassInfo *cls, int val);
@@ -543,6 +555,7 @@ int desugar_multi_value_jump(Compiler *c);
 int desugar_forwarding_to_rest_callee(Compiler *c);
 int desugar_anon_block_param(Compiler *c);
 int desugar_singleton_class_define_method(Compiler *c);
+int desugar_empty_hash_compare_by_identity(Compiler *c);
 int desugar_define_method_proc_arg(Compiler *c);
 int desugar_module_function_aliases(Compiler *c);
 int method_body_next_to_return(NodeTable *nt, int id);
@@ -634,6 +647,7 @@ int desugar_array_at(Compiler *c);
 int desugar_unused_block_arg(Compiler *c);
 int desugar_unpack_block(Compiler *c);
 int desugar_interp_reopened_to_s(Compiler *c);
+int desugar_interp_elided_to_s(Compiler *c);
 int desugar_array_first_last(Compiler *c);
 int desugar_enum_iter_splat_args(Compiler *c);
 int desugar_iter_splat_args(Compiler *c);

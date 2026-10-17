@@ -556,6 +556,8 @@ int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       int body = nt_ref(nt, block, "body");
       int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
       TyKind nvt = bn > 0 ? infer_type(c, bb[bn - 1]) : TY_UNKNOWN;
+      TyKind nx = block_next_value_ty(c, body);
+      if (nx != TY_UNKNOWN) nvt = nvt == TY_UNKNOWN ? nx : ty_unify(nvt, nx);
       TyKind kt = ty_hash_key(rt);
       TyKind r = ty_hash_of(kt, nvt);
       if (r != TY_UNKNOWN) { *out = r; return 1; }
@@ -1336,8 +1338,12 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
         comp_method_in_chain(c, cid, "hash", NULL) < 0 &&
         /* a reader named hash answers its ivar, typed as the ivar is */
         !comp_reader_in_chain(c, cid, "hash", NULL)) { *out = TY_INT; return 1; }
-    /* native class (C-backed): a declared instance method returns its spec type */
-    if (cls->is_native_class) {
+    /* native class (C-backed): a declared instance method returns its spec
+       type, also on a subclass of the class (#9269) */
+    int ncid = comp_native_answer_class(c, cid, name);
+    if (ncid >= 0) {
+      ClassInfo *cls = &c->classes[ncid];
+      int cid = ncid;
       /* IO::Buffer#get_value with a LITERAL type symbol lowers to a typed
          accessor (the codegen fold); the site's type follows the symbol:
          floats are Float, u64 stays boxed (a value above 2^63-1 is a

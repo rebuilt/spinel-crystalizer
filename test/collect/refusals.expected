@@ -84,24 +84,26 @@ spinel: 1 refusal, nothing written
 == test/reject/builtin_reopen_bare_instance_method.rb [promote] rc=1
 spinel: test/reject/builtin_reopen_bare_instance_method.rb:6: unsupported call: node N (CallNode `instance_method`) recv=-/ty-1 argc=1 arg0ty8
 spinel: 1 refusal, nothing written
-== test/reject/builtin_singleton_alias_call.rb [default] rc=1
-spinel: test/reject/builtin_singleton_alias_call.rb:8: File.basename: calling an alias of a builtin singleton method is not supported; see docs/limitations.md
-spinel: 1 refusal, nothing written
-== test/reject/builtin_singleton_alias_call.rb [promote] rc=1
-spinel: test/reject/builtin_singleton_alias_call.rb:8: File.basename: calling an alias of a builtin singleton method is not supported; see docs/limitations.md
-spinel: 1 refusal, nothing written
+== test/reject/builtin_singleton_alias_call_unordered_block.rb [default] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_block.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_block.rb [promote] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_block.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_conditional.rb [default] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_conditional.rb:5: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_conditional.rb [promote] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_conditional.rb:5: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_proc.rb [default] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_proc.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_proc.rb [promote] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_proc.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_same_line.rb [default] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_same_line.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_alias_call_unordered_same_line.rb [promote] rc=1
+spinel: test/reject/builtin_singleton_alias_call_unordered_same_line.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
 == test/reject/builtin_singleton_alias_chain.rb [default] rc=1
 spinel: test/reject/builtin_singleton_alias_chain.rb:7: Time.at: rebinding a builtin singleton method captured by an alias is not supported; see docs/limitations.md
 == test/reject/builtin_singleton_alias_chain.rb [promote] rc=1
 spinel: test/reject/builtin_singleton_alias_chain.rb:7: Time.at: rebinding a builtin singleton method captured by an alias is not supported; see docs/limitations.md
-== test/reject/builtin_singleton_alias_method_redefine.rb [default] rc=1
-spinel: test/reject/builtin_singleton_alias_method_redefine.rb:4: File.basename: alias of a builtin singleton method that is later overridden is not supported; see docs/limitations.md
-== test/reject/builtin_singleton_alias_method_redefine.rb [promote] rc=1
-spinel: test/reject/builtin_singleton_alias_method_redefine.rb:4: File.basename: alias of a builtin singleton method that is later overridden is not supported; see docs/limitations.md
-== test/reject/builtin_singleton_alias_redefine.rb [default] rc=1
-spinel: test/reject/builtin_singleton_alias_redefine.rb:5: File.basename: alias of a builtin singleton method that is later overridden is not supported; see docs/limitations.md
-== test/reject/builtin_singleton_alias_redefine.rb [promote] rc=1
-spinel: test/reject/builtin_singleton_alias_redefine.rb:5: File.basename: alias of a builtin singleton method that is later overridden is not supported; see docs/limitations.md
 == test/reject/builtin_singleton_kernel_alias.rb [default] rc=1
 spinel: test/reject/builtin_singleton_kernel_alias.rb:5: Kernel.sleep: alias of a builtin singleton method that is later overridden is not supported; see docs/limitations.md
 == test/reject/builtin_singleton_kernel_alias.rb [promote] rc=1
@@ -429,9 +431,9 @@ spinel: test/reject/class_subclasses_monitor.rb:5: class A::Monitor < Monitor: s
 == test/reject/class_subclasses_monitor.rb [promote] rc=1
 spinel: test/reject/class_subclasses_monitor.rb:5: class A::Monitor < Monitor: subclassing Monitor is not supported yet (a subclass would answer differently from CRuby); wrap a Monitor in an instance variable instead
 == test/reject/class_superclass_method_call.rb [default] rc=1
-spinel: test/reject/class_superclass_method_call.rb:10: unsupported superclass expression (a call other than Struct.new, Data.define or a blockless Class.new(Constant)): write the superclass as a constant
+spinel: test/reject/class_superclass_method_call.rb:10: unsupported superclass expression (a call other than Struct.new, Data.define, a Struct subclass's new or a blockless Class.new(Constant)): write the superclass as a constant
 == test/reject/class_superclass_method_call.rb [promote] rc=1
-spinel: test/reject/class_superclass_method_call.rb:10: unsupported superclass expression (a call other than Struct.new, Data.define or a blockless Class.new(Constant)): write the superclass as a constant
+spinel: test/reject/class_superclass_method_call.rb:10: unsupported superclass expression (a call other than Struct.new, Data.define, a Struct subclass's new or a blockless Class.new(Constant)): write the superclass as a constant
 == test/reject/class_then_module.rb [default] rc=1
 spinel: test/reject/class_then_module.rb:6: Thing is not a module (the first declaration, at line 3, is a class)
 == test/reject/class_then_module.rb [promote] rc=1
@@ -457,22 +459,28 @@ spinel: test/reject/compact_path_struct_parent_reopened_later.rb:8: a class or m
 == test/reject/compact_path_struct_parent_reopened_later.rb [promote] rc=1
 spinel: test/reject/compact_path_struct_parent_reopened_later.rb:8: a class or module under Point, a constant that holds a Struct or Data class, is not supported here; write it in the body that writes Point, after any `class Point` body
 == test/reject/compare_by_identity_chained.rb [default] rc=1
-spinel: test/reject/compare_by_identity_chained.rb:8: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
+spinel: test/reject/compare_by_identity_chained.rb:8: unsupported Hash#compare_by_identity (identity-keyed hashing): its answer is used as another name for the hash: node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained.rb [promote] rc=1
-spinel: test/reject/compare_by_identity_chained.rb:8: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
+spinel: test/reject/compare_by_identity_chained.rb:8: unsupported Hash#compare_by_identity (identity-keyed hashing): its answer is used as another name for the hash: node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained_aset.rb [default] rc=1
-spinel: test/reject/compare_by_identity_chained_aset.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
+spinel: test/reject/compare_by_identity_chained_aset.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): its answer is used as another name for the hash: node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained_aset.rb [promote] rc=1
-spinel: test/reject/compare_by_identity_chained_aset.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
+spinel: test/reject/compare_by_identity_chained_aset.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): its answer is used as another name for the hash: node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained_boxed.rb [default] rc=1
 spinel: test/reject/compare_by_identity_chained_boxed.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=CallNode/ty50 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained_boxed.rb [promote] rc=1
 spinel: test/reject/compare_by_identity_chained_boxed.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=CallNode/ty50 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/compare_by_identity_string_key.rb [default] rc=1
+spinel: test/reject/compare_by_identity_string_key.rb:5: unsupported Hash#compare_by_identity (identity-keyed hashing): a key may be a String, an Integer, a Float or a boxed value: node N (CallNode `compare_by_identity`) recv=CallNode/ty30 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/compare_by_identity_string_key.rb [promote] rc=1
+spinel: test/reject/compare_by_identity_string_key.rb:5: unsupported Hash#compare_by_identity (identity-keyed hashing): a key may be a String, an Integer, a Float or a boxed value: node N (CallNode `compare_by_identity`) recv=CallNode/ty30 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/complex_bignum_component.rb [default] rc=1
 spinel: test/reject/complex_bignum_component.rb:7: a Complex component given an Integer past 64 bits, which no conversion keeps in its sp_float slot
@@ -508,6 +516,12 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/def_delegators_splat.rb:10: def_delegators with arguments other than a literal symbol list is not supported (write the names as symbols: `def_delegators :@target, :name, ...`)
 == test/reject/def_delegators_splat.rb [promote] rc=1
 spinel: test/reject/def_delegators_splat.rb:10: def_delegators with arguments other than a literal symbol list is not supported (write the names as symbols: `def_delegators :@target, :name, ...`)
+== test/reject/define_method_handed_block.rb [default] rc=1
+spinel: test/reject/define_method_handed_block.rb:7: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
+spinel: 1 refusal, nothing written
+== test/reject/define_method_handed_block.rb [promote] rc=1
+spinel: test/reject/define_method_handed_block.rb:7: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
+spinel: 1 refusal, nothing written
 == test/reject/define_method_implicit_rescue_captured_values.rb [default] rc=1
 spinel: test/reject/define_method_implicit_rescue_captured_values.rb:9: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
 spinel: test/reject/define_method_implicit_rescue_captured_values.rb:46: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
@@ -590,6 +604,18 @@ spinel: 1 refusal, nothing written
 == test/reject/define_method_name_self.rb [promote] rc=1
 spinel: test/reject/define_method_name_self.rb:4: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/define_method_proc_ref_constant.rb [default] rc=1
+spinel: test/reject/define_method_proc_ref_constant.rb:6: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
+spinel: 1 refusal, nothing written
+== test/reject/define_method_proc_ref_constant.rb [promote] rc=1
+spinel: test/reject/define_method_proc_ref_constant.rb:6: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
+spinel: 1 refusal, nothing written
+== test/reject/define_method_proc_ref_in_method.rb [default] rc=1
+spinel: test/reject/define_method_proc_ref_in_method.rb:8: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
+spinel: 1 refusal, nothing written
+== test/reject/define_method_proc_ref_in_method.rb [promote] rc=1
+spinel: test/reject/define_method_proc_ref_in_method.rb:8: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
+spinel: 1 refusal, nothing written
 == test/reject/defined_super_builtin_singleton.rb [default] rc=1
 spinel: test/reject/defined_super_builtin_singleton.rb:6: unsupported defined?(super) where the method super reaches is not known at compile time: node N (DefinedNode)
 spinel: 1 refusal, nothing written
@@ -621,10 +647,10 @@ spinel: test/reject/extend_alias_over_earlier_copy.rb:11: K.copied: alias in the
 == test/reject/extend_alias_over_earlier_copy.rb [promote] rc=1
 spinel: test/reject/extend_alias_over_earlier_copy.rb:11: K.copied: alias in the extended module M of a class method K defines itself is not supported; see docs/limitations.md
 == test/reject/ffi_ptr_ruby_object.rb [default] rc=1
-spinel: test/reject/ffi_ptr_ruby_object.rb:11: unsupported ffi pointer argument (a Ruby object has no C address; pass an IO::Buffer, a String or a :ptr value): node 23 (CallNode `new`) recv=ConstantReadNode/ty49 argc=0
+spinel: test/reject/ffi_ptr_ruby_object.rb:11: unsupported ffi pointer argument (a Ruby object has no C address; pass an IO::Buffer, a String or a :ptr value): node N (CallNode `new`) recv=ConstantReadNode/ty49 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/ffi_ptr_ruby_object.rb [promote] rc=1
-spinel: test/reject/ffi_ptr_ruby_object.rb:11: unsupported ffi pointer argument (a Ruby object has no C address; pass an IO::Buffer, a String or a :ptr value): node 23 (CallNode `new`) recv=ConstantReadNode/ty49 argc=0
+spinel: test/reject/ffi_ptr_ruby_object.rb:11: unsupported ffi pointer argument (a Ruby object has no C address; pass an IO::Buffer, a String or a :ptr value): node N (CallNode `new`) recv=ConstantReadNode/ty49 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/forwarding_builtin_uneven_calls.rb [default] rc=1
 spinel: test/reject/forwarding_builtin_uneven_calls.rb:1: `...` forwarded into a builtin method, from calls that do not all pass the same number of positional arguments
@@ -709,16 +735,16 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/ivar_set_shared_string_slot.rb:10: an instance variable write given a String, which no conversion keeps in its sp_String * slot
 spinel: 1 refusal, nothing written
 == test/reject/lazy_chain_in_global.rb [default] rc=1
-spinel: test/reject/lazy_chain_in_global.rb:3: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node 3 (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
+spinel: test/reject/lazy_chain_in_global.rb:3: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node N (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/lazy_chain_in_global.rb [promote] rc=1
-spinel: test/reject/lazy_chain_in_global.rb:3: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node 3 (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
+spinel: test/reject/lazy_chain_in_global.rb:3: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node N (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/lazy_chain_in_ivar.rb [default] rc=1
-spinel: test/reject/lazy_chain_in_ivar.rb:8: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node 8 (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
+spinel: test/reject/lazy_chain_in_ivar.rb:8: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node N (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/lazy_chain_in_ivar.rb [promote] rc=1
-spinel: test/reject/lazy_chain_in_ivar.rb:8: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node 8 (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
+spinel: test/reject/lazy_chain_in_ivar.rb:8: unsupported a lazy chain held in an instance, class or global variable or a constant (an Enumerator::Lazy is fused into the call that forces it; keep the chain in a local or force it where it is built): node N (CallNode `lazy`) recv=ArrayNode/ty19 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/lazy_stage_string_mutation.rb [default] rc=1
 spinel: test/reject/lazy_stage_string_mutation.rb:6: a lazy stage's block that changes its String element in place (`<<`, `concat`, a `!` method) is not supported: the lazy pipeline hands the block a copy of the element, so the String the source holds would not change. Use the eager form (drop `.lazy`), or return a new String (`x + "!"`) (see docs/limitations.md)
@@ -1577,10 +1603,10 @@ spinel: test/reject/string_identity_return_param.rb:7: a String a method returns
 == test/reject/string_identity_return_param.rb [promote] rc=1
 spinel: test/reject/string_identity_return_param.rb:7: a String a method returns as its parameter is mutated in place, or the variable passed in is (a String is not yet shared by reference through a method returning its parameter). Mutate and read the String through the variable passed in.
 == test/reject/string_iter_block_argument.rb [default] rc=1
-spinel: test/reject/string_iter_block_argument.rb:7: unsupported a String iterator given its block as a block argument (&blk): write the block out, or use each_char / each_byte / each_line: node 12 (CallNode `bytes`) recv=StringNode/ty6 argc=0
+spinel: test/reject/string_iter_block_argument.rb:7: unsupported a String iterator given its block as a block argument (&blk): write the block out, or use each_char / each_byte / each_line: node N (CallNode `bytes`) recv=StringNode/ty6 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/string_iter_block_argument.rb [promote] rc=1
-spinel: test/reject/string_iter_block_argument.rb:7: unsupported a String iterator given its block as a block argument (&blk): write the block out, or use each_char / each_byte / each_line: node 12 (CallNode `bytes`) recv=StringNode/ty6 argc=0
+spinel: test/reject/string_iter_block_argument.rb:7: unsupported a String iterator given its block as a block argument (&blk): write the block out, or use each_char / each_byte / each_line: node N (CallNode `bytes`) recv=StringNode/ty6 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/string_ivar_alias_lent_call.rb [default] rc=1
 spinel: test/reject/string_ivar_alias_lent_call.rb:7: a String instance variable written from a local is passed to an appending parameter (a String is not yet shared by reference through a lent instance variable written from a local). Return the String from the method and assign it, or append to it in the caller.
@@ -1890,6 +1916,10 @@ spinel: 1 refusal, nothing written
 == test/reject/string_yield_splat_captured.rb [promote] rc=1
 spinel: test/reject/string_yield_splat_captured.rb:11: a String is passed to a block's parameter `q` through a splat into a yield, which the proc appends to: this call hands the proc a copy, so the append would not reach the caller's String (a String is not yet shared by reference through a splat into a yield). Return the String from the proc and assign it, or append to it in the caller.
 spinel: 1 refusal, nothing written
+== test/reject/stringio_subclass_initialize_no_super.rb [default] rc=1
+spinel: test/reject/stringio_subclass_initialize_no_super.rb:7: NoSuper#initialize does not call super: the StringIO it is would be left unset, where CRuby raises IOError (uninitialized stream) on its first use; call super in initialize
+== test/reject/stringio_subclass_initialize_no_super.rb [promote] rc=1
+spinel: test/reject/stringio_subclass_initialize_no_super.rb:7: NoSuper#initialize does not call super: the StringIO it is would be left unset, where CRuby raises IOError (uninitialized stream) on its first use; call super in initialize
 == test/reject/struct_masgn_string_member.rb [default] rc=1
 spinel: test/reject/struct_masgn_string_member.rb:11: unsupported multiple assignment index target non-array/hash: node N (MultiWriteNode)
 spinel: 1 refusal, nothing written
@@ -1902,6 +1932,10 @@ spinel: 1 refusal, nothing written
 == test/reject/struct_member_block_param_store.rb [promote] rc=1
 spinel: test/reject/struct_member_block_param_store.rb:6: a String variable is stored into a Struct member or through an attribute writer into an instance variable that is mutated in place through another name (a String is not yet shared by reference through this variable). Store a String no variable keeps, or mutate it through the variable.
 spinel: 1 refusal, nothing written
+== test/reject/struct_subclass_own_new_superclass.rb [default] rc=1
+spinel: test/reject/struct_subclass_own_new_superclass.rb:7: unsupported superclass expression (a call other than Struct.new, Data.define, a Struct subclass's new or a blockless Class.new(Constant)): write the superclass as a constant
+== test/reject/struct_subclass_own_new_superclass.rb [promote] rc=1
+spinel: test/reject/struct_subclass_own_new_superclass.rb:7: unsupported superclass expression (a call other than Struct.new, Data.define, a Struct subclass's new or a blockless Class.new(Constant)): write the superclass as a constant
 == test/reject/subclass_array_builtin_alias_recv.rb [default] rc=1
 spinel: test/reject/subclass_array_builtin_alias_recv.rb:11: calling `raw_size`, an alias of Array#size in Log, on a receiver is not supported yet (it would run the class's own `size`); call it without a receiver inside the class
 == test/reject/subclass_array_builtin_alias_recv.rb [promote] rc=1
@@ -1922,10 +1956,6 @@ spinel: test/reject/subclass_hash_class_new.rb:5: Class.new(Hash) without a bloc
 spinel: test/reject/subclass_range.rb:3: class Span < Range: subclassing Range is not supported yet (a subclass would answer differently from CRuby); wrap a Range in an instance variable instead
 == test/reject/subclass_range.rb [promote] rc=1
 spinel: test/reject/subclass_range.rb:3: class Span < Range: subclassing Range is not supported yet (a subclass would answer differently from CRuby); wrap a Range in an instance variable instead
-== test/reject/subclass_stringio.rb [default] rc=1
-spinel: test/reject/subclass_stringio.rb:6: class Buffer < StringIO: subclassing StringIO is not supported yet (a subclass would answer differently from CRuby); wrap a StringIO in an instance variable instead
-== test/reject/subclass_stringio.rb [promote] rc=1
-spinel: test/reject/subclass_stringio.rb:6: class Buffer < StringIO: subclassing StringIO is not supported yet (a subclass would answer differently from CRuby); wrap a StringIO in an instance variable instead
 == test/reject/subclass_thread_queue.rb [default] rc=1
 spinel: test/reject/subclass_thread_queue.rb:3: class Jobs < Queue: subclassing Queue is not supported yet (a subclass would answer differently from CRuby); wrap a Queue in an instance variable instead
 == test/reject/subclass_thread_queue.rb [promote] rc=1

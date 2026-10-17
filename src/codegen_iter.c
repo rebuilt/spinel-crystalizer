@@ -3506,7 +3506,8 @@ void emit_block_invoke(Compiler *c, int args_node, Buf *b, int indent, int as_ex
          where the box was read (#8399) */
       if (want_poly && (ty_is_object(tt3) ||
                         (nt_kind(nt, bd3[bn3 - 1]) == NK_CallNode &&
-                         (tt3 == TY_STRING || tt3 == TY_STRBUF))))
+                         (tt3 == TY_STRING || tt3 == TY_STRBUF)) ||
+                        (tt3 == TY_STRING && strbuf_srange_arm(c, bd3[bn3 - 1]))))
         emit_boxed(c, bd3[bn3 - 1], &tb);
       else if (ywo) emit_oint_expr(c, bd3[bn3 - 1], want_ty, &tb);
       else emit_expr(c, bd3[bn3 - 1], &tb);
@@ -4431,7 +4432,13 @@ int next_is_block_value(Compiler *c, int next) {
 /* Emit a loop body, prefixing a `_redo_N:` label (and pushing it on the redo
    stack) when the body contains a `redo` that targets this loop. The label
    sits at the body top so `redo` re-runs the body without advancing. */
+/* A loop that may not end (loop, an unproved while) polls for a delivered
+   signal at its back-edge; a counted one only when no loop of its function
+   encloses it, so an inner counted loop keeps no poll in its body (#9222) */
+int g_loop_uncounted = 0, g_poll_loop_nest = 0;
 void emit_loop_body(Compiler *c, int body, Buf *b, int indent) {
+  int poll_uncounted = g_loop_uncounted; g_loop_uncounted = 0;
+  int poll_nest = ++g_poll_loop_nest;
   /* break/next inside this body exit THIS C loop: record the live
      begin/rescue frame depth at loop entry so their emission can pop the
      frames opened inside the body (mirrors emit_return's accounting). */
@@ -4472,9 +4479,12 @@ void emit_loop_body(Compiler *c, int body, Buf *b, int indent) {
      the cache reloads after one runs, as after a safepoint. */
   if (polls_here && g_uses_finalizers) { emit_indent(b, indent); buf_printf(b, "if (SP_UNLIKELY(SP_ATOMIC_LOAD(&sp_fin_pending_flag, __ATOMIC_RELAXED))) sp_fin_run_pending()%s;\n", hc_mark()); }
   /* and for a delivered Signal.trap, Ruby code as a finalizer is */
-  if (polls_here && g_uses_traps) { emit_indent(b, indent); buf_printf(b, "if (SP_UNLIKELY(SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_RELAXED))) sp_sig_run_pending()%s;\n", hc_mark()); }
+  if (polls_here && sig_polls() && (poll_uncounted || poll_nest == 1) && !poll_in_pure(c, body)) {
+    emit_indent(b, indent); buf_printf(b, "%s%s;\n", sig_poll_stmt(), hc_mark());
+  }
   emit_stmts(c, body, b, indent);
   if (has_redo) g_redo_depth--;
+  g_poll_loop_nest--;
   g_c_loop_depth--;
   g_ie_next_var = sv_nxv; g_ie_next_ty = sv_nxt;
   g_loop_exc_base = sv_lexc; g_loop_rescue_base = sv_lexc_rb;
@@ -4517,9 +4527,11 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
     }
   }
   if (et == TY_UNKNOWN) return 0;
-  /* a nil receiver (`nil.tap { }`) has no scalar C type: carry it boxed */
-  int et_nil = (et == TY_NIL);
-  if (et_nil) et = TY_POLY;
+  /* a nil receiver (`nil.tap { }`) has no scalar C type: carry it boxed.
+     A receiver with no value (void: a method answering nothing usable, or
+     one that always raises) is run as a statement and yields nil. */
+  int et_nil = (et == TY_NIL), et_void = (et == TY_VOID);
+  if (et_nil || et_void) et = TY_POLY;
   int body = nt_ref(nt, block, "body");
   int bn = 0;
   const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
@@ -4554,8 +4566,15 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
   /* a receiver that can be nil is held as its oint: the parameter gets
      the nil (`x = nil; x.then { |y| y.nil? }`), and unwrapping it here
      raised before the block ran */
-  int ro = !empty_arr_adopt && !hparam && !et_nil && oint_kind(et) && node_is_oint(c, recv);
+  int ro = !empty_arr_adopt && !hparam && !et_nil && !et_void && oint_kind(et) && node_is_oint(c, recv);
   if (empty_arr_adopt || hparam) ;
+  else if (et_void) {
+    Buf vb; memset(&vb, 0, sizeof vb);
+    emit_expr(c, recv, &vb);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "%s;\n", vb.p ? vb.p : ""); free(vb.p);
+    buf_puts(&rb, "sp_box_nil()");
+  }
   else if (ro) emit_oint_expr(c, recv, et, &rb);
   else if (et_nil) emit_boxed(c, recv, &rb); else emit_expr(c, recv, &rb);
   emit_indent(g_pre, g_indent);
@@ -5557,7 +5576,7 @@ static int iter_strh_arms(Compiler *c, int id, Buf *b, int indent, int block, in
                           const char *p0, TyKind rt) {
   if (rt != TY_STRH_ARRAY || strh_call_op(c, id, rt) != STRH_EACH) return -1;
   Buf rb; memset(&rb, 0, sizeof rb);
-  emit_expr(c, recv, &rb);
+  strh_emit_recv(c, id, recv, &rb);
   hoist_loop_recv(c, rt, &rb, b, indent);
   Scope *cs = comp_scope_of(c, id);
   LocalVar *o0 = p0 && cs ? scope_local(cs, p0) : NULL;
@@ -5696,8 +5715,12 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
   if (sp_streq(name, "tap") && recv >= 0) {
     TyKind et = repr_of(c, recv).as_ty;
     /* a receiver of no type -- a call proven to raise NoMethodError -- is
-       the raise's sp_RbVal; `void _t` did not compile (#6213) */
-    if (et == TY_UNKNOWN || et == TY_VOID) et = TY_POLY;
+       the raise's sp_RbVal; `void _t` did not compile (#6213). A receiver
+       with no value (nil, or void: a method answering nothing usable, or
+       one that always raises) may be a void C call: it is run as a
+       statement, and the block gets nil. */
+    int no_value = et == TY_NIL || et == TY_VOID;
+    if (et == TY_UNKNOWN || no_value) et = TY_POLY;
     Scope *tsc = p0_orig ? comp_scope_of(c, block) : NULL;
     LocalVar *tlv0 = (tsc && p0_orig) ? scope_local(tsc, p0_orig) : NULL;
     TyKind tsaved0 = tlv0 ? tlv0->type : TY_UNKNOWN;
@@ -5706,11 +5729,29 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     /* a receiver that can be nil is held as its oint, the parameter's nil
        (emit_tap_then_expr) */
     int ro = oint_kind(et) && node_is_oint(c, recv);
+    /* --share-strings: a block parameter that is the shared handle is bound
+       to the receiver's own String, as the expression form binds it
+       (emit_tap_then_expr) */
+    int hparam = 0;
+    if (et == TY_STRING && repr_share_rule(c) && p0) {
+      LocalVar *hlv = tsc ? scope_local(tsc, p0) : NULL;
+      if (!hlv && tsc) hlv = scope_local(tsc, p0_orig);
+      hparam = hlv && repr_of_slot(c, hlv).handle;
+    }
     Buf rb; memset(&rb, 0, sizeof rb);
-    if (ro) emit_oint_expr(c, recv, et, &rb); else emit_expr(c, recv, &rb);
+    if (no_value) {
+      emit_expr(c, recv, &rb);
+      emit_indent(b, indent);
+      buf_printf(b, "%s;\n", rb.p ? rb.p : ""); free(rb.p);
+      memset(&rb, 0, sizeof rb);
+      buf_puts(&rb, "sp_box_nil()");
+    }
+    else if (hparam) { emit_strbuf_handle_of(c, recv, &rb); et = TY_STRBUF; use_shadow_t = tlv0 && tlv0->type != et; }
+    else if (ro) emit_oint_expr(c, recv, et, &rb); else emit_expr(c, recv, &rb);
     emit_indent(b, indent);
     if (ro) buf_puts(b, oint_ctype(et)); else emit_ctype(c, et, b);
     buf_printf(b, " _t%d = %s;\n", tr, rb.p ? rb.p : ""); free(rb.p);
+    if (hparam) { emit_indent(b, indent); emit_gc_root_tmp(c, et, tr, b); buf_puts(b, "\n"); }
     /* An OBJECT-receiver tap whose param widened to poly (it escaped through
        yield(_1) / a store) cannot be shadowed with a concrete object slot;
        box the receiver into the poly param instead (#3140). An array/hash
@@ -6180,8 +6221,11 @@ static int iter_range_upto_arms(Compiler *c, int id, Buf *b, int indent, const N
    row to the parameter's array representation before binding it. */
 static void emit_poly_combination_param(Compiler *c, int block, const char *pn,
                                         int tc, int ti, int indent, Buf *b) {
+  /* (pn is the C name, renamed where a yield inlined the block; the scope
+     knows the parameter by its own name) */
   Scope *sc = comp_scope_of(c, block);
-  LocalVar *lv = sc ? scope_local(sc, pn) : NULL;
+  const char *own = block_param_name(c, block, 0);
+  LocalVar *lv = sc && own ? scope_local(sc, own) : NULL;
   TyKind pt = lv ? lv->type : TY_UNKNOWN;
   emit_indent(b, indent);
   if (pt == TY_POLY_ARRAY)
@@ -6232,7 +6276,7 @@ static int iter_combination_cons_arms(Compiler *c, int id, Buf *b, int indent, c
     emit_indent(b, indent + 1); buf_printf(b, "for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, tc, ti);
     if (p0) {
       Scope *cbsc = comp_scope_of(c, block);
-      LocalVar *clv = cbsc ? scope_local(cbsc, p0) : NULL;
+      LocalVar *clv = cbsc ? scope_local(cbsc, block_param_name(c, block, 0)) : NULL;
       TyKind cpt = clv ? clv->type : TY_UNKNOWN;
       emit_indent(b, indent + 2);
       if (cpt == TY_POLY || cpt == TY_UNKNOWN)
@@ -6298,7 +6342,7 @@ static int iter_combination_cons_arms(Compiler *c, int id, Buf *b, int indent, c
     emit_indent(b, indent + 1); buf_printf(b, "for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, tc, ti);
     if (p0) {
       Scope *cbsc = comp_scope_of(c, block);
-      LocalVar *clv = cbsc ? scope_local(cbsc, p0) : NULL;
+      LocalVar *clv = cbsc ? scope_local(cbsc, block_param_name(c, block, 0)) : NULL;
       TyKind cpt = clv ? clv->type : TY_UNKNOWN;
       emit_indent(b, indent + 2);
       if (cpt == TY_FLOAT_ARRAY)
@@ -7601,6 +7645,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
        accounting the handler stack grew by one per call and eventually wrote
        past its end (#3781). */
     g_exc_frame_depth++;
+    g_loop_uncounted = 1;
     emit_loop_body(c, lbody, b, indent + 2);
     g_exc_frame_depth--;
     emit_indent(b, indent + 1); buf_puts(b, "}\n");

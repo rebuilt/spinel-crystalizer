@@ -122,11 +122,12 @@ A few `require`s name a capability Spinel already provides as core, and are
 ### Pre-installed packages (the carved-out stdlib)
 
 Some stdlib ships with Spinel as Ruby source and is spliced when required --
-`set`, `forwardable`, `optparse`, `erb`, `csv`, `pathname`, `digest`, `base64`,
+`set`, `forwardable`, `optparse` (the bundled release with a few hunks; see `packages/optparse/README.md`), `erb`, `csv`, `pathname`, `digest`, `base64`,
 `fileutils`, `tmpdir`, `zlib`, `open3` (the capture forms), `pty` (`PTY.spawn`; not on
 wasm32-wasi, which has no fork), `fiddle` (where libffi is,
 like `ffi`),
 `benchmark` (CRuby's own gem, unmodified), `shellwords` (likewise), `find` (likewise, but for one line; see its note),
+`getoptlong` (the bundled gem, unmodified; pinned in `packages/getoptlong/README.md`),
 `fileutils`, `tmpdir`, `zlib`, `logger` (a compact implementation of its API),
 `benchmark` (CRuby's own gem, unmodified),
 `bigdecimal` (a minimal subset, see `packages/bigdecimal/bigdecimal.rb`),
@@ -137,7 +138,8 @@ interrupts through `Thread#raise`, so not on the main thread yet),
 in Ruby with Psych's scalar rules and libyaml's emitter choices; what is
 left out is listed at the top of `packages/psych/psych.rb`)
 (plus the `stringio`/`strscan`/`json` marker shims for their C-backed
-features). `net/http` and `uri` are there, and so
+features). `net/http` and `uri` are there, `net/smtp` (ruby/net-smtp with
+`net/protocol`, vendored in `packages/net`; see its README.md), and so
 is `openssl` -- the one that is conditional: it is glue over the system libssl, so it exists only where those
 headers did at build time, and `require "openssl"` is otherwise the
 unsatisfiable require it is for any library Spinel does not carry. Where the

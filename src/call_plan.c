@@ -705,14 +705,18 @@ int cplan_target_binds(Compiler *c, int id, int mi) {
   if (id < 0 || mi < 0 || mi >= c->nscopes || nt_kind(nt, id) != NK_CallNode) return 1;
   int args = nt_ref(nt, id, "arguments"), argc = 0;
   const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
-  for (int a = 0; a < argc; a++) {
+  /* a trailing keyword hash is judged as the arm judges it: taken as
+     keywords, refused, or one more positional Hash (kw_plan) */
+  int kwh = argc > 0 && nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode ? argv[argc - 1] : -1;
+  int pos_argc = kwh >= 0 ? argc - 1 : argc;
+  for (int a = 0; a < pos_argc; a++) {
     NodeKind k = nt_kind(nt, argv[a]);
     if (k == NK_SplatNode || k == NK_KeywordHashNode || k == NK_ForwardingArgumentsNode ||
         k == NK_BlockArgumentNode)
       return 1;
   }
   char exp[256];
-  return poly_arm_count(c, &c->scopes[mi], -1, argc, -1, exp, sizeof exp) >= 0;
+  return poly_arm_count(c, &c->scopes[mi], kwh, pos_argc, -1, exp, sizeof exp) >= 0;
 }
 
 int cplan_targets(Compiler *c, int id, int *out, int cap) {
@@ -979,6 +983,10 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
              "name the attributes (see docs/limitations.md)", name);
     return buf;
   }
+  if (nt_int(nt, id, "define_method_name", 0) == 2 && cplan_reachable(c, id))
+    return "Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, "
+           "a constant, a call's result) is not supported: the defined method's body is known only at run "
+           "time. Pass a block literal to define_method instead";
   if (nt_int(nt, id, "define_method_name", 0) && cplan_reachable(c, id))
     return "Module#define_method with a non-literal name is not supported; "
            "use a literal Symbol or String (see docs/limitations.md)";
@@ -1002,16 +1010,6 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
   }
 
   int recv = nt_ref(nt, id, "receiver");
-  if ((nt_kind(nt, recv) == NK_ConstantReadNode || nt_kind(nt, recv) == NK_ConstantPathNode) &&
-      !nt_int(nt, id, "builtin_only", 0)) {
-    int ci = comp_class_index(c, nt_str(nt, recv, "name")), builtin = 0;
-    const char *target = ci >= 0 && c->classes[ci].naliases > 0
-                           ? comp_resolve_alias_ex(c, ci, name, NULL, &builtin) : NULL;
-    if (builtin == 2) {
-      snprintf(buf, cap, "%s.%s: calling an alias of a builtin singleton method is not supported; see docs/limitations.md", c->classes[ci].name, target);
-      return buf;
-    }
-  }
   if (is_then_alias(name)) {
     int blk = nt_ref(nt, id, "block"), recv = nt_ref(nt, id, "receiver");
     TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
@@ -1510,7 +1508,7 @@ static void cpoly_user_arms0(Compiler *c, int id, const char *name, TyKind ret, 
   for (int ki = 0; ki < nks; ki++) {
     int k = ks[ki];
     if (!c->classes[k].instantiated && !class_is_prim_reopen(c, k)) continue;
-    if (c->classes[k].is_native_class) {
+    if (comp_native_binding_class(c, k, name) >= 0) {
       int nmi = comp_native_method_find(c, k, name, 0, 0);
       if (nmi >= 0 && native_takes(&c->native_methods[nmi], 0)) {
         TyKind mret = native_spec_to_ty(c->native_methods[nmi].ret);
@@ -1564,13 +1562,13 @@ static void cpoly_user_arms0(Compiler *c, int id, const char *name, TyKind ret, 
       char ivn[256]; snprintf(ivn, sizeof ivn, "@%s", rn);
       int ivx = comp_ivar_index(&c->classes[rdcls], ivn);
       TyKind ivt = ivx >= 0 ? c->classes[rdcls].ivar_types[ivx] : TY_INT;
-      int optional = oint_kind(ret) && repr_of(c, id).nil_scalar && ivx >= 0 && repr_of_ivar(c, rdcls, ivx).nil_scalar;
       /* an Integer or Float ivar with a nil bit goes with its nil into a
          boxed result or a result slot that holds one (an sp_oint), as the
-         arm emitter writes it */
+         arm emitter writes it; one without a nil bit holds no nil, and
+         a boxed result takes its plain box */
       int nilbit = ivx >= 0 && oint_kind(ivt) && ivar_has_nilbit(c, rdcls, ivx);
       int slot_oint = is_scalar_ret(ret) && oint_kind(ret) && node_is_oint(c, id);
-      int conv = (ret == TY_POLY && ivt == TY_INT) || optional || (nilbit && (ret == TY_POLY || slot_oint)) ? PC_BOX_OR_NIL
+      int conv = nilbit && (ret == TY_POLY || slot_oint) ? PC_BOX_OR_NIL
                : ivt == TY_STRBUF && ret == TY_STRING && cpoly_conv(ret, ivt) == PC_SAME ? PC_COPY
                : cpoly_conv(ret, ivt);
       cpoly_add(p, &cap, PA_READER, k, -1, ivt, conv);
@@ -1620,7 +1618,7 @@ int cplan_arm_args_fit(Compiler *c, Scope *ks, const ArgLayout *L, int pos_argc,
   if (kslot >= 0 && L->from[kslot] != ARG_BY_NAME && ks->pnames && ks->pnames[kslot]) {
     LocalVar *kpv = scope_local(ks, ks->pnames[kslot]);
     TyKind kpt = kpv ? kpv->type : TY_UNKNOWN;
-    if (ty_is_hash(kpt) && kpt != (kwall_any ? TY_POLY_POLY_HASH : TY_SYM_POLY_HASH)) return 0;
+    if (!kwh_param_fits(kpt, kwall_any)) return 0;
   }
   return 1;
 }
@@ -1807,12 +1805,13 @@ static void cpoly_user_arms_n(Compiler *c, int id, const char *name, int argc, c
       cpoly_add(p, &cap, PA_STRUCT_SET, k, -1, ret, PC_SAME);
       continue;
     }
-    if (c->classes[k].is_native_class) {
+    int nk = comp_native_binding_class(c, k, name);
+    if (nk >= 0) {
       if (kw_pos && has_splat_arg && argc == 1 && splat_a == 0 && kwh < 0 && c->classes[k].instantiated) {
         const NativeMethod *rm = NULL;
         for (int i = 0; i < c->n_native_methods && !rm; i++) {
           const NativeMethod *m = &c->native_methods[i];
-          if (m->class_id == k && m->kind == 0 && m->rest && m->nargs == 0 && sp_streq(m->name, name))
+          if (m->class_id == nk && m->kind == 0 && m->rest && m->nargs == 0 && sp_streq(m->name, name))
             rm = m;
         }
         if (!rm) continue;
@@ -2293,9 +2292,12 @@ void cplan_poly_free(PolyPlan *p) {
 
 /* the receivers whose nil target the plan decides: a typed pointer whose
    NULL is nil, a builtin's or a user object's (repr_of says which object
-   is held as a pointer; a by-value one has no nil) */
+   is held as a pointer; a by-value one has no nil), an Array of shared
+   Strings' handles (TY_STRH_ARRAY) included, whose arguments then run
+   ahead of the nil test (emit_nil_target_head) */
 static int cplan_nil_family(TyKind t) {
-  return t == TY_STRING || ty_is_array(t) || ty_is_obj_array(t) || ty_is_hash(t) || t == TY_IO || ty_is_object(t);
+  return t == TY_STRING || ty_is_array(t) || t == TY_STRH_ARRAY || ty_is_obj_array(t) || ty_is_hash(t) ||
+         t == TY_IO || ty_is_object(t);
 }
 
 /* Does the program give nil a method `name` of its own: on NilClass,

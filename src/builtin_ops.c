@@ -35,6 +35,69 @@ int bop_name_mutates(const char *name, unsigned sites) {
   return 0;
 }
 
+/* The names a lone splat on a boxed receiver reaches through the generic
+   entry (an_bi_generic_splat, bi_generic_fn), and the most arguments it
+   takes them with (-1: every count it writes out). Each was run on every
+   builtin receiver class that has it, and on those that lack it, with no,
+   one, two and three arguments of each builtin kind (Integer, a Bignum,
+   Float, String, Symbol, Regexp, Array, Hash, nil), and answered as CRuby
+   does or raised, leaving the receiver and $~ as CRuby leaves them. A name
+   some count of which answers otherwise stops below that count; a name the
+   written-out call answers wrong for is left out (fill, utc, assoc ...), as
+   is a name whose blockless form answers an Enumerator and any other name:
+   their splat raises NoMethodError, as before. Sorted by name (strcmp). */
+typedef struct { const char *name; int most; } BopGenericRow;
+static const BopGenericRow bop_generic_rows[] = {
+  { "abs", -1 }, { "abs2", -1 }, { "angle", -1 }, { "arg", -1 }, { "ascii_only?", -1 }, { "asctime", -1 },
+  { "at", -1 }, { "b", -1 }, { "between?", -1 }, { "bit_length", -1 }, { "bytesize", -1 },
+  { "byteslice", -1 }, { "capitalize", -1 }, { "capitalize!", -1 }, { "captures", -1 }, { "casecmp", -1 },
+  { "casecmp?", -1 }, { "ceil", 0 }, { "center", -1 }, { "chars", -1 }, { "chomp", -1 }, { "chomp!", -1 },
+  { "chop", -1 }, { "chop!", -1 }, { "chr", -1 }, { "clamp", -1 }, { "close", -1 }, { "closed?", -1 },
+  { "codepoints", -1 }, { "coerce", -1 }, { "compact", -1 }, { "compare_by_identity?", -1 },
+  { "concat", 0 }, { "conj", -1 }, { "conjugate", -1 }, { "ctime", -1 }, { "day", -1 },
+  { "deconstruct_keys", -1 }, { "default", -1 }, { "delete!", -1 }, { "delete_at", -1 },
+  { "delete_prefix", -1 }, { "delete_prefix!", -1 }, { "delete_suffix", -1 }, { "delete_suffix!", -1 },
+  { "denominator", -1 }, { "difference", -1 }, { "div", -1 }, { "divmod", -1 }, { "downcase", -1 },
+  { "downcase!", -1 }, { "drop", -1 }, { "dst?", -1 }, { "dump", -1 }, { "encode", 0 }, { "encoding", -1 },
+  { "entries", -1 }, { "eof?", -1 }, { "exclude_end?", -1 }, { "fdiv", -1 }, { "finite?", -1 },
+  { "flatten!", -1 }, { "floor", 0 }, { "friday?", -1 }, { "gcd", -1 }, { "getgm", -1 }, { "getlocal", -1 },
+  { "getutc", -1 }, { "gmt?", -1 }, { "gmt_offset", -1 }, { "gmtoff", -1 }, { "has_value?", -1 },
+  { "hex", -1 }, { "hour", -1 }, { "id2name", -1 }, { "imag", -1 }, { "imaginary", -1 },
+  { "infinite?", -1 }, { "integer?", -1 }, { "intern", -1 }, { "intersection", -1 }, { "isdst", -1 },
+  { "keys", -1 }, { "lcm", -1 }, { "ljust", -1 }, { "lstrip", -1 }, { "lstrip!", 0 }, { "magnitude", -1 },
+  { "mday", -1 }, { "members", -1 }, { "merge", -1 }, { "merge!", -1 }, { "min", -1 }, { "modulo", -1 },
+  { "mon", -1 }, { "monday?", -1 }, { "month", -1 }, { "nan?", -1 }, { "negative?", -1 }, { "next", -1 },
+  { "next!", -1 }, { "next_float", -1 }, { "next_values", -1 }, { "nonzero?", -1 }, { "nsec", -1 },
+  { "numerator", -1 }, { "oct", -1 }, { "offset", -1 }, { "ord", -1 }, { "pack", -1 }, { "peek", -1 },
+  { "peek_values", -1 }, { "phase", -1 }, { "polar", -1 }, { "pop", -1 }, { "positive?", -1 },
+  { "post_match", -1 }, { "pre_match", -1 }, { "prepend", -1 }, { "prev_float", -1 }, { "read", 1 },
+  { "real", -1 }, { "real?", -1 }, { "rect", -1 }, { "rectangular", -1 }, { "regexp", -1 },
+  { "replace", -1 }, { "reverse", -1 }, { "reverse!", -1 }, { "rjust", -1 }, { "rotate!", -1 },
+  { "round", 0 }, { "rstrip", -1 }, { "rstrip!", 0 }, { "saturday?", -1 }, { "scan", -1 }, { "scrub", -1 },
+  { "scrub!", -1 }, { "sec", -1 }, { "shift", -1 }, { "sort", -1 }, { "sort!", -1 }, { "split", -1 },
+  { "squeeze", -1 }, { "squeeze!", -1 }, { "store", -1 }, { "strip", -1 }, { "strip!", 0 }, { "sub", -1 },
+  { "sub!", -1 }, { "subsec", -1 }, { "succ", -1 }, { "succ!", -1 }, { "sum", -1 }, { "sunday?", -1 },
+  { "swapcase", -1 }, { "swapcase!", -1 }, { "sync", -1 }, { "take", -1 }, { "thursday?", -1 },
+  { "to_ary", -1 }, { "to_f", -1 }, { "to_hash", -1 }, { "to_str", -1 }, { "to_sym", -1 }, { "tr", -1 },
+  { "tr_s", -1 }, { "tr_s!", -1 }, { "truncate", 0 }, { "tuesday?", -1 }, { "tv_nsec", -1 },
+  { "tv_sec", -1 }, { "tv_usec", -1 }, { "union", -1 }, { "uniq", -1 }, { "uniq!", -1 }, { "unpack", -1 },
+  { "unpack1", -1 }, { "upcase", -1 }, { "upcase!", -1 }, { "update", -1 }, { "usec", -1 }, { "utc?", -1 },
+  { "utc_offset", -1 }, { "valid_encoding?", -1 }, { "value?", -1 }, { "values", -1 }, { "wday", -1 },
+  { "wednesday?", -1 }, { "yday", -1 }, { "year", -1 }, { "zero?", -1 }, { "zone", -1 }
+};
+
+static int bop_generic_cmp(const void *k, const void *r) {
+  return strcmp((const char *)k, *(const char *const *)r);
+}
+
+int bop_generic_entry(const char *name, int *most) {
+  if (!name) return 0;
+  const BopGenericRow *r = bsearch(name, bop_generic_rows, sizeof bop_generic_rows / sizeof bop_generic_rows[0],
+            sizeof bop_generic_rows[0], bop_generic_cmp);
+  if (r && most) *most = r->most;
+  return r != NULL;
+}
+
 static const BuiltinZeroOp bop_zero_ops[] = {
 #define BZ_IO(name, fn, ret, max, mode, poly_ret, tail) \
   { TY_IO, name, #fn, poly_ret, tail },
@@ -951,8 +1014,8 @@ static const BuiltinOp bop_rows[] = {
   { TY_ENUMERATOR, "sum",             0,   0, BF_REQUIRED, TY_POLY,        BOPE_NONE },
   { TY_ENUMERATOR, "to_a",            0,   0, BF_ANY,      TY_POLY_ARRAY,  BOPE_NONE },
   { TY_ENUMERATOR, "entries",         0,   0, BF_ANY,      TY_POLY_ARRAY,  BOPE_NONE },
-  { TY_ENUMERATOR, "dup",             0,   0, BF_ANY,      TY_UNKNOWN,     BOPE_TEMPLATE, "sp_Enumerator_dup($r)", 0 },  /* typed by the generic rules */
-  { TY_ENUMERATOR, "clone",           0,   0, BF_ANY,      TY_UNKNOWN,     BOPE_TEMPLATE, "sp_Enumerator_dup($r)", 0 },
+  { TY_ENUMERATOR, "dup",             0,   0, BF_ANY,      BOPR_SELF,      BOPE_TEMPLATE, "sp_Enumerator_dup($r)", 0 },
+  { TY_ENUMERATOR, "clone",           0,   0, BF_ANY,      BOPR_SELF,      BOPE_TEMPLATE, "sp_Enumerator_dup($r)", 0 },
   { TY_ENUMERATOR, "inspect",         0,   0, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "sp_enum_inspect($r)" },
   { TY_ENUMERATOR, "to_s",            0,   0, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "sp_enum_inspect($r)" },
 
@@ -1430,34 +1493,35 @@ static const BuiltinOp bop_rows[] = {
   /* Method and Proc: the result kinds read off the name and arity.
      call/()/[] (the target's or the proc's return), bind_call, receiver,
      composition (<< / >>) and Proc identity against a Proc are typed in
-     infer_call_inner. */
-  { TY_METHOD, "to_proc",         0,   0, BF_ANY, TY_PROC,       BOPE_NONE },
-  { TY_METHOD, "original_name",   0,   0, BF_ANY, TY_SYMBOL,     BOPE_NONE },  /* reflection (#3247) */
+     infer_call_inner; Proc#=== is emitted with call. */
+  { TY_METHOD, "to_proc",         0,   0, BF_ANY, TY_PROC,       BOPE_METHOD_TO_PROC },
+  { TY_METHOD, "original_name",   0,   0, BF_ANY, TY_SYMBOL,     BOPE_METHOD_ORIGINAL_NAME },  /* reflection (#3247) */
   { TY_METHOD, "name",            0,   0, BF_ANY,      TY_SYMBOL,     BOPE_TEMPLATE, "sp_sym_intern((const char *)($r)->name)", 0 },
-  { TY_METHOD, "parameters",      0,   0, BF_ANY, TY_POLY_ARRAY, BOPE_NONE },
-  { TY_METHOD, "source_location", 0,   0, BF_ANY, TY_POLY_ARRAY, BOPE_NONE },
+  { TY_METHOD, "parameters",      0,   0, BF_ANY, TY_POLY_ARRAY, BOPE_METHOD_PARAMETERS, 0, 0, 0, 0, 1 },  /* stage 1: after the reflection arm */
+  { TY_METHOD, "source_location", 0,   0, BF_ANY, TY_POLY_ARRAY, BOPE_METHOD_SOURCE_LOCATION },
   { TY_METHOD, "dup",             0,   0, BF_ANY,      TY_METHOD,     BOPE_TEMPLATE, "$r", 0 },
   { TY_METHOD, "clone",           0,   0, BF_ANY,      TY_METHOD,     BOPE_TEMPLATE, "$r", 0 },
-  { TY_METHOD, "unbind",          0,   0, BF_ANY, TY_METHOD,     BOPE_NONE },
-  { TY_METHOD, "super_method",    0,   0, BF_ANY, TY_METHOD,     BOPE_NONE },
+  { TY_METHOD, "unbind",          0,   0, BF_ANY, TY_METHOD,     BOPE_METHOD_UNBIND },
+  { TY_METHOD, "super_method",    0,   0, BF_ANY, TY_METHOD,     BOPE_METHOD_SUPER_METHOD },
   { TY_METHOD, "inspect",         0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_method_desc_cstr($r)", 0 },
   { TY_METHOD, "to_s",            0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_method_desc_cstr($r)", 0 },
   { TY_METHOD, "box",             0,   0, BF_ANY,      TY_NIL,        BOPE_TEMPLATE, "((void)($r), sp_box_nil())", 0 },  /* namespace-less: never boxed */
-  { TY_METHOD, "owner",           0,   0, BF_ANY, TY_CLASS,      BOPE_NONE },  /* #2701 */
-  { TY_METHOD, "arity",           0,   0, BF_ANY, TY_INT,        BOPE_NONE },
+  { TY_METHOD, "owner",           0,   0, BF_ANY, TY_CLASS,      BOPE_METHOD_OWNER },  /* #2701 */
+  { TY_METHOD, "receiver",        0,   0, BF_ANY, TY_UNKNOWN,    BOPE_METHOD_RECEIVER, NULL, 0, 0, BOPF_INFERRED },  /* typed by infer_method_proc_call (#2701) */
+  { TY_METHOD, "arity",           0,   0, BF_ANY, TY_INT,        BOPE_METHOD_ARITY },
   { TY_METHOD, "==",              1,   1, BF_ANY, TY_BOOL,       BOPE_NONE },
   { TY_METHOD, "eql?",            1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "({ sp_BoundMethod *_t$t = $r; sp_BoundMethod *_t$u = $e0; (sp_bool)(_t$t->self == _t$u->self && _t$t->fn == _t$u->fn); })", BOP_K(TY_METHOD) },
   { TY_METHOD, "eql?",            1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "((void)($r), (void)($b0), (sp_bool)0)", 0 },
   { TY_METHOD, "equal?",          1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "({ sp_BoundMethod *_t$t = $r; sp_BoundMethod *_t$u = $e0; (sp_bool)(_t$t->self == _t$u->self && _t$t->fn == _t$u->fn); })", BOP_K(TY_METHOD) },
   { TY_METHOD, "equal?",          1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "((void)($r), (void)($b0), (sp_bool)0)", 0 },
-  { TY_METHOD, "bind",            1,   1, BF_ANY, TY_METHOD,     BOPE_NONE },  /* #2676 */
-  { TY_PROC,   "to_proc",         0,   0, BF_ANY, TY_PROC,       BOPE_NONE },  /* self (#3687) */
+  { TY_METHOD, "bind",            1,   1, BF_ANY, TY_METHOD,     BOPE_METHOD_BIND },  /* #2676 */
+  { TY_PROC,   "to_proc",         0,   0, BF_ANY, TY_PROC,       BOPE_TEMPLATE, "$r", 0 },  /* self (#3687) */
   { TY_PROC,   "===",             1,   1, BF_ANY, TY_POLY,       BOPE_NONE },  /* the proc's value, boxed (#3818) */
-  { TY_PROC,   "parameters",      0,   1, BF_ANY, TY_POLY_ARRAY, BOPE_NONE },  /* parameters(lambda:) is the same shape */
+  { TY_PROC,   "parameters",      0,   1, BF_ANY, TY_POLY_ARRAY, BOPE_PROC_PARAMETERS },  /* parameters(lambda:) is the same shape */
   { TY_PROC, "arity",           0,   0, BF_ANY,      TY_INT,        BOPE_TEMPLATE, "sp_proc_arity($r)", 0 },
   { TY_PROC, "lambda?",         0,   0, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "sp_proc_lambda_p($r)", 0 },
   { TY_PROC, "frozen?",         0,   0, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "(($r)->frozen)", 0 },
-  { TY_PROC,   "source_location", 0,   0, BF_ANY, TY_POLY_ARRAY, BOPE_NONE },  /* [file, line] */
+  { TY_PROC,   "source_location", 0,   0, BF_ANY, TY_POLY_ARRAY, BOPE_PROC_SOURCE_LOCATION },  /* [file, line] */
   { TY_PROC, "inspect",         0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_proc_inspect($r)", 0 },
   { TY_PROC, "to_s",            0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_proc_inspect($r)", 0 },
   { TY_PROC, "freeze",          0,   0, BF_ANY,      TY_PROC,       BOPE_TEMPLATE, "({ sp_Proc *_t$t = $r; _t$t->frozen = TRUE; _t$t; })", 0 },
@@ -1870,7 +1934,7 @@ static const BuiltinOp bop_rows[] = {
                        BOP_K(TY_POLY_POLY_HASH) | BOP_K(TY_INT_ARRAY) | BOP_K(TY_FLOAT_ARRAY) | \
                        BOP_K(TY_STR_ARRAY) | BOP_K(TY_POLY_ARRAY) | BOP_K(TY_INT_ARRAY_ARRAY) | \
                        BOP_K(TY_FLOAT_ARRAY_ARRAY))
-  { BOP_ANY_HASH, "compare_by_identity?", 0, 0, BF_ANY,  TY_BOOL,        BOPE_TEMPLATE, "((void)($r), 0)" },  /* always false; the receiver still runs */
+  { BOP_ANY_HASH, "compare_by_identity?", 0, 0, BF_ANY,  TY_BOOL,        BOPE_TEMPLATE, "sp_hash_ident_p($r)" },  /* set only on a PolyPoly or SymPoly hash (#9171) */
   { BOP_ANY_HASH, "equal?",           1,   1, BF_ANY,      TY_BOOL,        BOPE_TEMPLATE, "((void *)($r) == (void *)($e0))", HASH_OR_ARRAY },  /* pointer identity */
   /* nil is the NULL a Hash slot holds when it can be nil (a seeded
      `Hash[...]?` answer, an ivar set later), the same object as nil */
@@ -2240,7 +2304,7 @@ static const BuiltinOp bop_rows[] = {
   { BOP_ANY_ARRAY, "entries",               0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "$r" },
   { BOP_ANY_ARRAY, "deconstruct",           0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "$r", 0, 0, BOPF_SELF },
   { BOP_ANY_ARRAY, "dup",                   0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "sp_$AArray_dup($r)", 0, 0, BOPF_COPY_CLASS },
-  { BOP_ANY_ARRAY, "clone",                 0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "({ sp_$AArray *_t$t = $r; sp_$AArray *_t$u = sp_$AArray_dup(_t$t); _t$u->frozen = _t$t ? _t$t->frozen : 0; _t$u; })", 0, 0, BOPF_COPY_CLASS },  /* the frozen flag carries over */
+  { BOP_ANY_ARRAY, "clone",                 0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "({ sp_$AArray *_t$t = $r; sp_$AArray *_t$u = sp_$AArray_dup(_t$t); if (_t$t) _t$u->frozen = _t$t->frozen; _t$u; })", 0, 0, BOPF_COPY_CLASS },  /* the frozen flag carries over; nil.clone is nil */
   { BOP_ANY_ARRAY, "compact",               0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "sp_$AArray_compact($r)" },  /* drops the nil elements */
   { BOP_ANY_ARRAY, "shuffle",               0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "sp_$AArray_shuffle($r)" },
   { BOP_ANY_ARRAY, "reverse",               0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "({ sp_$AArray *_t$t = sp_$AArray_dup($r); sp_$AArray_reverse_bang(_t$t); _t$t; })" },
@@ -2401,12 +2465,10 @@ static const BuiltinOp bop_rows[] = {
   /* Array and Hash, any kind: freeze, frozen? and a Hash's to_h, rows of
      stage 1 looked up in emit_call_freeze_dup_arms, ahead of the families'
      own arms, where the Ranges' rows of the same names are. An Array keeps
-     its frozen flag in the struct, a Hash in its GC header. Hash#freeze
-     types nothing, as its row did before it emitted: the rules after the
-     lookup answer it. */
+     its frozen flag in the struct, a Hash in its GC header. */
   { BOP_ANY_ARRAY, "freeze",                0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "({ sp_$AArray *_t$t = $r; if (_t$t) _t$t->frozen = 1; _t$t; })", 0, 0, BOPF_SELF, 1 },
   { BOP_ANY_ARRAY, "frozen?",               0,   0, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "(($r)->frozen != 0)", 0, 0, 0, 1 },
-  { BOP_ANY_HASH,  "freeze",                0,   0, BF_ANY,      TY_UNKNOWN,    BOPE_TEMPLATE, "sp_gc_freeze($r)", 0, 0, BOPF_SELF, 1 },
+  { BOP_ANY_HASH,  "freeze",                0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "sp_gc_freeze($r)", 0, 0, BOPF_SELF, 1 },
   { BOP_ANY_HASH,  "frozen?",               0,   0, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "sp_gc_is_frozen($r)", 0, 0, 0, 1 },
   { BOP_ANY_HASH,  "to_h",                  0,   0, BF_NONE,     BOPR_SELF,     BOPE_TEMPLATE, "$r", 0, 0, BOPF_SELF_EXACT, 1 },  /* identity */
   /* The reflection lookup alone asks this family, after earlier overrides.
@@ -2548,16 +2610,19 @@ const BuiltinOp *bop_find_boxed(TyKind rt, const char *name, int argc, int has_b
   return op && (op->flags & BOPF_BOXED) ? op : NULL;
 }
 
+/* The kind whose rows a call on a receiver of kind rt reads: rt where rows
+   cover it, else the family of its Array or Hash variant. */
+TyKind bop_family_of(TyKind rt) {
+  if (bop_covers(rt)) return rt;
+  if (ty_is_array(rt)) return BOP_ANY_ARRAY;
+  if (ty_is_hash(rt)) return BOP_ANY_HASH;
+  return rt;
+}
+
 /* the flags of the row a call on a receiver of kind rt finds, the Array and
    Hash kinds through their family's rows */
 static unsigned bop_call_flags(TyKind rt, const char *name, int argc, int has_block) {
-  TyKind lk = rt;
-  if (rt == TY_STRBUF) lk = TY_STRING;
-  else if (!bop_covers(rt)) {
-    if (ty_is_array(rt)) lk = BOP_ANY_ARRAY;
-    else if (ty_is_hash(rt)) lk = BOP_ANY_HASH;
-  }
-  const BuiltinOp *op = bop_find(lk, name, argc, has_block);
+  const BuiltinOp *op = bop_find(rt == TY_STRBUF ? TY_STRING : bop_family_of(rt), name, argc, has_block);
   return op ? op->flags : 0;
 }
 
@@ -2779,6 +2844,19 @@ static const BopShareRow bop_share_rows[] = {
   { BOP_ANY_HASH, "hash",       BSH_PURE },
   { BOP_ANY_HASH, "frozen?",    BSH_PURE },
   { BOP_ANY_HASH, "clear",      BSH_RECV },
+
+  /* A Time's text forms answer a new String; named here so a boxed
+     receiver's builtin arm reads them too (sh_boxed_builtin_row): no other
+     builtin has these names, and a program's own (Date#iso8601 in the date
+     package) is a user target, asked apart. */
+  { TY_TIME, "iso8601",    BSH_PURE },
+  { TY_TIME, "xmlschema",  BSH_PURE },
+  { TY_TIME, "httpdate",   BSH_PURE },
+  { TY_TIME, "rfc2822",    BSH_PURE },
+  { TY_TIME, "rfc822",     BSH_PURE },
+  { TY_TIME, "ctime",      BSH_PURE },
+  { TY_TIME, "asctime",    BSH_PURE },
+  { TY_TIME, "strftime",   BSH_PURE },
 
   /* An IO copies what it writes and answers new Strings for what it reads;
      the buffer forms of the reads fill their second argument in place. */
