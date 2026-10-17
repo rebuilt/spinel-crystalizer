@@ -705,12 +705,17 @@ p MyErr.new.message'
 # observable (`.encoding` / `.valid_encoding?` are refused), so `bytes` agrees.
 expect_diverge "string_index_read" "Crystal String#[] yields a Char; Ruby a 1-char String" 'p "abc"[0]'
 
-# .each returns nil in Crystal (not the receiver), so it cannot be chained.
-expect_diverge "each_returns_nil" ".each yields nil, not the receiver" 'p [1,2].each { }'
+# .each answers the receiver again (P22u rewrites a self-returning iterator to
+# `recv.tap { |r| r.each { ... } }`, so the call is chainable); pinned as a
+# diverge here before P22u landed. Measured agreeing with CRuby 2026-10-17,
+# before and after the third upstream merge -- promoted to expect_agree.
+expect_agree "each_returns_nil" 'p [1,2].each { }'
 
-# Crystal prints parameterized type names; a Hash literal is a real Hash here
-# (we emit => form), but .class shows its element types.
-expect_diverge "param_type_name" "Crystal .class shows parameterized types" 'p({a: 1}.class)'
+# .class renders Ruby's class names through the runtime name shim, so a Hash
+# literal's class prints `Hash`, not `Hash(String, Int32)`; pinned as a diverge
+# before the shim landed. Measured agreeing 2026-10-17, pre- and post-merge --
+# promoted to expect_agree.
+expect_agree "param_type_name" 'p({a: 1}.class)'
 
 # Struct#to_h is translated to a real Hash, and the emitted Hash#inspect shim
 # renders symbol keys with CRuby's spelling ({a: 1}, not {:a => 1}).

@@ -11,8 +11,8 @@ questions, not to replace the C backend:
    translation to Crystal's block model?
 
 **Verdict: yes to both, for a concrete subset.** The parser and analyzer are
-reused verbatim; only the emitter is new. A 7,347-program corpus now runs through
-the Crystal path: 528 compile and match CRuby byte-for-byte on stdout, and the
+reused verbatim; only the emitter is new. A 7,474-program corpus now runs through
+the Crystal path: 579 compile and match CRuby byte-for-byte on stdout, and the
 rest are refused with a line-anchored reason naming the construct (see
 [Results](#results)).
 
@@ -41,6 +41,7 @@ spinel --target crystal app.rb -c     # write app.cr only
 spinel --target crystal app.rb        # crystal build --release -> ./app, then report
  scripts/poc_crystal.sh                # run the 18-program PoC corpus vs CRuby and print metrics
  scripts/crystal_reject_test.sh        # assert the honesty gate refuses with a reason
+ scripts/crystal_refuse_survey.sh      # the first-obstacle histogram over refusals
  scripts/crystal_difference_test.sh    # pin each Ruby-vs-Crystal difference: agree / refuse / diverge
  scripts/crystal_corpus_list.sh        # the corpus program list the gate measures
  scripts/crystal_corpus.sh            # run the whole corpus vs CRuby -> results.txt
@@ -1204,36 +1205,41 @@ usual suspect has a second obstacle behind it. That is what hid the
 `SPINEL_CRYSTAL_WHYS=1` makes the emitter print **every** unsupported reason (it
 scans the whole program regardless), and `scripts/crystal_obstacle_survey.sh`
 reports, per reason, how many programs have it as their **only** obstacle — the
-real ceiling on a single fix. On the 7,347-program corpus:
+real ceiling on a single fix. On the 7,474-program corpus:
 
 ```
-refused 6,356   sole-obstacle 1,925  (30%)
+refused 6,325   sole-obstacle 2,089  (33%)
 ```
 
 | sole-obstacle family | programs | what it would take |
 |---|---|---|
-| method not in the Crystal subset | **582** | a per-name ladder; ~80 names are cheap (`block_given?` 13, `scan` 14, `downto` 7, `format` 7, `rand` 6, `to_sym` 6, `match?` 6, `inject` 5, `each_line` 5, `chr` 5, `chomp` 5, …) and a few are not (`method` reflection 32, `proc`/`lambda` 25, `Integer`/`Rational`/`Complex` 49, `catch` 6, `instance_exec` 10) |
-| method not available on this receiver | **153** | per-receiver; 69 are "Object has no such method", 43 are `String#<<` (a mutable buffer), 34 are class-object reflection |
-| exception class has no Crystal equivalent | **140** | `NoMethodError` 35, `TypeError` 27, `NameError` 13, then a long tail — **reopens the E2 shim decision** (above) |
-| class/module body side effect | **128** | reject the statement, or run class bodies at load in declaration order |
-| untyped empty container | **116** | 72 `[]` + 44 `{}`: a boxed `Array(SpValue)`/`Hash(SpValue, SpValue)` spelling of the empty literal |
-| poly/unknown ivar type | **104** | a declared type or a boxed member |
-| lambda/proc | 54 | Crystal procs cannot close over a mutated local the way Ruby's do |
-| pattern matching | 53 | `case`/`in` has no Crystal form |
-| integer overflows 64 bits | 41 | needs a BigInt shard this emitter does not pull in |
-| keyword-argument hash in a positional position | 34 | a `{k: v}` argument, not a positional Hash |
-| everything else | ~376 | the long tail (`Box` reopening 23, poly-receiver `yield` 19, keyword/rest params 18, `Regexp` 16, `super` with no superclass 16, `SplatNode` 15, a non-`$!` global 14, `Enumerator` 12, `h[k] += v` 11, …) |
+| method not in the Crystal subset | **651** | a per-name ladder; the cheap names are `scan` 22, `class` 22, `block_given?` 15, `format` 14, `each_line` 11, `inject` 10, `match?` 8, `chr` 8, `rand` 7, `downto` 7, `chomp` 7, `catch` 7, `[]=` 7, `to_sym` 6, `setbyte` 6, `replace` 6 …, and the heavy ones need a Crystal type or emulation: `proc` 36, `method` reflection 34, `Rational` 33, `Complex` 21, `Integer` 18, `instance_exec` 12, `encoding` 9, `lambda` 10 |
+| method not available on this receiver | **346** | per-receiver; `Object`-no-such-method 85 (`equal?` 18, `eql?` 16, `respond_to?` 14, `frozen?` 12, `then` 10, `freeze` 9 …), `String#<<` 45 (a mutable buffer), class-object reflection 33, `GC.start` 21, a Struct factory `new` ~11, `Time#to_s(format)` 11, `Thread#join` timeout 10, `Range#lazy` 9, `Hash#key?` 7, `Hash#slice` 7, `Object.new` 5, a ~100 tail |
+| an instance variable with a poly/unknown type | 138 | a declared type or a boxed member |
+| a side-effecting statement in a class/module body | 130 | reject the statement, or run class bodies at load in declaration order |
+| the exception class has no Crystal equivalent | 119 | the P24-measured shim still rejected (they *test* a runtime class, none raise one — a shim unmasks BUILDFAIL, no PASS); re-check per name at the rung (`NoMethodError` 44 sole alone on the name-preserving view) |
+| a lambda/proc (`-> {}` / proc) | 63 | Crystal procs cannot close over a mutated local the way Ruby's do |
+| pattern matching (`case ... in`) | 57 | `case`/`in` has no Crystal form |
+| an integer that overflows 64 bits | 49 | needs a BigInt shard this emitter does not pull in |
+| a keyword-argument hash in a positional position | 37 | a `{k: v}` argument, not a positional Hash |
+| a class named 'X' (a generic stdlib type cannot be reopened) | 30 | reject the reopen, or alias the emitted name |
+| a yielding method called on a poly receiver | 25 | the poly-receiver dispatch seam |
+| keyword/rest parameters | 21 | forward as a typed array |
+| everything else | ~423 | the long tail (`SplatNode` 20, the `Regexp` spelling 17, `super` with no superclass 16, globals 25, `Enumerator` 12, `defined?` 12, `Hash.new(default)` in value position 10 — R2's named refusal, `IndexOperatorWriteNode` 11, multi-assign 11, `Time.at` 9 …) |
 
-The order is the ladder: **the exception-class shim is the single cheapest
-large gain** (one ~15-line hierarchy, ~140 PASS), then the per-name method
-allowlist — and the last rung of that opening, the boxed empty-container
-spelling, has landed below as R2.
+The order is the ladder: **the per-name method allowlist is the single cheapest
+large gain** (651 sole-obstacle, of which ~180 are the cheap names above), then
+the `Object`-receiver rung — and the boxed empty-container spelling has landed
+below as R2, whose named refusal (`Hash.new(default)` in value position) is
+itself a small rung. The exception-class family stays refused: 119 is the third
+confirmation (55 at P24, 117 at P25.0) that the shim's yield is unmasking
+BUILDFAIL rather than PASS.
 
 One caveat on the two "method" rows: the per-name counts come from the
 name-preserving view (a program naming two different globals is *not* sole
 there, but is sole once names collapse), so each named count is exact and the
-family total is the normalized one — 1,685 programs are sole under the
-stricter view against 1,925 under the normalized one.
+family total is the normalized one — 1,820 programs are sole under the
+stricter view against 2,089 under the normalized one.
 
 ## Ruby → Crystal divergences handled
 
@@ -1275,6 +1281,22 @@ classes with ivars + `attr_accessor` + `initialize`, Array/Hash/String
 operations, string interpolation, ranges (inclusive/exclusive), boolean logic,
 and blocks (`each`/`map`/`select`/`sum`/`times`, `next`, nested blocks).
 ## Results
+
+Measured 2026-10-17 on Crystal 1.21.1 / LLVM 20.1.8, CRuby as the oracle, after
+the third upstream merge (498 commits, bcba2dbd7 → 8a51e2822) and re-baseline.
+The merge is behaviourally transparent to the emitter — the corpus gate ran
+against the previous baseline with zero regressions on every one of the 528
+baselined PASSes, and the only transitions on the 127 new upstream programs are
+6 PASS, 1 DIFF, 11 BUILDFAIL, 109 REFUSED. Two ledger divergences (`each_returns_nil`,
+`param_type_name`) were measured agreeing pre-merge and post-merge and are promoted
+to `expect_agree` (the pins predate the P22u self-returning-iterator rewrite and
+the P22-era Ruby-like `.class` name shim):
+
+```
+programs: 7474   PASS 579   DIFF 99   BUILDFAIL 471   REFUSED 6325
+gate: PASS (528 PASS baselined, 0 regressions)
+difference-test: PASS (agree=50 refuse=19 diverge=7)
+```
 
 Measured 2026-10-16 on Crystal 1.21.1 / LLVM 20.1.8, CRuby as the oracle, after
 the R2 container rung landed (below):
